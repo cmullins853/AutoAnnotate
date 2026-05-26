@@ -26,7 +26,7 @@ def preprocess_caption(caption: str) -> str:
     return result + "."
 
 
-def load_model(model_config_path: str, model_checkpoint_path: str, device: str = "cuda"):
+def load_model(model_config_path: str, model_checkpoint_path: str, device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")):
     args = SLConfig.fromfile(model_config_path)
     args.device = device
     model = build_model(args)
@@ -56,7 +56,7 @@ def predict(
         caption: str,
         box_threshold: float,
         text_threshold: float,
-        device: str = "cuda",
+        device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
         remove_combined: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     caption = preprocess_caption(caption=caption)

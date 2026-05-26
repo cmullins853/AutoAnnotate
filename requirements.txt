@@ -1,0 +1,40 @@
+# AutoAnnotate runtime dependencies.
+#
+# Floors are picked to match what the project was actually developed against
+# (see `pip freeze` in autoannotate study/GroundingDINO/venv). No upper pins —
+# they tend to over-constrain Windows wheel resolution.
+#
+# Windows + NVIDIA users: install torch / torchvision from the CUDA wheel
+# index BEFORE running `pip install -r requirements.txt`, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Otherwise pip will pick the CPU build and CUDA acceleration won't work.
+#
+# GroundingDINO is intentionally NOT listed here — it ships with its own
+# setup.py under autoannotate study/GroundingDINO/. Install it after this
+# file with: pip install -e "autoannotate study/GroundingDINO"
+
+# ── Core ML stack ─────────────────────────────────────────────────────────
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+
+# ── Detection / segmentation models ──────────────────────────────────────
+# SAM3 requires >=8.3.237 (added in that release). YOLOE-11 stride=14 fix
+# is also in this range.
+ultralytics>=8.3.237
+
+# ── Vision / image I/O ───────────────────────────────────────────────────
+opencv-python>=4.8
+Pillow>=10.0
+shapely>=2.0
+
+# ── LLM-prompt path (SmolVLM / Florence / Gemma in AutomatedWindow) ──────
+transformers>=4.40
+accelerate>=0.30
+huggingface_hub>=0.20
+
+# ── GUI ───────────────────────────────────────────────────────────────────
+PyQt5>=5.15
+
+# ── Config / env ─────────────────────────────────────────────────────────
+python-dotenv>=1.0

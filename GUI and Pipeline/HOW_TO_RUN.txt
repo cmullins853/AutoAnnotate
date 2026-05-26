@@ -1,0 +1,241 @@
+========================================================
+  AUTO-ANNOTATE GUI — SETUP & RUN INSTRUCTIONS
+========================================================
+
+OVERVIEW
+--------
+The visualizer is the Manual Prompt and Confidence Tuning window.
+It lets you load a folder of images, pick a detector and segmenter,
+prompt by text or by drawing boxes, and see bounding boxes or
+segmentation masks drawn live over your images.
+
+--------------------------------------------------------
+STEP 1 — ONE-TIME SETUP: PYTHON ENVIRONMENT
+--------------------------------------------------------
+Make sure you are using the project's virtual environment.
+
+From the repo root:
+
+  source .venv/bin/activate          # Mac/Linux
+  .venv\Scripts\activate             # Windows
+
+If the venv doesn't exist yet, create it first:
+
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  pip install python-dotenv
+
+--------------------------------------------------------
+STEP 2 — ONE-TIME SETUP: CONFIGURE .env
+--------------------------------------------------------
+The project root already contains a .env file. Open it and confirm
+the GROUNDING_DINO_DIR path is correct for your machine:
+
+  File: AutoAnnotate/.env
+
+  GROUNDING_DINO_DIR=/absolute/path/to/autoannotate study/GroundingDINO
+
+For this machine it is already set to:
+  /Users/bxavier/Documents/GitHub/AutoAnnotate/autoannotate study/GroundingDINO
+
+If you are on a different machine, copy .env.example to .env and
+fill in the correct path.
+
+--------------------------------------------------------
+STEP 3 — ONE-TIME SETUP: DOWNLOAD MODEL WEIGHTS
+--------------------------------------------------------
+The notebook needs several weight files that are NOT in the repo
+(too large for git).
+
+a) GroundingDINO weights
+   Destination folder:
+     autoannotate study/GroundingDINO/weights/
+
+   Files to download:
+     groundingdino_swint_ogc.pth
+       -> https://github.com/IDEA-Research/GroundingDINO/releases
+
+     groundingdino_swinb_cogcoor.pth  (only if you use SwinB)
+       -> same releases page
+
+b) SAM 2 weights
+   The code uses "sam2_t.pt" loaded by ultralytics SAM.
+   Ultralytics auto-downloads sam2_t.pt on first run if you have
+   an internet connection. If it doesn't, download manually:
+     https://github.com/ultralytics/assets/releases
+   and place sam2_t.pt in "GUI and Pipeline/".
+
+c) SAM 3 weights (for SAM3 detector and SAM3 segmenter)
+   Filename: sam3.pt
+   Source:   https://huggingface.co/facebook/sam3
+             (gated — you must accept the license on HF first)
+   Destination: GUI and Pipeline/
+   If sam3.pt is missing, the SAM3 entries in both dropdowns auto-grey
+   with a tooltip so you cannot accidentally run them.
+
+d) YOLOE weights (for YOLOE-vis and YOLOE-seg one-shot)
+   Filenames: yoloe-11l-seg.pt and yoloe-11l-seg-pf.pt
+   Source:    https://github.com/ultralytics/assets/releases
+   Destination: GUI and Pipeline/
+
+e) LLM weights (Gemma — only needed for the Automated window)
+   The splash screen loads google/gemma-3-4b-it from Hugging Face
+   on startup. This requires ~8 GB of disk and a Hugging Face token
+   if the model is gated.
+   To skip LLM loading (Manual window only, no Automated features):
+   see the note in STEP 5 below.
+
+--------------------------------------------------------
+STEP 4 — INSTALL GROUNDINGDINO PYTHON PACKAGE
+--------------------------------------------------------
+GroundingDINO must be installed as a Python package so that
+"from groundingdino.util.inference import ..." works.
+
+  cd "autoannotate study/GroundingDINO"
+  pip install -e .
+
+If you see CUDA/torch errors, make sure your PyTorch version
+matches your CUDA driver before installing.
+
+--------------------------------------------------------
+STEP 5 — RUN THE NOTEBOOK
+--------------------------------------------------------
+Open Jupyter (or JupyterLab / VS Code Jupyter extension):
+
+  cd "GUI and Pipeline"
+  jupyter notebook auto-annotate-gui.ipynb
+
+Run the cells in order:
+  Cell 0  — imports + loads .env + defines GROUNDING_DINO_DIR
+  Cell 1  — defines helper functions (clean_labels, load_dino_model,
+             run_sam3_text, run_yoloe_vis, etc.)
+  Cell 2  — defines draw_boxes_on_image, overlay_with_borders
+  Cell 3  — defines optimizer and metric functions
+  Cell 4  — defines all GUI classes (LLMWorker, SplashScreen, MainWindow,
+             ManualWindow, AutomatedWindow) and main()
+  Cell 5  — calls main() and launches the app
+
+NOTE: The app opens a PyQt5 window. This requires a display.
+  - On a local Mac/Windows machine: works out of the box.
+  - On a remote server/SSH: you need X11 forwarding or a VNC session.
+
+TIP — Skip LLM loading (faster startup, Manual window only):
+  If you do not need the Automated window's prompt-generation feature,
+  comment out the model loading in LLMWorker.run() and replace with:
+    self.finished.emit(None, None)
+  The Manual window works fully without the LLM loaded.
+
+--------------------------------------------------------
+STEP 6 — USING THE VISUALIZER (Manual Window)
+--------------------------------------------------------
+1. The splash screen appears and loads the Gemma LLM in the background.
+   Wait for "Model loaded successfully." in the log, then the main
+   menu opens automatically.
+
+2. Click "Manual Prompt and Confidence Tuning".
+
+3. Click "Select Image Folder" -> choose a folder of .jpg/.png images.
+
+4. Click "Select Output Folder" -> choose where annotation files will
+   be saved (bounding box labels go to output/boxes/,
+   segmentation masks go to output/segments/).
+
+5. Pick a detector and a segmenter from the dropdowns:
+
+   Detector options:
+     - DINO (SwinT)       — text prompts, returns boxes
+     - DINO (SwinB)       — heavier DINO variant, same interface
+     - YOLOE-vis          — visual prompts (drawn boxes), one-shot:
+                             returns boxes AND masks in a single pass
+     - YOLOE-seg          — one-shot detector + mask generator;
+       (one-shot)            pair with segmenter "(none)"
+     - SAM3 (one-shot)    — text OR drawn boxes; returns boxes and masks
+
+   Segmenter options:
+     - SAM2 (tiny)        — default; converts detector boxes to masks
+     - SAM3               — higher-quality; same role as SAM2
+     - (none)             — only valid with YOLOE-seg (one-shot)
+
+   Greyed-out entries mean the corresponding weight file is missing —
+   hover the entry to see which file and where to put it.
+
+6. Pick a prompt mode (radio above the prompt entry):
+
+   - Text   — type class names ("red apple, leaf"); the detector
+              finds them in the image. Used with DINO and SAM3.
+   - Boxes  — draw yellow prompt boxes directly on the image; the
+              detector treats them as visual prompts. REQUIRED for
+              YOLOE-vis. Optional for SAM3 and YOLOE-seg.
+
+   Drawn boxes route to the YELLOW prompt bucket when the detector
+   actually consumes prompts; otherwise drags become GREEN annotation
+   boxes. The bucket re-evaluates whenever you change detector or
+   prompt mode.
+
+7. Check either "Bounding Box" or "Segmentation" to control the
+   display mode.
+
+8. Adjust the sliders:
+   - Detection threshold : detector confidence cutoff (0–100)
+   - Mask threshold      : segmenter confidence cutoff (0–100);
+                           ignored when the detector is one-shot
+                           with "(none)" as the segmenter
+
+9. Click "Auto annotate" to run the selected pipeline on the current
+   image and see results overlaid.
+
+   First SAM3 text call loads ~hundreds of MB — the action buttons
+   grey out for several seconds. This is normal; cached on subsequent
+   calls.
+
+10. Edit annotations directly on the canvas:
+    - Drag to draw a new annotation (rect or polygon depending on
+      display mode).
+    - Click an annotation to select it; press the red X badge to
+      delete.
+    - Rect annotations have corner/edge handles for resize.
+
+11. Click "Next Image" to step through the folder.
+
+12. When happy with the prompt and slider settings, click
+    "Auto Annotate Remaining" to batch-annotate the rest of the folder.
+    NOTE: this batch path currently uses the legacy DINO + text
+    pipeline and ignores the new detector/segmenter dropdowns. For
+    YOLOE / SAM3 / visual-prompt pipelines, use per-image "Auto
+    annotate" instead.
+
+--------------------------------------------------------
+COMMON ERRORS & FIXES
+--------------------------------------------------------
+"GROUNDING_DINO_DIR is not set"
+  -> Open .env in the project root and set the path (Step 2).
+
+"FileNotFoundError: groundingdino_swint_ogc.pth"
+  -> Download the weights file (Step 3a) and place it in
+     autoannotate study/GroundingDINO/weights/
+
+"ModuleNotFoundError: No module named 'groundingdino'"
+  -> Run: pip install -e "autoannotate study/GroundingDINO" (Step 4)
+
+"sam3.pt not found" or SAM3 entries greyed out
+  -> Download sam3.pt (Step 3c) and place it in "GUI and Pipeline/".
+
+"SAM3 text mode needs an ultralytics version that ships
+ SAM3SemanticPredictor"
+  -> Upgrade ultralytics:  pip install --upgrade ultralytics
+
+"cannot connect to X server" / blank window on Linux
+  -> You need a display. Use X11 forwarding or run locally.
+
+"Error loading model" on splash screen
+  -> Gemma-3-4b-it failed to load (out of memory, missing token, etc.)
+     You can still use the Manual window — it does not require the LLM.
+     Just wait for the error to appear and the window should still open,
+     or follow the TIP in Step 5 to skip LLM loading entirely.
+
+"No module named 'shapely'"
+  -> pip install shapely
+
+"No module named 'PyQt5'"
+  -> pip install PyQt5

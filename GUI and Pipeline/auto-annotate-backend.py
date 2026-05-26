@@ -10,6 +10,116 @@ from PIL import Image, ImageDraw
 import numpy as np
 
 
+# Segmentation models supported by the GUI's pipeline preset dropdown.
+# Keys = preset value used by the GUI; values = ultralytics checkpoint name.
+SAM_VARIANTS = {
+    "sam2_t": "sam2_t.pt",
+    "sam2_b": "sam2_b.pt",
+    "sam3":   "sam3.pt",
+}
+
+
+def load_sam(variant="sam2_t"):
+    """Load a SAM-family segmenter via ultralytics. Weights auto-download on first call."""
+    ckpt = SAM_VARIANTS.get(variant, variant if variant.endswith(".pt") else f"{variant}.pt")
+    return SAM(ckpt)
+
+
+def load_yoloe(model_path="yoloe-11l-seg.pt"):
+    """Load a YOLOE model. Use 'yoloe-11l-seg.pt' for text (set_classes) AND
+    visual prompting. 'yoloe-11l-seg-pf.pt' is the prompt-free variant: it has
+    a fixed vocabulary baked in and does NOT support set_classes."""
+    from ultralytics import YOLOE
+    return YOLOE(model_path)
+
+
+def run_yoloe_text(model, image_path, names, conf=0.05, max_area_frac=0.9):
+    """Run YOLOE with text/class prompts. `names` is a list of class strings.
+    Returns a torch tensor of xyxy boxes (filtered by max area fraction)."""
+    model.set_classes(names, model.get_text_pe(names))
+    results = model.predict(image_path, conf=conf, imgsz=1036, verbose=False)
+    out_boxes = torch.empty((0, 4))
+    for result in results:
+        shape = result.orig_shape
+        boxes = result.boxes.xyxy
+        max_area = shape[0] * shape[1] * max_area_frac
+        keep = []
+        for box in boxes.tolist():
+            if (box[2] - box[0]) * (box[3] - box[1]) < max_area:
+                keep.append(box)
+        if keep:
+            out_boxes = torch.tensor(keep)
+    return out_boxes, results
+
+
+def run_yoloe_vis(model, image_path, visual_prompts, conf=0.05, max_area_frac=0.9):
+    """Run YOLOE with visual (bbox) prompts.
+    `visual_prompts` = {'bboxes': np.ndarray(N,4) xyxy, 'cls': np.ndarray(N,) int32}
+    Returns (xyxy boxes tensor, raw results)."""
+    from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+    results = model.predict(
+        source=image_path,
+        visual_prompts=visual_prompts,
+        predictor=YOLOEVPSegPredictor,
+        conf=conf,
+        imgsz=1036,
+        verbose=False,
+    )
+    out_boxes = torch.empty((0, 4))
+    for result in results:
+        shape = result.orig_shape
+        boxes = result.boxes.xyxy
+        max_area = shape[0] * shape[1] * max_area_frac
+        keep = []
+        for box in boxes.tolist():
+            if (box[2] - box[0]) * (box[3] - box[1]) < max_area:
+                keep.append(box)
+        if keep:
+            out_boxes = torch.tensor(keep)
+    return out_boxes, results
+
+
+# Module-level cache: building SAM3SemanticPredictor loads a multi-hundred-MB
+# weight set distinct from the interactive SAM3, so reuse across calls.
+_sam3_text_predictor = None
+
+
+def run_sam3_text(image_path, names, conf=0.25, max_area_frac=0.9):
+    """Run SAM3 with text/class prompts (open-vocabulary semantic segmentation).
+
+    The public `ultralytics.SAM('sam3.pt')` wraps SAM3Predictor (interactive),
+    which only accepts box/point prompts. Text prompts live in a separate
+    `SAM3SemanticPredictor` that uses `build_sam3_image_model` instead of
+    `build_interactive_sam3` — same .pt file, different architecture.
+    Returns (xyxy boxes tensor, raw results).
+    """
+    global _sam3_text_predictor
+    from ultralytics.models.sam.predict import SAM3SemanticPredictor
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(",") if n.strip()]
+    if not names:
+        return torch.empty((0, 4)), None
+    if _sam3_text_predictor is None:
+        _sam3_text_predictor = SAM3SemanticPredictor(overrides=dict(
+            conf=conf, task="segment", mode="predict", imgsz=1024, model="sam3.pt",
+        ))
+    else:
+        _sam3_text_predictor.args.conf = conf
+    _sam3_text_predictor.set_prompts({"text": names})
+    results = _sam3_text_predictor(source=image_path)
+    out_boxes = torch.empty((0, 4))
+    if results and getattr(results[0], "boxes", None) is not None:
+        shape = results[0].orig_shape
+        max_area = shape[0] * shape[1] * max_area_frac
+        keep = []
+        for box in results[0].boxes.xyxy.tolist():
+            if (box[2] - box[0]) * (box[3] - box[1]) < max_area:
+                keep.append(box)
+        if keep:
+            out_boxes = torch.tensor(keep)
+    return out_boxes, results
+
+
 def clean_labels(boxes, max_area):
     clean_boxes = []
     box_list = boxes.tolist()

@@ -1,0 +1,98 @@
+# ============================
+# Python
+# ============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ============================
+# Jupyter
+# ============================
+.ipynb_checkpoints/
+
+# ============================
+# ML / Data / Weights
+# ============================
+weights/
+checkpoints/
+models/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.tflite
+# TorchScript exports (e.g. mobileclip_blt.ts shipped with YOLOE) — large binary weights.
+*.torchscript
+mobileclip_*.ts
+
+# Large data / outputs
+data/
+datasets/
+outputs/
+runs/
+results/
+logs/
+*.log
+Output Folder/
+cumulative/
+
+# ============================
+# OS (macOS)
+# ============================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# OS (Windows)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ============================
+# Editors / IDEs
+# ============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code per-user config (absolute paths + personal allowlist).
+# Shared project config at .claude/settings.json stays tracked.
+.claude/settings.local.json
+
+# ============================
+# Environment / secrets
+# ============================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+
+# ============================
+# Misc
+# ============================
+*.tmp
+*.bak
+*.old
+
+# Quarantined leftovers (was tracked before .gitignore rules existed;
+# moved here on cleanup so the working tree stays organized without
+# polluting the next push).
+junk/

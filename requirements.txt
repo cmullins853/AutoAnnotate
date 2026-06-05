@@ -33,6 +33,13 @@ transformers>=4.40
 accelerate>=0.30
 huggingface_hub>=0.20
 
+# ── Stable Diffusion synthetic image generation ──────────────────────────
+# Drives the "Generate Variation" / "Variations for Folder" flow in
+# ManualWindow. 0.27 is the floor where StableDiffusionInpaintPipeline
+# stabilized for SD-2 inpainting; older versions miss the use_safetensors
+# kwarg or have noisier MPS code paths.
+diffusers>=0.27
+
 # ── GUI ───────────────────────────────────────────────────────────────────
 PyQt5>=5.15
 

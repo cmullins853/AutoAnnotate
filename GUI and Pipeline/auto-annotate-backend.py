@@ -176,9 +176,12 @@ def run_dino(img_path, prompt, box_threshold, text_threshold, model_size, max_ar
     return absolute_boxes
 
 
-def save_masks(sam_results, output_dir):
+def save_masks(sam_results, output_dir, image_path):
+    # Name the file after the REAL image, never sam_results[0].path -- if the
+    # model ran on a temp/composite image that path is a random tempfile name,
+    # producing orphan tmp*.txt files that never overwrite. Mirrors the notebook.
     segments = sam_results[0].masks.xyn
-    with open(f"{Path(output_dir) / Path(sam_results[0].path).stem}.txt", "w") as f:
+    with open(f"{Path(output_dir) / Path(image_path).stem}.txt", "w") as f:
         for i in range(len(segments)):
             s = segments[i]
             if len(s) == 0:
@@ -196,7 +199,7 @@ def run(img_dir, output_dir, prompt, conf, box_threshold):
         boxes = run_dino(dino_model, path, prompt, conf, 0.1, box_threshold)
         model = SAM(sam_model)
         sam_results = model(os.path.join(img_dir, fname), model=sam_model, bboxes=boxes, verbose=False)
-        save_masks(sam_results, output_dir)
+        save_masks(sam_results, output_dir, os.path.join(img_dir, fname))
     print(f"Completed in: {t.time() - start} seconds, masks saved in {output_dir}")
 
 

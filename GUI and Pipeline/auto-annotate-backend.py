@@ -1,3 +1,18 @@
+"""
+LEGACY / REFERENCE ONLY -- NOT USED BY THE GUI.
+
+The live application is the notebook auto-annotate-gui.ipynb, which contains its
+own, corrected versions of every function below (run_dino, save_masks, the YOLOE
+and SAM3 helpers, the metrics functions, etc.). Nothing imports this module.
+
+It is kept only as a historical reference and will NOT run as-is:
+  - run_dino / run / optimize_prompts use Windows-style backslash paths
+    (e.g. r"GroundingDINO\\weights\\...") that break on macOS and Linux.
+  - optimize_confidence contains a hardcoded absolute path from the original
+    author's machine (C:\\Users\\Mechanized Systems\\...).
+If you need this logic, use the notebook versions instead. Do not wire this
+file into the GUI without first fixing the paths above.
+"""
 from groundingdino.util.inference import load_model, load_image, predict
 import cv2
 import torch
@@ -90,7 +105,7 @@ def run_sam3_text(image_path, names, conf=0.25, max_area_frac=0.9):
     The public `ultralytics.SAM('sam3.pt')` wraps SAM3Predictor (interactive),
     which only accepts box/point prompts. Text prompts live in a separate
     `SAM3SemanticPredictor` that uses `build_sam3_image_model` instead of
-    `build_interactive_sam3` — same .pt file, different architecture.
+    `build_interactive_sam3`. Both load the same .pt file but build a different architecture.
     Returns (xyxy boxes tensor, raw results).
     """
     global _sam3_text_predictor

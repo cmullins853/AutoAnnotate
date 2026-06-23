@@ -1,5 +1,5 @@
 ========================================================
-  AUTO-ANNOTATE GUI — SETUP & RUN INSTRUCTIONS
+  AUTO-ANNOTATE GUI - SETUP & RUN INSTRUCTIONS
 ========================================================
 
 OVERVIEW
@@ -10,7 +10,37 @@ prompt by text or by drawing boxes, and see bounding boxes or
 segmentation masks drawn live over your images.
 
 --------------------------------------------------------
-STEP 1 — ONE-TIME SETUP: PYTHON ENVIRONMENT
+SUPPORTED OPERATING SYSTEMS (macOS / Windows / Linux)
+--------------------------------------------------------
+The app runs on macOS, Windows and Linux. All file paths are derived
+portably (the notebook walks up to the repo root and joins paths with
+os.path.join), so no path edits are needed when you move machines - just
+set GROUNDING_DINO_DIR in .env if GroundingDINO lives somewhere unusual.
+
+The ONLY per-OS knob is which compute device runs the Stable Diffusion
+background-variation step. It lives in cell 0 under the header
+"PER-OS COMPUTE-DEVICE CONFIG", as commented lines for each OS:
+
+  macOS (Apple Silicon/Intel) : AUTOANNOTATE_SD_DEVICE = "cpu"  (8GB-safe)
+                                AUTOANNOTATE_SD_DEVICE = "mps"  (>8GB Macs)
+  Windows / Linux + NVIDIA GPU: AUTOANNOTATE_SD_DEVICE = "cuda" (fastest)
+  Windows / Linux, CPU only   : AUTOANNOTATE_SD_DEVICE = "cpu"
+
+By default cell 0 AUTO-DETECTS: macOS -> "cpu" (MPS has hung SD-1.5
+inpainting for 15+ min on 8GB), and on Windows/Linux it leaves the value
+unset so the SD loader picks CUDA, then MPS, then CPU on its own. To force
+a device, uncomment exactly one line for your OS in that block. The
+detection/segmentation models (DINO, YOLOE, SAM2/SAM3) choose their own
+device automatically and need no setting.
+
+Verify a machine quickly (any OS) with:
+  python "GUI and Pipeline/check_environment.py"
+It loads no models - it just confirms the Python deps, prints which
+compute device the app will use, and lists which weight files are
+present. Run it inside the activated venv (Step 1).
+
+--------------------------------------------------------
+STEP 1 - ONE-TIME SETUP: PYTHON ENVIRONMENT
 --------------------------------------------------------
 Make sure you are using the project's virtual environment.
 
@@ -22,12 +52,59 @@ From the repo root:
 If the venv doesn't exist yet, create it first:
 
   python3 -m venv .venv
-  source .venv/bin/activate
+  source .venv/bin/activate          # Mac/Linux  (.venv\Scripts\activate on Windows)
   pip install -r requirements.txt
-  pip install python-dotenv
+
+(python-dotenv is already in requirements.txt, so no separate install
+is needed.)
+
+REPRODUCIBLE INSTALL (recommended): instead of requirements.txt (which
+only pins floors), install the exact, proven-good version set from the
+lockfile:
+
+  pip install -r requirements.lock
+
+requirements.lock is a full `pip freeze` of the environment the app is
+known to run on (Python 3.13). It also includes ipykernel, so on this
+path you can skip the separate `pip install jupyter ipykernel` in STEP 1b
+(you still need `jupyter`/`jupyterlab` itself if you launch from the CLI).
+Note: GroundingDINO is NOT in the lock; install it in STEP 4.
 
 --------------------------------------------------------
-STEP 2 — ONE-TIME SETUP: CONFIGURE .env
+STEP 1b - ONE-TIME SETUP: REGISTER THE VENV AS A JUPYTER KERNEL
+--------------------------------------------------------
+The notebook must run on the .venv interpreter, otherwise the imports
+(torch, ultralytics, groundingdino, PyQt5, ...) won't be found. Jupyter
+and the kernel package are NOT in requirements.txt, so install them into
+the activated venv and register the venv as a named kernel:
+
+  pip install jupyter ipykernel      # ipykernel already present if you
+                                     # used requirements.lock in STEP 1
+  python -m ipykernel install --user --name autoannotate-venv \
+         --display-name "Python (AutoAnnotate .venv)"
+
+This creates a kernel called "Python (AutoAnnotate .venv)" (id
+"autoannotate-venv") that points at the venv's Python. You only do this
+once per machine. If a kernel by that id already exists pointing at a
+different interpreter, re-run the command above from the correct venv to
+overwrite it.
+
+Then, when the notebook is open, SELECT that kernel:
+  - Jupyter / JupyterLab : Kernel menu -> Change Kernel ->
+                           "Python (AutoAnnotate .venv)".
+  - VS Code              : click the kernel picker (top-right of the
+                           notebook) -> Select Another Kernel ->
+                           Python Environments -> the .venv interpreter
+                           (or the "AutoAnnotate .venv" Jupyter kernel).
+
+Tip: launching `jupyter notebook` from inside the activated venv (Step 5)
+already gives you the right interpreter; the named kernel above is what
+lets VS Code and an externally-launched Jupyter find it too.
+
+To remove the kernel later:  jupyter kernelspec uninstall autoannotate
+
+--------------------------------------------------------
+STEP 2 - ONE-TIME SETUP: CONFIGURE .env
 --------------------------------------------------------
 The project root already contains a .env file. Open it and confirm
 the GROUNDING_DINO_DIR path is correct for your machine:
@@ -42,8 +119,20 @@ For this machine it is already set to:
 If you are on a different machine, copy .env.example to .env and
 fill in the correct path.
 
+HF_TOKEN in the .env is OPTIONAL and the running app never uses it.
+Every model the app loads is either public (SmolVLM, bert-base-uncased
+for DINO, Stable Diffusion 1.5) or already on disk (sam3.pt) or comes
+from ultralytics' own server (SAM2, YOLOE) -- none require a token, and
+no from_pretrained call passes one. With the weights in place the app
+runs fully token-free; you can leave HF_TOKEN blank.
+
+A token is only useful OUTSIDE the app, for the ONE-TIME manual download
+of the gated sam3.pt from huggingface.co/facebook/sam3 (you accept the
+license there and authenticate the download). Once sam3.pt sits in
+"GUI and Pipeline/", nothing in the code reads the token again.
+
 --------------------------------------------------------
-STEP 3 — ONE-TIME SETUP: DOWNLOAD MODEL WEIGHTS
+STEP 3 - ONE-TIME SETUP: DOWNLOAD MODEL WEIGHTS
 --------------------------------------------------------
 The notebook needs several weight files that are NOT in the repo
 (too large for git).
@@ -69,7 +158,7 @@ b) SAM 2 weights
 c) SAM 3 weights (for SAM3 detector and SAM3 segmenter)
    Filename: sam3.pt
    Source:   https://huggingface.co/facebook/sam3
-             (gated — you must accept the license on HF first)
+             (gated - you must accept the license on HF first)
    Destination: GUI and Pipeline/
    If sam3.pt is missing, the SAM3 entries in both dropdowns auto-grey
    with a tooltip so you cannot accidentally run them.
@@ -79,27 +168,34 @@ d) YOLOE weights (for YOLOE-vis and YOLOE-seg one-shot)
    Source:    https://github.com/ultralytics/assets/releases
    Destination: GUI and Pipeline/
 
-e) LLM weights (Gemma — only needed for the Automated window)
-   The splash screen loads google/gemma-3-4b-it from Hugging Face
-   on startup. This requires ~8 GB of disk and a Hugging Face token
-   if the model is gated.
+e) LLM weights (only needed for the Automated window)
+   The splash screen loads HuggingFaceTB/SmolVLM-256M-Instruct from
+   Hugging Face on startup. It is about 0.5 GB and is a public model,
+   so it downloads without a Hugging Face token.
    To skip LLM loading (Manual window only, no Automated features):
    see the note in STEP 5 below.
 
 --------------------------------------------------------
-STEP 4 — INSTALL GROUNDINGDINO PYTHON PACKAGE
+STEP 4 - INSTALL GROUNDINGDINO PYTHON PACKAGE
 --------------------------------------------------------
 GroundingDINO must be installed as a Python package so that
 "from groundingdino.util.inference import ..." works.
 
-  cd "autoannotate study/GroundingDINO"
-  pip install -e .
+  pip install --no-build-isolation -e "autoannotate study/GroundingDINO"
+
+IMPORTANT: the --no-build-isolation flag is REQUIRED. GroundingDINO's
+setup.py does `import torch` at build time; without this flag pip builds
+in an isolated environment that has no torch and the install fails with
+"ModuleNotFoundError: No module named 'torch'". Because of this flag,
+torch must already be installed (it is, from STEP 1) before you run this.
 
 If you see CUDA/torch errors, make sure your PyTorch version
 matches your CUDA driver before installing.
 
+To uninstall later:  pip uninstall groundingdino
+
 --------------------------------------------------------
-STEP 5 — RUN THE NOTEBOOK
+STEP 5 - RUN THE NOTEBOOK
 --------------------------------------------------------
 Open Jupyter (or JupyterLab / VS Code Jupyter extension):
 
@@ -107,31 +203,33 @@ Open Jupyter (or JupyterLab / VS Code Jupyter extension):
   jupyter notebook auto-annotate-gui.ipynb
 
 Run the cells in order:
-  Cell 0  — imports + loads .env + defines GROUNDING_DINO_DIR
-  Cell 1  — defines helper functions (clean_labels, load_dino_model,
+  Cell 0  - imports + loads .env + defines GROUNDING_DINO_DIR
+  Cell 1  - defines helper functions (clean_labels, load_dino_model,
              run_sam3_text, run_yoloe_vis, etc.)
-  Cell 2  — defines draw_boxes_on_image, overlay_with_borders
-  Cell 3  — defines optimizer and metric functions
-  Cell 4  — defines all GUI classes (LLMWorker, SplashScreen, MainWindow,
+  Cell 2  - defines draw_boxes_on_image, overlay_with_borders
+  Cell 3  - defines optimizer and metric functions
+  Cell 4  - defines all GUI classes (LLMWorker, SplashScreen, MainWindow,
              ManualWindow, AutomatedWindow) and main()
-  Cell 5  — calls main() and launches the app
+  Cell 5  - calls main() and launches the app
 
 NOTE: The app opens a PyQt5 window. This requires a display.
   - On a local Mac/Windows machine: works out of the box.
   - On a remote server/SSH: you need X11 forwarding or a VNC session.
 
-TIP — Skip LLM loading (faster startup, Manual window only):
-  If you do not need the Automated window's prompt-generation feature,
-  comment out the model loading in LLMWorker.run() and replace with:
-    self.finished.emit(None, None)
-  The Manual window works fully without the LLM loaded.
+NOTE - The prompt-suggestion VLM (SmolVLM) now loads LAZILY:
+  It is no longer loaded on the splash screen. It loads automatically the
+  first time you actually use prompt generation (the Automated window's
+  "Generate Prompts", or any path that calls it). So a Manual-only session
+  never pays its ~0.5 GB or its load wait, and startup is faster. If the
+  VLM can't load, prompt generation simply returns nothing and the rest of
+  the app is unaffected.
 
 --------------------------------------------------------
-STEP 6 — USING THE VISUALIZER (Manual Window)
+STEP 6 - USING THE VISUALIZER (Manual Window)
 --------------------------------------------------------
-1. The splash screen appears and loads the Gemma LLM in the background.
-   Wait for "Model loaded successfully." in the log, then the main
-   menu opens automatically.
+1. The splash screen appears and loads the SmolVLM model in the
+   background. Wait for "Model loaded successfully." in the log, then
+   the main menu opens automatically.
 
 2. Click "Manual Prompt and Confidence Tuning".
 
@@ -144,27 +242,27 @@ STEP 6 — USING THE VISUALIZER (Manual Window)
 5. Pick a detector and a segmenter from the dropdowns:
 
    Detector options:
-     - DINO (SwinT)       — text prompts, returns boxes
-     - DINO (SwinB)       — heavier DINO variant, same interface
-     - YOLOE-vis          — visual prompts (drawn boxes), one-shot:
+     - DINO (SwinT)       - text prompts, returns boxes
+     - DINO (SwinB)       - heavier DINO variant, same interface
+     - YOLOE-vis          - visual prompts (drawn boxes), one-shot:
                              returns boxes AND masks in a single pass
-     - YOLOE-seg          — one-shot detector + mask generator;
+     - YOLOE-seg          - one-shot detector + mask generator;
        (one-shot)            pair with segmenter "(none)"
-     - SAM3 (one-shot)    — text OR drawn boxes; returns boxes and masks
+     - SAM3 (one-shot)    - text OR drawn boxes; returns boxes and masks
 
    Segmenter options:
-     - SAM2 (tiny)        — default; converts detector boxes to masks
-     - SAM3               — higher-quality; same role as SAM2
-     - (none)             — only valid with YOLOE-seg (one-shot)
+     - SAM2 (tiny)        - default; converts detector boxes to masks
+     - SAM3               - higher-quality; same role as SAM2
+     - (none)             - only valid with YOLOE-seg (one-shot)
 
-   Greyed-out entries mean the corresponding weight file is missing —
+   Greyed-out entries mean the corresponding weight file is missing -
    hover the entry to see which file and where to put it.
 
 6. Pick a prompt mode (radio above the prompt entry):
 
-   - Text   — type class names ("red apple, leaf"); the detector
+   - Text   - type class names ("red apple, leaf"); the detector
               finds them in the image. Used with DINO and SAM3.
-   - Boxes  — draw yellow prompt boxes directly on the image; the
+   - Boxes  - draw yellow prompt boxes directly on the image; the
               detector treats them as visual prompts. REQUIRED for
               YOLOE-vis. Optional for SAM3 and YOLOE-seg.
 
@@ -177,15 +275,15 @@ STEP 6 — USING THE VISUALIZER (Manual Window)
    display mode.
 
 8. Adjust the sliders:
-   - Detection threshold : detector confidence cutoff (0–100)
-   - Mask threshold      : segmenter confidence cutoff (0–100);
+   - Detection threshold : detector confidence cutoff (0-100)
+   - Mask threshold      : segmenter confidence cutoff (0-100);
                            ignored when the detector is one-shot
                            with "(none)" as the segmenter
 
 9. Click "Auto annotate" to run the selected pipeline on the current
    image and see results overlaid.
 
-   First SAM3 text call loads ~hundreds of MB — the action buttons
+   First SAM3 text call loads ~hundreds of MB - the action buttons
    grey out for several seconds. This is normal; cached on subsequent
    calls.
 
@@ -200,10 +298,92 @@ STEP 6 — USING THE VISUALIZER (Manual Window)
 
 12. When happy with the prompt and slider settings, click
     "Auto Annotate Remaining" to batch-annotate the rest of the folder.
-    NOTE: this batch path currently uses the legacy DINO + text
-    pipeline and ignores the new detector/segmenter dropdowns. For
-    YOLOE / SAM3 / visual-prompt pipelines, use per-image "Auto
-    annotate" instead.
+    This batch path runs the SAME detector + segmenter you selected in
+    the dropdowns (via _run_detector / _run_segmenter) on every remaining
+    image - YOLOE, SAM3 and DINO pipelines all work here, not just DINO.
+    Each image's labels go to output/boxes/ and masks to output/segments/,
+    overwriting any existing label for that image.
+    - Text prompt carries automatically (it is reused on every image).
+    - To carry the box prompts you drew on this image across the whole
+      folder, turn on "Use First Image as Prompt" first (enabled only for
+      the box-capable detectors: YOLOE-vis/-seg and SAM3; DINO is
+      text-only so the toggle is greyed there).
+    - ZERO-detection retry: if an image gets no detections, the detector
+      automatically RETRIES ONCE at a lower threshold (det + mask x 0.5,
+      tunable via AUTOANNOTATE_RETRY_FACTOR). It is a single bounded retry,
+      never a loop.
+    - REVIEW folder: images that are STILL empty after the retry, or that
+      error out, are COPIED (never moved) into a review folder so you can
+      fix them by hand:
+        output/_review/boxes/      (no detections - detection-stage problem)
+        output/_review/segments/   (boxes found but no masks - seg-stage)
+        output/_review/review_report.csv   (image, stage, status, reason,
+                                            detector, prompt, thresholds)
+      The _review folder is rebuilt every run (a clean run removes it). The
+      end-of-run popup reports "Failed: N", "Empty (needs review): N", and
+      the review-folder path.
+
+--------------------------------------------------------
+TUNING KNOBS (optional environment variables)
+--------------------------------------------------------
+All optional. Defaults reproduce the original behavior, so you only set
+these to tune speed/memory. Set them in your shell before launching, or in
+cell 0 (the PER-OS block already sets AUTOANNOTATE_SD_DEVICE there).
+
+  AUTOANNOTATE_SD_DEVICE        cpu | mps | cuda. Stable Diffusion compute
+                                device. Default: auto (macOS->cpu; else
+                                CUDA>MPS>CPU). See the OS section above.
+
+  AUTOANNOTATE_MODEL_BUDGET_GB  Soft RAM budget for resident detection/
+                                segmentation models; least-recently-used
+                                models are evicted when a load would exceed
+                                it. Default: unset = unbounded (never evict).
+                                Set ~4.5 on an 8 GB machine to stop SAM3
+                                (~3.3 GB) co-residing with other heavy models.
+
+  AUTOANNOTATE_KEEP_MODELS_WARM 1 = keep every model cached across detector/
+                                segmenter switches (faster switching, more
+                                memory). Default: 0 = offload the models the
+                                new pipeline no longer uses on each switch.
+
+  AUTOANNOTATE_BATCH_CHUNK      Images to DETECT before switching to the
+                                SEGMENT pass in a two-stage (detector ->
+                                separate segmenter) batch run, so one heavy
+                                model is resident per pass. Default: 8.
+
+  AUTOANNOTATE_RELEASE_EVERY    Release GPU/MPS memory every Nth inference.
+                                Default: 1 (every time -- needed on 8 GB).
+                                Raise it (e.g. 5) on a large-RAM/CUDA box to
+                                cut the per-image gc + empty_cache overhead.
+
+  AUTOANNOTATE_RETRY_FACTOR     Multiplier for the single lower-threshold
+                                retry on an empty detection in Auto Annotate
+                                Remaining. Default: 0.5 (half). Clamped to
+                                between 0 and 1.
+
+  AUTOANNOTATE_MAX_AREA_FRAC    Drop any single detection whose box covers
+                                more than this fraction of the image (a
+                                spurious whole-/large-image match). Applied to
+                                ALL detectors. Default: 0.9 (only near-whole-
+                                image). LOWER it to ~0.4-0.5 for small-object
+                                or texture folders (e.g. fescue/grass), where
+                                SAM3 box-exemplar can match a broad region
+                                whose box still sneaks under 0.9. Clamped to
+                                (0, 1].
+
+  AUTOANNOTATE_DINO_RESCUE      1 = on an otherwise-empty DINO image, keep
+                                the low-confidence candidates above a small
+                                floor (review them) instead of returning
+                                nothing. Default: 0 (off).
+
+Not an env var -- a code flag (edit in cell 1, then re-run cell 1):
+  AUTOANNOTATE_DEBUG            False by default. Set True for verbose
+                                diagnostics ([model-cache], [_get_model],
+                                evictions, etc.).
+  DINO_SCORE_DIAGNOSTICS        False by default. Set True to print DINO's
+                                top raw detection scores per image (doubles
+                                DINO inference time; use only to calibrate
+                                the confidence slider).
 
 --------------------------------------------------------
 COMMON ERRORS & FIXES
@@ -228,11 +408,11 @@ COMMON ERRORS & FIXES
 "cannot connect to X server" / blank window on Linux
   -> You need a display. Use X11 forwarding or run locally.
 
-"Error loading model" on splash screen
-  -> Gemma-3-4b-it failed to load (out of memory, missing token, etc.)
-     You can still use the Manual window — it does not require the LLM.
-     Just wait for the error to appear and the window should still open,
-     or follow the TIP in Step 5 to skip LLM loading entirely.
+"SmolVLM load failed" (on first use of Generate Prompts)
+  -> The prompt-suggestion VLM couldn't load (out of memory, no network,
+     etc.). It now loads lazily on FIRST USE, not on the splash, so this
+     never blocks startup. Prompt generation just returns nothing; the
+     rest of the app (Manual + Automated) is unaffected.
 
 "No module named 'shapely'"
   -> pip install shapely

@@ -26,7 +26,7 @@ pip install -r requirements.txt
 The authoritative, step-by-step setup guide is
 [`GUI and Pipeline/HOW_TO_RUN.txt`](GUI%20and%20Pipeline/HOW_TO_RUN.txt). It covers
 the virtual environment, the `.env` file, where to put the model weight files, and
-how to launch the notebook on macOS, Linux, and Windows. In short:
+how to launch the app on macOS, Linux, and Windows. In short:
 
 1. Clone the repository and create a virtual environment with Python 3.13.
 2. `pip install -r requirements.txt`, or for an exact reproducible
@@ -45,10 +45,13 @@ how to launch the notebook on macOS, Linux, and Windows. In short:
 5. Place the weight files (DINO `.pth`, `sam2_t.pt`, `sam3.pt`, `yoloe-*.pt`) as
    described in HOW_TO_RUN.txt. `GROUNDING_DINO_DIR` is auto-derived, so a fresh
    clone needs no `.env` path edit.
+6. Launch the app from the repo root with `python run_app.py` (or
+   `python -m autoannotate`), or run the single launcher cell in
+   `GUI and Pipeline/auto-annotate-gui.ipynb`.
 
 The app runs on macOS, Windows, and Linux. The only per-OS setting is the Stable
 Diffusion compute device (`AUTOANNOTATE_SD_DEVICE`), configured in a commented
-per-OS block in the notebook's cell 0; see HOW_TO_RUN.txt ("SUPPORTED OPERATING
+per-OS block in `autoannotate/config.py`; see HOW_TO_RUN.txt ("SUPPORTED OPERATING
 SYSTEMS"). Optional speed/memory tuning (model RAM budget, batch chunking,
 memory-release cadence, etc.) is controlled by `AUTOANNOTATE_*` environment
 variables, all documented under "TUNING KNOBS" in HOW_TO_RUN.txt, with defaults
@@ -97,23 +100,30 @@ Examples:
 
 ## Key Files and Usage
 
-All live code is under the `GUI and Pipeline/` directory.
+All live code is in the `autoannotate/` package at the repo root. Model weight
+files, the notebook launcher, and dev tools live under `GUI and Pipeline/`.
 
 ### Code Files:
+- **`autoannotate/`**:
+  - The application package. `config.py` holds env/path/device setup,
+    `pipeline/` holds the model wrappers (DINO, YOLOE, SAM2/SAM3, Stable
+    Diffusion) and label I/O, `gui/` holds the PyQt5 windows and canvas, and
+    `optimizer.py` holds the prompt/confidence optimizers. Entry points:
+    `run_app.py` at the repo root, or `python -m autoannotate`.
 - **[GUI and Pipeline/auto-annotate-gui.ipynb](GUI%20and%20Pipeline/auto-annotate-gui.ipynb)**:
-  - The application. This is the single entrypoint: it defines the detectors,
-    segmenters, the GUI, and the batch pipeline, and it is the file you run.
+  - Thin Jupyter launcher for the app. It contains no application code; it
+    imports `autoannotate.app` and calls `main()`.
 - **[GUI and Pipeline/auto-annotate-backend.py](GUI%20and%20Pipeline/auto-annotate-backend.py)**:
-  - Legacy reference only. NOT imported by the GUI. The notebook contains its own
-    corrected versions of these functions; this file has non-portable paths and
-    will not run as-is. Kept for history.
+  - Legacy reference only. NOT imported by the GUI. The `autoannotate` package
+    contains the corrected versions of these functions; this file has
+    non-portable paths and will not run as-is. Kept for history.
 - **[GUI and Pipeline/manual-tuning-test.ipynb](GUI%20and%20Pipeline/manual-tuning-test.ipynb)**:
   - Scratch notebook for manual testing and tuning of prompts and confidence levels.
 - **[GUI and Pipeline/LLM implementation.ipynb](GUI%20and%20Pipeline/LLM%20implementation.ipynb)**:
   - Experiments for the LLM prompt-suggestion path used by the Automated window.
 - **[GUI and Pipeline/test_semiauto_headless.py](GUI%20and%20Pipeline/test_semiauto_headless.py)**:
   - Headless regression tests for the semi-automatic segmentation GUI logic.
-    Run with `QT_QPA_PLATFORM=offscreen python3 "GUI and Pipeline/test_semiauto_headless.py"`.
+    Run with `QT_QPA_PLATFORM=offscreen .venv/bin/python "GUI and Pipeline/test_semiauto_headless.py"`.
 - **[GUI and Pipeline/model_cleanup.py](GUI%20and%20Pipeline/model_cleanup.py)**:
   - Utility that reports and (on request) removes model weights AutoAnnotate no
     longer uses, from both the Hugging Face cache and local `.pt`/`.pth` files.
@@ -125,8 +135,8 @@ All live code is under the `GUI and Pipeline/` directory.
 
 ### Instructions for Model Training and Testing:
 #### Grounding DINO:
-1. The config and checkpoint paths are derived from `GROUNDING_DINO_DIR` in the
-   notebook (cell 0); the weight files live in
+1. The config and checkpoint paths are derived from `GROUNDING_DINO_DIR` in
+   `autoannotate/config.py`; the weight files live in
    `autoannotate study/GroundingDINO/weights/`.
 2. Adjust `box_threshold` and `text_threshold` for specific datasets.
 
@@ -141,13 +151,14 @@ All live code is under the `GUI and Pipeline/` directory.
 
 ### Adding New Models:
 - Ensure compatibility with the pipeline.
-- Add the model in the notebook `auto-annotate-gui.ipynb` (NOT the legacy
+- Add the model in the `autoannotate` package (NOT the legacy
   `auto-annotate-backend.py`, which is unused):
-  - Cell 1: add the loader/inference helper (mirroring `run_yoloe_*`,
-    `run_sam3_text`, etc.).
-  - Cell 4: wire it into `_get_model`, `_detector_keys_for_pipeline`, and the
-    `_run_detector` dispatch, and classify its prompt capability (text/boxes)
-    so the Text/Boxes radios and carry-forward gate it correctly.
+  - `autoannotate/pipeline/`: add the loader/inference helper in the matching
+    module (mirroring `run_yoloe_*`, `run_sam3_text`, etc.).
+  - `autoannotate/gui/manual_window.py`: wire it into `_get_model`,
+    `_detector_keys_for_pipeline`, and the `_run_detector` dispatch, and
+    classify its prompt capability (text/boxes) so the Text/Boxes radios and
+    carry-forward gate it correctly.
 
 ### Training New Models:
 - Update the model paths in notebooks (e.g., YOLO or Grounding DINO).

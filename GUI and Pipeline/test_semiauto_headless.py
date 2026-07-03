@@ -1,14 +1,18 @@
 """Headless logic tests for the semi-automatic SAM segmentation feature.
 
-Runs the real cell-4 GUI code under an offscreen Qt platform, with the heavy
-ML deps (cv2, ultralytics, groundingdino, ...) stubbed. It exercises the pure
-GUI logic: gating, point capture, coordinate mapping, key handling, commit, and
-toolbar mutual-exclusion, NOT real SAM inference or live rendering.
+Runs the real GUI code (autoannotate.gui.*) under an offscreen Qt platform,
+with the heavy ML deps (cv2, ultralytics, groundingdino, ...) stubbed. It
+exercises the pure GUI logic: gating, point capture, coordinate mapping, key
+handling, commit, and toolbar mutual-exclusion, NOT real SAM inference or live
+rendering.
+
+Run with the repo venv:
+    QT_QPA_PLATFORM=offscreen .venv/bin/python "GUI and Pipeline/test_semiauto_headless.py"
 """
-import os, sys, types, json
+import os, sys, types
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-# ── Stub the heavy modules so the namespace can run without them ──────────
+# ── Stub the heavy modules so the package can import without them ─────────
 def _stub(name):
     m = types.ModuleType(name)
     sys.modules[name] = m
@@ -19,38 +23,87 @@ cv2.COLOR_BGR2RGB = 4
 import numpy as _np
 cv2.imread = lambda *a, **k: _np.zeros((100, 100, 3), dtype=_np.uint8)
 
+_gd = _stub("groundingdino"); _gdu = _stub("groundingdino.util")
+_gdi = _stub("groundingdino.util.inference")
+_gd.util = _gdu; _gdu.inference = _gdi
+_gdi.load_model = lambda *a, **k: object()
+_gdi.load_image = lambda *a, **k: (None, None)
+_gdi.predict = lambda *a, **k: ([], [], [])
+
+_ul = _stub("ultralytics")
+_ul.SAM = lambda *a, **k: object()
+
+_de = _stub("dotenv"); _de.load_dotenv = lambda *a, **k: None
+_hf = _stub("huggingface_hub"); _hf.login = lambda *a, **k: None
+# transformers is stubbed EMPTY on purpose: ensure_llm's lazy
+# `from transformers import ...` must raise ImportError so the VLM tests
+# exercise the degrade-gracefully path instead of downloading a model.
+_stub("transformers")
+
 from PyQt5 import QtWidgets, QtGui, QtCore
 import numpy as np
 
-# ── Load cell-4 source from the notebook next to this file and exec it ────
-# Self-contained: reads the GUI code straight out of the notebook's cell 4 so
-# the suite runs from any working directory. Run with:
-#   QT_QPA_PLATFORM=offscreen python3 "GUI and Pipeline/test_semiauto_headless.py"
-NB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto-annotate-gui.ipynb")
-src = "".join(json.load(open(NB))["cells"][4]["source"])
+# ── Import the real GUI modules from the package ──────────────────────────
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-G = {
-    "__name__": "cell4",
-    "QtWidgets": QtWidgets, "QtGui": QtGui, "QtCore": QtCore,
-    "np": np, "cv2": cv2, "os": os, "sys": sys,
-    # Functions referenced only inside method bodies are stubbed; tests that
-    # need specific behavior override them per-test.
-    "result_clean_polys": lambda r: [],
-    "load_dino_model": lambda *a, **k: object(),
-    "load_sam": lambda *a, **k: object(),
-    "load_yoloe": lambda *a, **k: object(),
-    "save_masks": lambda *a, **k: None,
-    "adjust_masks": lambda *a, **k: [],
-    "overlay_with_borders": lambda img, *a, **k: img,
-    "draw_boxes_on_image": lambda img, *a, **k: img,
-    "GROUNDING_DINO_DIR": "/tmp/gd", "CUMULATIVE_DIR": "/tmp",
-    "_SD_STRENGTH": 0.2,
-    # Defined in cell 1 (not exec'd here); cell-4 code reads it as a global.
-    "AUTOANNOTATE_DEBUG": False,
-}
-from pathlib import Path as _Path
-G["Path"] = _Path
-exec(compile(src, "cell4", "exec"), G)
+import autoannotate.gui.manual_window as _mod_mw
+import autoannotate.gui.canvas as _mod_canvas
+import autoannotate.gui.dialogs as _mod_dialogs
+import autoannotate.gui.side_by_side as _mod_sbs
+import autoannotate.gui.splash as _mod_splash
+import autoannotate.gui.automated_window as _mod_auto
+import autoannotate.gui.llm as _mod_llm
+import autoannotate.gui.spatial as _mod_spatial
+import autoannotate.gui.style as _mod_style
+import autoannotate.pipeline.labels as _mod_labels
+
+class _FlatNamespace:
+    """Dict-like view over the module set, mirroring the flat namespace the
+    suite used when the GUI was a single exec'd notebook cell. Reads find the
+    first module holding the name; writes patch EVERY module holding it, so a
+    per-test stub lands in the module where the name is actually used."""
+    def __init__(self, mods):
+        self._mods = mods
+    def __getitem__(self, k):
+        for m in self._mods:
+            if hasattr(m, k):
+                return getattr(m, k)
+        raise KeyError(k)
+    def __setitem__(self, k, v):
+        hit = False
+        for m in self._mods:
+            if hasattr(m, k):
+                setattr(m, k, v)
+                hit = True
+        if not hit:
+            setattr(self._mods[0], k, v)
+    def get(self, k, default=None):
+        try:
+            return self[k]
+        except KeyError:
+            return default
+    def pop(self, k, default=None):
+        v = self.get(k, default)
+        for m in self._mods:
+            if hasattr(m, k):
+                delattr(m, k)
+        return v
+
+G = _FlatNamespace([_mod_mw, _mod_canvas, _mod_dialogs, _mod_sbs, _mod_splash,
+                    _mod_auto, _mod_llm, _mod_spatial, _mod_style, _mod_labels])
+
+# Default stubs, mirroring the old harness: model loads and pipeline calls
+# are inert unless a test overrides them.
+G["result_clean_polys"] = lambda r: []
+G["load_dino_model"] = lambda *a, **k: object()
+G["load_sam"] = lambda *a, **k: object()
+G["load_yoloe"] = lambda *a, **k: object()
+G["save_masks"] = lambda *a, **k: None
+G["adjust_masks"] = lambda *a, **k: []
+G["overlay_with_borders"] = lambda img, *a, **k: img
+G["draw_boxes_on_image"] = lambda img, *a, **k: img
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 AnnotationCanvas = G["AnnotationCanvas"]
@@ -58,6 +111,7 @@ ManualWindow = G["ManualWindow"]
 SemiAutoSettingsDialog = G["SemiAutoSettingsDialog"]
 SpatialGrid = G["SpatialGrid"]
 SideBySideWindow = G["SideBySideWindow"]
+
 
 # ── tiny test runner ──────────────────────────────────────────────────────
 _results = []

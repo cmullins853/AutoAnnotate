@@ -1,17 +1,18 @@
 """
 LEGACY / REFERENCE ONLY -- NOT USED BY THE GUI.
 
-The live application is the notebook auto-annotate-gui.ipynb, which contains its
-own, corrected versions of every function below (run_dino, save_masks, the YOLOE
-and SAM3 helpers, the metrics functions, etc.). Nothing imports this module.
+The live application is the `autoannotate` package at the repo root, which
+contains corrected versions of every function below (run_dino, save_masks, the
+YOLOE and SAM3 helpers, the metrics functions, etc.). Nothing imports this
+module.
 
 It is kept only as a historical reference and will NOT run as-is:
   - run_dino / run / optimize_prompts use Windows-style backslash paths
     (e.g. r"GroundingDINO\\weights\\...") that break on macOS and Linux.
   - optimize_confidence contains a hardcoded absolute path from the original
     author's machine (C:\\Users\\Mechanized Systems\\...).
-If you need this logic, use the notebook versions instead. Do not wire this
-file into the GUI without first fixing the paths above.
+If you need this logic, use the autoannotate package versions instead. Do not
+wire this file into the GUI without first fixing the paths above.
 """
 from groundingdino.util.inference import load_model, load_image, predict
 import cv2

@@ -13,20 +13,20 @@ segmentation masks drawn live over your images.
 SUPPORTED OPERATING SYSTEMS (macOS / Windows / Linux)
 --------------------------------------------------------
 The app runs on macOS, Windows and Linux. All file paths are derived
-portably (the notebook walks up to the repo root and joins paths with
+portably (autoannotate/config.py anchors everything to the repo root with
 os.path.join), so no path edits are needed when you move machines - just
 set GROUNDING_DINO_DIR in .env if GroundingDINO lives somewhere unusual.
 
 The ONLY per-OS knob is which compute device runs the Stable Diffusion
-background-variation step. It lives in cell 0 under the header
-"PER-OS COMPUTE-DEVICE CONFIG", as commented lines for each OS:
+background-variation step. It lives in autoannotate/config.py under the
+header "PER-OS COMPUTE-DEVICE CONFIG", as commented lines for each OS:
 
   macOS (Apple Silicon/Intel) : AUTOANNOTATE_SD_DEVICE = "cpu"  (8GB-safe)
                                 AUTOANNOTATE_SD_DEVICE = "mps"  (>8GB Macs)
   Windows / Linux + NVIDIA GPU: AUTOANNOTATE_SD_DEVICE = "cuda" (fastest)
   Windows / Linux, CPU only   : AUTOANNOTATE_SD_DEVICE = "cpu"
 
-By default cell 0 AUTO-DETECTS: macOS -> "cpu" (MPS has hung SD-1.5
+By default config.py AUTO-DETECTS: macOS -> "cpu" (MPS has hung SD-1.5
 inpainting for 15+ min on 8GB), and on Windows/Linux it leaves the value
 unset so the SD loader picks CUDA, then MPS, then CPU on its own. To force
 a device, uncomment exactly one line for your OS in that block. The
@@ -195,22 +195,25 @@ matches your CUDA driver before installing.
 To uninstall later:  pip uninstall groundingdino
 
 --------------------------------------------------------
-STEP 5 - RUN THE NOTEBOOK
+STEP 5 - RUN THE APP
 --------------------------------------------------------
-Open Jupyter (or JupyterLab / VS Code Jupyter extension):
+The application code lives in the `autoannotate` package at the repo root:
 
-  cd "GUI and Pipeline"
-  jupyter notebook auto-annotate-gui.ipynb
+  autoannotate/config.py    - env, paths, device configuration
+  autoannotate/pipeline/    - DINO / YOLOE / SAM / SD wrappers and label I/O
+  autoannotate/gui/         - the PyQt5 windows, canvas and dialogs
+  autoannotate/optimizer.py - prompt/confidence optimizers
 
-Run the cells in order:
-  Cell 0  - imports + loads .env + defines GROUNDING_DINO_DIR
-  Cell 1  - defines helper functions (clean_labels, load_dino_model,
-             run_sam3_text, run_yoloe_vis, etc.)
-  Cell 2  - defines draw_boxes_on_image, overlay_with_borders
-  Cell 3  - defines optimizer and metric functions
-  Cell 4  - defines all GUI classes (LLMWorker, SplashScreen, MainWindow,
-             ManualWindow, AutomatedWindow) and main()
-  Cell 5  - calls main() and launches the app
+Launch it from a terminal (inside the venv), from the repo root:
+
+  python run_app.py
+      -- or --
+  python -m autoannotate
+
+Or launch it from Jupyter (JupyterLab / VS Code Jupyter extension): open
+"GUI and Pipeline/auto-annotate-gui.ipynb" and run its single launcher
+cell. The notebook contains no application code anymore; it just imports
+autoannotate.app and calls main().
 
 NOTE: The app opens a PyQt5 window. This requires a display.
   - On a local Mac/Windows machine: works out of the box.
@@ -328,7 +331,8 @@ TUNING KNOBS (optional environment variables)
 --------------------------------------------------------
 All optional. Defaults reproduce the original behavior, so you only set
 these to tune speed/memory. Set them in your shell before launching, or in
-cell 0 (the PER-OS block already sets AUTOANNOTATE_SD_DEVICE there).
+autoannotate/config.py (its PER-OS block already sets
+AUTOANNOTATE_SD_DEVICE).
 
   AUTOANNOTATE_SD_DEVICE        cpu | mps | cuda. Stable Diffusion compute
                                 device. Default: auto (macOS->cpu; else
@@ -376,10 +380,12 @@ cell 0 (the PER-OS block already sets AUTOANNOTATE_SD_DEVICE there).
                                 floor (review them) instead of returning
                                 nothing. Default: 0 (off).
 
-Not an env var -- a code flag (edit in cell 1, then re-run cell 1):
-  AUTOANNOTATE_DEBUG            False by default. Set True for verbose
-                                diagnostics ([model-cache], [_get_model],
-                                evictions, etc.).
+  AUTOANNOTATE_DEBUG            1/true = verbose diagnostics ([model-cache],
+                                [_get_model], evictions, etc.). Read from
+                                the environment or .env in
+                                autoannotate/config.py. Default: off.
+
+Not an env var -- a code flag (edit autoannotate/pipeline/dino.py):
   DINO_SCORE_DIAGNOSTICS        False by default. Set True to print DINO's
                                 top raw detection scores per image (doubles
                                 DINO inference time; use only to calibrate

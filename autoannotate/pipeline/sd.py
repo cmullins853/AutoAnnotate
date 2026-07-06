@@ -164,10 +164,10 @@ def load_sd_inpaint(device=None, extra_caches=None):
             f"Underlying error: {type(e).__name__}: {e}\n\n"
             f"If this is `No module named 'diffusers'`, install with:\n"
             f"    pip install diffusers>=0.27 safetensors\n"
-            f"into the SAME Python your Jupyter kernel uses. The most "
-            f"reliable way is from a notebook cell:\n"
-            f"    import sys; !{{sys.executable}} -m pip install diffusers safetensors\n"
-            f"and then restart the kernel."
+            f"into the SAME Python that runs the app. The most reliable "
+            f"way is with the venv's own interpreter, from the repo root:\n"
+            f"    .venv/bin/python -m pip install diffusers safetensors\n"
+            f"(.venv\\Scripts\\python on Windows), then relaunch the app."
         ) from e
     if device is None:
         device, dtype = _sd_select_device()
@@ -195,7 +195,7 @@ def load_sd_inpaint(device=None, extra_caches=None):
         use_safetensors=True,
     )
     pipe = pipe.to(device)
-    # Cut the progress-bar spam in the notebook output.
+    # Cut the progress-bar spam in the terminal output.
     pipe.set_progress_bar_config(disable=True)
 
     # Memory savings for MPS / 8GB systems

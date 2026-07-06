@@ -819,7 +819,7 @@ class ManualWindow(QtWidgets.QWidget):
 
         Covers both combos:
           - DETECTOR: SwinB needs groundingdino_swinb_cogcoor.pth
-          - SEGMENTER: SAM3 needs sam3.pt next to the notebook
+          - SEGMENTER: SAM3 needs sam3.pt in 'GUI and Pipeline/'
             (ultralytics 8.4.33 doesn't auto-download SAM3; its asset
             list omits 'sam3.pt' and build_sam3 does a raw open() that
             FileNotFounds. User must fetch sam3.pt manually from Meta's
@@ -871,8 +871,8 @@ class ManualWindow(QtWidgets.QWidget):
                     tip = ("sam3.pt not found. Ultralytics 8.4.33 does NOT "
                            "auto-download SAM3, so fetch sam3.pt manually from "
                            "https://huggingface.co/facebook/sam3 (gated, accept "
-                           "the license) and drop it next to the notebook in "
-                           "'GUI and Pipeline/'. Use SAM2 (tiny) until then.")
+                           "the license) and drop it in 'GUI and Pipeline/'. "
+                           "Use SAM2 (tiny) until then.")
                 else:
                     tip = (f"sam3.pt looks broken: only {sam3_size:,} bytes "
                            f"(expected hundreds of MB). Re-download from HF.")
@@ -889,7 +889,7 @@ class ManualWindow(QtWidgets.QWidget):
                 if sam3_size == 0:
                     tip = ("sam3.pt not found. Fetch from "
                            "https://huggingface.co/facebook/sam3 (gated) and "
-                           "drop next to the notebook in 'GUI and Pipeline/'.")
+                           "drop it in 'GUI and Pipeline/'.")
                 else:
                     tip = (f"sam3.pt looks broken: only {sam3_size:,} bytes. "
                            "Re-download from HF.")

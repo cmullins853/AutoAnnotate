@@ -2,7 +2,7 @@
 """
 check_environment.py - cross-OS readiness check for AutoAnnotate.
 
-Run this on macOS, Windows, or Linux BEFORE launching the notebook to confirm
+Run this on macOS, Windows, or Linux BEFORE launching the app to confirm
 the machine can run the app. It does NOT load any model (fast, no downloads); it
 only verifies the Python deps, reports the compute device the app will pick, and
 checks that the weight files are where the GUI expects them.
@@ -31,7 +31,7 @@ def _mark_fail():
     _failed = True
 
 
-# ── locate repo root (mirror the notebook's cell-0 walk) ──────────────────────
+# ── locate repo root by walking up from this file ─────────────────────────────
 def find_repo_root(start):
     d = os.path.abspath(start)
     for _ in range(6):
@@ -98,8 +98,7 @@ def main():
 
     header("Python packages (optional)")
     for mod, note in [("diffusers", "Stable Diffusion variations"),
-                      ("groundingdino", "DINO detector (pip install -e the GroundingDINO dir)"),
-                      ("ipykernel", "register the venv as a Jupyter kernel")]:
+                      ("groundingdino", "DINO detector (pip install -e the GroundingDINO dir)")]:
         try:
             importlib.import_module(mod)
             print(f"  {OK} {mod:<14} present")
@@ -116,10 +115,10 @@ def main():
         print(f"  CUDA available : {cuda}")
         print(f"  MPS available  : {mps}")
 
-        # Mirror cell-0 default + _sd_select_device (cell 1) for the SD device.
+        # Mirror config.py's auto-detect + pipeline.sd._sd_select_device.
         override = os.environ.get("AUTOANNOTATE_SD_DEVICE", "").lower().strip()
         if not override and platform.system() == "Darwin":
-            override = "cpu"  # cell-0 auto-detect default on macOS
+            override = "cpu"  # config.py auto-detect default on macOS
         if override == "cuda" and cuda:
             sd = "cuda (fp16)"
         elif override == "mps" and mps:

@@ -31,23 +31,16 @@ how to launch the app on macOS, Linux, and Windows. In short:
 1. Clone the repository and create a virtual environment with Python 3.13.
 2. `pip install -r requirements.txt`, or for an exact reproducible
    install, `pip install -r requirements.lock` (a full `pip freeze` of the
-   proven environment; it also includes `ipykernel`).
-3. Register the venv as a Jupyter kernel so the notebook runs on it
-   (`jupyter`/`ipykernel` are not in `requirements.txt`, but `ipykernel`
-   *is* in `requirements.lock`):
-   `pip install jupyter ipykernel` then
-   `python -m ipykernel install --user --name autoannotate-venv --display-name "Python (AutoAnnotate .venv)"`,
-   and select that kernel in Jupyter/VS Code. See HOW_TO_RUN.txt STEP 1b.
-4. Install GroundingDINO as a package (the `--no-build-isolation` flag is
+   proven environment).
+3. Install GroundingDINO as a package (the `--no-build-isolation` flag is
    **required** because its `setup.py` imports torch at build time, so torch from
    step 2 must already be installed):
    `pip install --no-build-isolation -e "autoannotate study/GroundingDINO"`
-5. Place the weight files (DINO `.pth`, `sam2_t.pt`, `sam3.pt`, `yoloe-*.pt`) as
+4. Place the weight files (DINO `.pth`, `sam2_t.pt`, `sam3.pt`, `yoloe-*.pt`) as
    described in HOW_TO_RUN.txt. `GROUNDING_DINO_DIR` is auto-derived, so a fresh
    clone needs no `.env` path edit.
-6. Launch the app from the repo root with `python run_app.py` (or
-   `python -m autoannotate`), or run the single launcher cell in
-   `GUI and Pipeline/auto-annotate-gui.ipynb`.
+5. Launch the app from a terminal at the repo root with `python run_app.py`
+   (or `python -m autoannotate`). No Jupyter or IDE is required.
 
 The app runs on macOS, Windows, and Linux. The only per-OS setting is the Stable
 Diffusion compute device (`AUTOANNOTATE_SD_DEVICE`), configured in a commented
@@ -101,7 +94,7 @@ Examples:
 ## Key Files and Usage
 
 All live code is in the `autoannotate/` package at the repo root. Model weight
-files, the notebook launcher, and dev tools live under `GUI and Pipeline/`.
+files and dev tools live under `GUI and Pipeline/`.
 
 ### Code Files:
 - **`autoannotate/`**:
@@ -110,9 +103,6 @@ files, the notebook launcher, and dev tools live under `GUI and Pipeline/`.
     Diffusion) and label I/O, `gui/` holds the PyQt5 windows and canvas, and
     `optimizer.py` holds the prompt/confidence optimizers. Entry points:
     `run_app.py` at the repo root, or `python -m autoannotate`.
-- **[GUI and Pipeline/auto-annotate-gui.ipynb](GUI%20and%20Pipeline/auto-annotate-gui.ipynb)**:
-  - Thin Jupyter launcher for the app. It contains no application code; it
-    imports `autoannotate.app` and calls `main()`.
 - **[GUI and Pipeline/auto-annotate-backend.py](GUI%20and%20Pipeline/auto-annotate-backend.py)**:
   - Legacy reference only. NOT imported by the GUI. The `autoannotate` package
     contains the corrected versions of these functions; this file has

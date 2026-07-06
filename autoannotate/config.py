@@ -3,8 +3,8 @@
 Importing this module has side effects on purpose: it sets the environment
 variables that must exist BEFORE HuggingFace / transformers are imported,
 loads .env, and optionally logs into HuggingFace. Every other module gets
-its paths from here so the app runs the same from the notebook launcher,
-`python -m autoannotate`, or a future frozen executable.
+its paths from here so the app runs the same from `python -m autoannotate`,
+run_app.py, or a future frozen executable.
 """
 import os
 import platform as _platform
@@ -55,8 +55,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEIGHTS_DIR = os.path.join(REPO_ROOT, "GUI and Pipeline")
 
 # Where cwd-relative artifacts (DINO-labels, optimizer save files) land when a
-# caller does not pass an explicit directory. Matches where the notebook wrote
-# them, since Jupyter ran with "GUI and Pipeline" as its working directory.
+# caller does not pass an explicit directory. Kept at "GUI and Pipeline" for
+# continuity with where earlier versions of the app wrote them.
 BASE_DIR = WEIGHTS_DIR
 
 load_dotenv(os.path.join(REPO_ROOT, ".env"))

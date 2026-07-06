@@ -6,13 +6,13 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .config import BASE_DIR as NOTEBOOK_DIR
+from .config import BASE_DIR
 from .pipeline.dino import run_dino_from_model
 
 def prompt_optimizer(prompts_file, gt_path, img_path, save_file, threshold, DINO):
     print('entered prompt optimizer')
     # Ensure inference path exists
-    inf_path = os.path.join(NOTEBOOK_DIR, "DINO-labels")
+    inf_path = os.path.join(BASE_DIR, "DINO-labels")
     os.makedirs(inf_path, exist_ok=True)
 
     # Initialize result dictionary from prompt file
@@ -111,7 +111,7 @@ def draw_boxes(boxes, image_dim=(1280, 720)):
     return np.array(image, dtype=np.uint8)
 
 def confidence_optimizer(prompt, DINO, gt_path, img_path, threshold):
-    inf_path = os.path.join(NOTEBOOK_DIR, "DINO-labels")
+    inf_path = os.path.join(BASE_DIR, "DINO-labels")
     os.makedirs(inf_path, exist_ok=True)
 
     best_iou = 0

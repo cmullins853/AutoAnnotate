@@ -66,7 +66,7 @@ def run_sam3_text(image_path, names, conf=0.25, max_area_frac=0.9):
             raise RuntimeError(
                 "sam3.pt not found. Fetch it from "
                 "https://huggingface.co/facebook/sam3 (gated; accept the "
-                "license) and drop it next to the notebook in 'GUI and Pipeline/'."
+                "license) and drop it in 'GUI and Pipeline/'."
             ) from e
     else:
         _sam3_text_predictor.args.conf = conf
@@ -126,7 +126,7 @@ def run_sam3_boxes(image_path, bboxes, conf=0.25, max_area_frac=0.9):
             raise RuntimeError(
                 "sam3.pt not found. Fetch it from "
                 "https://huggingface.co/facebook/sam3 (gated; accept the "
-                "license) and drop it next to the notebook in 'GUI and Pipeline/'."
+                "license) and drop it in 'GUI and Pipeline/'."
             ) from e
     else:
         _sam3_text_predictor.args.conf = conf

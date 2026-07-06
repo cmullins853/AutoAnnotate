@@ -65,43 +65,11 @@ lockfile:
   pip install -r requirements.lock
 
 requirements.lock is a full `pip freeze` of the environment the app is
-known to run on (Python 3.13). It also includes ipykernel, so on this
-path you can skip the separate `pip install jupyter ipykernel` in STEP 1b
-(you still need `jupyter`/`jupyterlab` itself if you launch from the CLI).
-Note: GroundingDINO is NOT in the lock; install it in STEP 4.
+known to run on (Python 3.13). Note: GroundingDINO is NOT in the lock;
+install it in STEP 4.
 
---------------------------------------------------------
-STEP 1b - ONE-TIME SETUP: REGISTER THE VENV AS A JUPYTER KERNEL
---------------------------------------------------------
-The notebook must run on the .venv interpreter, otherwise the imports
-(torch, ultralytics, groundingdino, PyQt5, ...) won't be found. Jupyter
-and the kernel package are NOT in requirements.txt, so install them into
-the activated venv and register the venv as a named kernel:
-
-  pip install jupyter ipykernel      # ipykernel already present if you
-                                     # used requirements.lock in STEP 1
-  python -m ipykernel install --user --name autoannotate-venv \
-         --display-name "Python (AutoAnnotate .venv)"
-
-This creates a kernel called "Python (AutoAnnotate .venv)" (id
-"autoannotate-venv") that points at the venv's Python. You only do this
-once per machine. If a kernel by that id already exists pointing at a
-different interpreter, re-run the command above from the correct venv to
-overwrite it.
-
-Then, when the notebook is open, SELECT that kernel:
-  - Jupyter / JupyterLab : Kernel menu -> Change Kernel ->
-                           "Python (AutoAnnotate .venv)".
-  - VS Code              : click the kernel picker (top-right of the
-                           notebook) -> Select Another Kernel ->
-                           Python Environments -> the .venv interpreter
-                           (or the "AutoAnnotate .venv" Jupyter kernel).
-
-Tip: launching `jupyter notebook` from inside the activated venv (Step 5)
-already gives you the right interpreter; the named kernel above is what
-lets VS Code and an externally-launched Jupyter find it too.
-
-To remove the kernel later:  jupyter kernelspec uninstall autoannotate
+No Jupyter setup is needed. The app is plain Python scripts launched
+from the terminal (STEP 5); there is no notebook to run.
 
 --------------------------------------------------------
 STEP 2 - ONE-TIME SETUP: CONFIGURE .env
@@ -134,7 +102,7 @@ license there and authenticate the download). Once sam3.pt sits in
 --------------------------------------------------------
 STEP 3 - ONE-TIME SETUP: DOWNLOAD MODEL WEIGHTS
 --------------------------------------------------------
-The notebook needs several weight files that are NOT in the repo
+The app needs several weight files that are NOT in the repo
 (too large for git).
 
 a) GroundingDINO weights
@@ -210,10 +178,17 @@ Launch it from a terminal (inside the venv), from the repo root:
       -- or --
   python -m autoannotate
 
-Or launch it from Jupyter (JupyterLab / VS Code Jupyter extension): open
-"GUI and Pipeline/auto-annotate-gui.ipynb" and run its single launcher
-cell. The notebook contains no application code anymore; it just imports
-autoannotate.app and calls main().
+That is the whole launch procedure: no IDE or Jupyter session is
+involved. The old launcher notebook (auto-annotate-gui.ipynb) has been
+retired to junk/.
+
+To verify the install (or a code change) beyond launching, run the
+headless regression suite from the repo root:
+
+  QT_QPA_PLATFORM=offscreen python "GUI and Pipeline/test_semiauto_headless.py"
+
+Expect "323/323 checks passed". For live-GUI verification, walk
+"GUI and Pipeline/MANUAL_TEST_CHECKLIST.md".
 
 NOTE: The app opens a PyQt5 window. This requires a display.
   - On a local Mac/Windows machine: works out of the box.

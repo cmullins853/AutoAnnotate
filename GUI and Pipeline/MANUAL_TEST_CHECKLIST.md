@@ -16,10 +16,12 @@ Tested on: __________   OS: __________   Date: __________
 ## 0. Setup / environment
 - [ ] Activate the venv, then run `python "GUI and Pipeline/check_environment.py"`
       → all required packages OK, weights present, the SD device line looks right.
-- [ ] Launch the notebook on the **venv kernel** ("Python (AutoAnnotate .venv)").
-- [ ] Run cells 0 to 5 in order with no errors. Cell 0 prints the `[HF]` token-free
-      line (you can leave HF_TOKEN blank).
-- [ ] Splash screen loads SmolVLM, then the main menu opens automatically.
+- [ ] From the repo root (venv active), launch with `python run_app.py` (or
+      `python -m autoannotate`). No Jupyter/IDE: the launcher notebook is retired.
+- [ ] The terminal shows no errors on startup; the `[HF]` token-free line prints
+      (you can leave HF_TOKEN blank).
+- [ ] Splash screen appears, then the main menu opens automatically. (SmolVLM
+      loads lazily on first prompt-generation use, not on the splash.)
 - [ ] Greyed dropdown entries: temporarily move `sam3.pt` aside → SAM3 entries
       (detector + segmenter) grey out with a tooltip; restore it → re-enabled.
 

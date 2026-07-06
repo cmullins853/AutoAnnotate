@@ -1,5 +1,5 @@
 """Model wrappers and label I/O. Import from the submodules directly for
-anything not re-exported here; these are the names the GUI and notebook
+anything not re-exported here; these are the names the GUI and script
 users reach for most.
 """
 from .dino import clean_labels, load_dino_model, run_dino_from_model, run_image

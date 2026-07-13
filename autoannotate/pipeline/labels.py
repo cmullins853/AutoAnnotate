@@ -29,7 +29,7 @@ def _validate_class_ids(classes, n_items, fn_name, item_name):
         ids = [int(c) for c in classes]
     except (TypeError, ValueError) as exc:
         raise ValueError(f'{fn_name}: class ids must be integers, got {classes!r}') from exc
-    # A YOLO class id indexes into classes.txt, so it cannot be negative: -1 is
+    # A YOLO class id indexes into the class-name table, so it cannot be negative: -1 is
     # the "no class" sentinel some detectors return, and exporting it produces a
     # label file no importer can read.
     bad = [c for c in ids if c < 0]
@@ -194,11 +194,10 @@ def save_polys_yolo(segments, output_dir, image_path, classes=None):
 def _validate_class_names(names, fn_name):
     """Reject class names carrying a newline before anything is written.
 
-    classes.txt is positional: line N IS class id N. A name containing a newline
-    would occupy two lines and silently shift the id of every class after it, so
-    the labels would import against the wrong names. The class-colour table has
-    the same one-row-per-class contract. Cheaper to refuse than to write a file
-    that is quietly wrong.
+    The class table is positional: row N IS class id N. A name containing a
+    newline would occupy two lines and silently shift the id of every class
+    after it, so the labels would read against the wrong names. Cheaper to
+    refuse than to write a file that is quietly wrong.
     """
     for i, n in enumerate(names or []):
         if "\n" in str(n) or "\r" in str(n):
@@ -207,29 +206,12 @@ def _validate_class_names(names, fn_name):
                 f'one class per line is what makes the class id meaningful')
 
 
-def save_classes_txt(names, output_dir):
-    """Write classes.txt (one class name per line, index order) into the
-    output folder so the saved YOLO label ids stay interpretable. Skipped
-    when `names` is empty.
-
-    Nothing but the class name goes on a line. YOLO/Roboflow/labelImg importers
-    read the WHOLE line as the name, so a trailing color or id would silently
-    rename every class on import. The colors live in save_class_colors_txt."""
-    if not names:
-        return
-    _validate_class_names(names, 'save_classes_txt')
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "classes.txt"), "w", encoding="utf-8", newline="\n") as f:
-        for n in names:
-            f.write(f"{n}\n")
-
-
 def save_class_colors_txt(names, output_dir):
-    """Write class_colors.txt: which colour each class id is drawn in.
+    """Write class_colors.txt: the id -> name -> colour table for a run.
 
-    A sibling of classes.txt, not a replacement. classes.txt has to stay a plain
-    importable name list, so the colour key lives here, in plain text, next to
-    the labels it explains.
+    This is THE record of what each saved class id means; the old classes.txt
+    duplicated the name column and was retired, so a stale one from an earlier
+    run is removed here rather than left to drift out of sync with the labels.
 
     The quoted colours are the ones in the annotated_<model> review images that
     sit beside this file (class_color_image_rgb), which is also what the legend
@@ -262,6 +244,12 @@ def save_class_colors_txt(names, output_dir):
         f.write("# " + _line(head) + "\n")
         for r in rows:
             f.write("  " + _line(r) + "\n")
+    stale = os.path.join(output_dir, "classes.txt")
+    try:
+        if os.path.exists(stale):
+            os.remove(stale)
+    except OSError:
+        pass
     return path
 
 def _mask_to_polys(result, min_area_frac=0.04):

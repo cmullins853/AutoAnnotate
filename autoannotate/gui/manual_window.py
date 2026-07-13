@@ -15,7 +15,7 @@ from ..imageio import imread_unicode, imwrite_unicode
 from ..pipeline import sam as sam_module
 from ..pipeline.dino import load_dino_model, run_dino_from_model
 from ..pipeline.labels import (_mask_to_polys, result_clean_polys, save_boxes_yolo,
-                               save_class_colors_txt, save_classes_txt, save_masks,
+                               save_class_colors_txt, save_masks,
                                save_polys_yolo, verify_boxes_round_trip)
 from ..pipeline.overlay import (adjust_masks, draw_boxes_on_image, overlay_with_borders,
                                 save_class_legend_image)
@@ -33,8 +33,8 @@ from .style import (BTN_BLUE, BTN_GAP, BTN_GREEN, BTN_GREY, BTN_ORANGE, BTN_PURP
                     BTN_RED, MAX_BOX_CLASSES, TGL_DRAW_ON, TGL_EDIT_ON,
                     TOOLTIP_AUTODRAW, TOOLTIP_BOX, TOOLTIP_SEMIAUTO,
                     TOOLTIP_SEMIAUTO_EDIT, _SD_DEFAULT_NEG,
-                    _SD_DEFAULT_PROMPT, add_input_scheme_actions, btn_qss,
-                    chip_btn_qss, class_color_bgr, class_color_image_rgb,
+                    _SD_DEFAULT_PROMPT, DragOnlySlider, add_input_scheme_actions,
+                    btn_qss, chip_btn_qss, class_color_bgr, class_color_image_rgb,
                     class_color_qt, lock_during, slider_qss, toggle_qss,
                     tool_toggle_qss)
 
@@ -543,7 +543,7 @@ class ManualWindow(QtWidgets.QWidget):
         # kept in the in-process store so they survive moving between images
         # and round trips through the main menu, but a fresh launch always
         # starts from one unnamed class. Edited via the Classes... dialog and
-        # written verbatim into classes.txt and the legend image.
+        # written verbatim into class_colors.txt and the legend image.
         self.box_class_names = self._load_box_class_names()
 
         # Box prompts section: shown ONLY in Boxes mode (the Text/Boxes radio
@@ -586,13 +586,13 @@ class ManualWindow(QtWidgets.QWidget):
         _box_col.addLayout(_dc_row)
 
         # Class count + names. Opens the Box Classes dialog; the names persist
-        # across restarts and are what classes.txt records.
+        # across restarts and are what class_colors.txt records.
         self.box_classes_btn = QtWidgets.QPushButton("Classes…")
         self.box_classes_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
         self.box_classes_btn.setFixedHeight(self._prompt_field_h)
         self.box_classes_btn.setToolTip(
             "Choose how many kinds of box you draw and name each one. The names "
-            "are saved into classes.txt and the class_legend.png next to your "
+            "are saved into class_colors.txt and the class_legend.png next to your "
             "labels. Each class draws in its own color.\n\n"
             "SAM3 searches for one class at a time, so every extra class adds "
             "one more SAM3 pass per image.")
@@ -656,7 +656,7 @@ class ManualWindow(QtWidgets.QWidget):
         def _cs_slider(label_text, lo, init):
             lab = QtWidgets.QLabel(label_text)
             lab.setStyleSheet(lbl_style)
-            s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            s = DragOnlySlider(QtCore.Qt.Horizontal)
             s.setRange(lo, 100)
             s.setValue(init)
             s.setFixedHeight(30)
@@ -678,6 +678,28 @@ class ManualWindow(QtWidgets.QWidget):
         left_layout.addWidget(self.class_settings_panel)
         self.class_settings_panel.setVisible(False)
 
+        # The three global sliders live inside their own collapsible dropdown,
+        # same pattern as the Prompts section: the values keep applying while
+        # collapsed, only the widgets hide, so the control column stays short.
+        self.sliders_toggle_btn = QtWidgets.QPushButton("Sliders ▸")
+        self.sliders_toggle_btn.setCheckable(True)
+        self.sliders_toggle_btn.setChecked(False)
+        self.sliders_toggle_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
+        self.sliders_toggle_btn.setFixedHeight(int(btn_h * 0.8))
+        self.sliders_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                              QtWidgets.QSizePolicy.Fixed)
+        self.sliders_toggle_btn.setToolTip(
+            "Show or hide the detector confidence, segmenter confidence and "
+            "max detection size sliders. The values stay in effect while "
+            "collapsed.")
+        self.sliders_toggle_btn.toggled.connect(self._toggle_sliders_panel)
+        left_layout.addWidget(self.sliders_toggle_btn)
+
+        self.sliders_panel = QtWidgets.QWidget()
+        _sl_layout = QtWidgets.QVBoxLayout(self.sliders_panel)
+        _sl_layout.setContentsMargins(0, 0, 0, 0)
+        _sl_layout.setSpacing(4)
+
         self.global_sliders_header = QtWidgets.QLabel("Global sliders (all classes)")
         self.global_sliders_header.setStyleSheet(lbl_style)
         self.global_sliders_header.setToolTip(
@@ -685,24 +707,24 @@ class ManualWindow(QtWidgets.QWidget):
             "then press Apply to All Classes to overwrite every class's "
             "individual settings, or Revert. Runs are blocked while a change "
             "sits unapplied.")
-        left_layout.addWidget(self.global_sliders_header)
+        _sl_layout.addWidget(self.global_sliders_header)
         self.global_sliders_header.setVisible(False)
 
         # Detector confidence (filters detector-output boxes)
         det_label = QtWidgets.QLabel("Detector confidence: 50")
         det_label.setStyleSheet(lbl_style)
         det_label.setToolTip("Higher = fewer but more confident detections from the detector.\nNote: YOLOE detectors auto-rescale this slider into their practical range (slider 25 ~= 0.05, slider 50 ~= 0.10, slider 100 ~= 0.20). DINO/SAM use the raw value.")
-        left_layout.addWidget(det_label)
+        _sl_layout.addWidget(det_label)
         self.detection_threshold_label = det_label
 
-        self.detection_threshold_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.detection_threshold_slider = DragOnlySlider(QtCore.Qt.Horizontal)
         self.detection_threshold_slider.setRange(0, 100)
         self.detection_threshold_slider.setValue(50)
         self.detection_threshold_slider.setFixedHeight(30)
         # Force QSS rendering; the native macOS slider drag-bubble can
         # render duplicated or off-position when the widget is height-pinned.
         self.detection_threshold_slider.setStyleSheet(slider_qss())
-        left_layout.addWidget(self.detection_threshold_slider)
+        _sl_layout.addWidget(self.detection_threshold_slider)
         self.detection_threshold_slider.valueChanged.connect(self._update_detection_threshold_label)
         self.confidence_slider = self.detection_threshold_slider  # legacy alias
 
@@ -714,15 +736,15 @@ class ManualWindow(QtWidgets.QWidget):
             "for YOLOE-seg it overrides detection threshold for the segmenter pass; "
             "for plain YOLOE+SAM it currently has no effect (SAM has no conf knob)."
         )
-        left_layout.addWidget(mask_label)
+        _sl_layout.addWidget(mask_label)
         self.mask_threshold_label = mask_label
 
-        self.mask_threshold_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.mask_threshold_slider = DragOnlySlider(QtCore.Qt.Horizontal)
         self.mask_threshold_slider.setRange(0, 100)
         self.mask_threshold_slider.setValue(30)
         self.mask_threshold_slider.setFixedHeight(30)
         self.mask_threshold_slider.setStyleSheet(slider_qss())
-        left_layout.addWidget(self.mask_threshold_slider)
+        _sl_layout.addWidget(self.mask_threshold_slider)
         self.mask_threshold_slider.valueChanged.connect(self._update_mask_threshold_label)
         self.box_threshold_slider = self.mask_threshold_slider  # legacy alias
 
@@ -743,15 +765,15 @@ class ManualWindow(QtWidgets.QWidget):
             "(e.g. blueberries at ~0.10-0.30); raise it for large objects you "
             "do want kept (e.g. a red leaf, near 1.00). Applies to every "
             "detector and to Auto Annotate Remaining.")
-        left_layout.addWidget(maxarea_label)
+        _sl_layout.addWidget(maxarea_label)
         self.max_area_label = maxarea_label
 
-        self.max_area_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.max_area_slider = DragOnlySlider(QtCore.Qt.Horizontal)
         self.max_area_slider.setRange(5, 100)
         self.max_area_slider.setValue(_maf_default)
         self.max_area_slider.setFixedHeight(30)
         self.max_area_slider.setStyleSheet(slider_qss())
-        left_layout.addWidget(self.max_area_slider)
+        _sl_layout.addWidget(self.max_area_slider)
         self.max_area_slider.valueChanged.connect(self._update_max_area_label)
 
         # Apply / Revert for the global sliders while per-class settings are
@@ -774,8 +796,11 @@ class ManualWindow(QtWidgets.QWidget):
         self.global_revert_btn.clicked.connect(self._revert_global_sliders)
         _ga_layout.addWidget(self.global_apply_btn)
         _ga_layout.addWidget(self.global_revert_btn)
-        left_layout.addWidget(self.global_apply_row)
+        _sl_layout.addWidget(self.global_apply_row)
         self.global_apply_row.setVisible(False)
+
+        left_layout.addWidget(self.sliders_panel)
+        self.sliders_panel.setVisible(False)
         self._global_dirty = False
         self._snapshot_globals()
         self.detection_threshold_slider.valueChanged.connect(self._on_global_slider_moved)
@@ -1009,11 +1034,12 @@ class ManualWindow(QtWidgets.QWidget):
         self.resize_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self.resize_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.resize_btn.setToolTip(
-            "Zoom (pinch / Ctrl+scroll) and pan (scroll) the image while STILL "
-            "drawing and editing with the left button. Pick Trackpad or Mouse "
-            "input in the dropdown. Your zoom stays after you turn this off; "
-            "the dropdown's Original Size (and Save & Confirm) returns the "
-            "image to its original size.")
+            "Zoom and pan the image while STILL drawing and editing with the "
+            "left button. Trackpad input: two-finger scroll pans, pinch zooms. "
+            "Mouse input: wheel zooms, right-drag pans. Pick the scheme in the "
+            "dropdown. Your zoom stays after you turn this off; the dropdown's "
+            "Original Size (and Save & Confirm) returns the image to its "
+            "original size.")
         self.resize_btn.toggled.connect(self._toggle_resize_mode)
         resize_menu = QtWidgets.QMenu()
         resize_menu.setToolTipsVisible(True)
@@ -1228,7 +1254,7 @@ class ManualWindow(QtWidgets.QWidget):
 
         sd_strength_row = QtWidgets.QHBoxLayout()
         sd_strength_row.setContentsMargins(0, 0, 0, 0)
-        self.sd_strength_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sd_strength_slider = DragOnlySlider(QtCore.Qt.Horizontal)
         self.sd_strength_slider.setRange(0, 100)
         self.sd_strength_slider.setValue(int(_SD_STRENGTH * 100))
         self.sd_strength_slider.setFixedHeight(30)
@@ -1341,6 +1367,13 @@ class ManualWindow(QtWidgets.QWidget):
         if hasattr(self, "prompts_panel"):
             self.prompts_panel.setVisible(checked)
         self.prompts_toggle_btn.setText("Prompts ▾" if checked else "Prompts ▸")
+
+    def _toggle_sliders_panel(self, checked):
+        """Show/hide the three global sliders. The slider values keep applying
+        while collapsed; only the widgets hide."""
+        if hasattr(self, "sliders_panel"):
+            self.sliders_panel.setVisible(checked)
+        self.sliders_toggle_btn.setText("Sliders ▾" if checked else "Sliders ▸")
 
     def _set_active_class(self, idx):
         """Single source of truth for the active draw class. Sets active_class,
@@ -2372,12 +2405,12 @@ class ManualWindow(QtWidgets.QWidget):
         return det_name + (f"_{seg_name}" if seg_name else "")
 
     def _write_class_key(self, names, output_folder=None):
-        """Write the three things that explain a run's class ids.
+        """Write the two things that explain a run's class ids.
 
-          classes.txt        plain YOLO name list, one per line, nothing else:
-                             importers read the whole line as the class name, so
-                             a trailing colour would rename every class.
-          class_colors.txt   which colour each id is drawn in, in plain text.
+          class_colors.txt   the id/name/colour table, in plain text. This is
+                             the record of what each saved class id means (the
+                             old classes.txt duplicated the name column and was
+                             retired; the writer removes a stale one).
           class_legend.png   the same key as an image, under annotated_<model>/,
                              BESIDE boxes/ and masks/ rather than inside them, so
                              no labelled review image is ever painted over.
@@ -2386,10 +2419,6 @@ class ManualWindow(QtWidgets.QWidget):
         folder = output_folder or self.output_folder
         if not folder or not names:
             return
-        try:
-            save_classes_txt(names, folder)
-        except Exception as e:
-            print(f"[classes] classes.txt write failed: {e}")
         try:
             save_class_colors_txt(names, folder)
         except Exception as e:
@@ -2929,7 +2958,7 @@ class ManualWindow(QtWidgets.QWidget):
 
     def _class_names_for_run(self, prompt):
         """Positive class names for the current run: parsed from the prompt,
-        with a one-item fallback so classes.txt is never empty. In Boxes mode
+        with a one-item fallback so the class table is never empty. In Boxes mode
         the names come from the Box Classes dialog."""
         if getattr(self, "prompt_mode", "text") == "boxes":
             return self._box_class_names()
@@ -2943,7 +2972,7 @@ class ManualWindow(QtWidgets.QWidget):
     def _max_box_class_used(self):
         """Highest box class id in play: the configured class count bounds it,
         never the boxes that happen to be drawn right now. Reading the drawn
-        boxes instead made classes.txt shrink to a single line the moment the
+        boxes instead made the class table shrink to a single row the moment the
         user advanced to an image they had not drawn on yet."""
         return max(len(self._box_class_names()) - 1,
                    self._max_drawn_box_class(),
@@ -5761,6 +5790,10 @@ class ManualWindow(QtWidgets.QWidget):
         image_path = self.images[self.current_image_index]
         prompt = (self._sd_prompt or "").strip() or _SD_DEFAULT_PROMPT
         neg_prompt = (self._sd_neg or "").strip() or None
+        # Read the slider HERE, on the GUI thread. The regenerate callback below
+        # runs on the preview dialog's worker thread, and a QWidget must never be
+        # touched from a thread that does not own it.
+        strength = self.sd_strength_slider.value() / 100.0
 
         self._busy = True
         self.gen_variation_btn.setEnabled(False)
@@ -5780,7 +5813,7 @@ class ManualWindow(QtWidgets.QWidget):
                 polys_xyxy_pixel=polys,
                 prompt=prompt,
                 negative_prompt=neg_prompt,
-                strength=self.sd_strength_slider.value() / 100.0,
+                strength=strength,
             )
         except Exception as e:
             import traceback
@@ -5798,6 +5831,8 @@ class ManualWindow(QtWidgets.QWidget):
             self._refresh_auto_annotate_enabled()
 
         def _regen():
+            # Runs on the dialog's worker thread: reads only the plain values
+            # captured above, never a widget.
             try:
                 new_var, _ = generate_variation(
                     image_path,
@@ -5805,7 +5840,7 @@ class ManualWindow(QtWidgets.QWidget):
                     polys_xyxy_pixel=polys,
                     prompt=prompt,
                     negative_prompt=neg_prompt,
-                    strength=self.sd_strength_slider.value() / 100.0,
+                    strength=strength,
                 )
                 return new_var
             except Exception as e:
@@ -6090,7 +6125,7 @@ class ManualWindow(QtWidgets.QWidget):
         os.makedirs(seg_dir, exist_ok=True)
         os.makedirs(box_dir, exist_ok=True)
 
-        # Keep classes.txt current with the label files so saved class ids
+        # Keep class_colors.txt current with the label files so saved class ids
         # stay interpretable (headless windows have no prompt fields).
         prompt_text = self._positive_prompt_text()
         self._write_class_key(self._class_names_for_run(prompt_text))
@@ -6973,18 +7008,34 @@ class ManualWindow(QtWidgets.QWidget):
                   f"({type(_e).__name__}: {_e}); skipping")
             return boxes
         if not neg_matches:
+            # Said out loud so a batch log shows the pass RAN and found
+            # nothing, rather than looking like it silently died.
+            print(f"[neg-box] no look-alikes found on "
+                  f"{os.path.basename(image_path)}")
             return boxes
         classes = self._det_classes_aligned
         polys = self._oneshot_polys_aligned
-        nb, nc, npoly = suppress_by_neg_boxes(
-            boxes, classes if classes is not None else [], polys, neg_matches)
+        try:
+            nb, nc, npoly = suppress_by_neg_boxes(
+                boxes, classes if classes is not None else [], polys, neg_matches)
+        except ValueError as _e:
+            # suppress_by_neg_boxes REFUSES misaligned parallel lists rather than
+            # mislabelling boxes, which is right for the filter but must not take
+            # the run down with it: unfiltered detections on one image beat an
+            # aborted Auto Annotate Remaining half way through a folder.
+            print(f"[neg-box] {_e}; skipping suppression on "
+                  f"{os.path.basename(image_path)}")
+            return boxes
         if classes is not None:
             self._det_classes_aligned = nc
         if polys is not None:
             self._oneshot_polys_aligned = npoly
         dropped = len(boxes) - len(nb)
-        if dropped:
-            print(f"[neg-box] suppressed {dropped} detection(s) matching a negative box")
+        # Printed even at 0 so the pass is auditable from the terminal: a
+        # look-alike that overlapped no positive suppresses nothing, and that
+        # used to be indistinguishable from the pass not running at all.
+        print(f"[neg-box] {len(neg_matches)} look-alike region(s), "
+              f"suppressed {dropped} detection(s) matching a negative box")
         return nb
 
     def _batch_chunk_size(self):
@@ -7229,7 +7280,7 @@ class ManualWindow(QtWidgets.QWidget):
         # an earlier image is kept when this one has none drawn.
         self._refresh_neg_box_ref()
 
-        # One classes.txt + color legend per output folder, from this run's classes.
+        # One class_colors.txt + color legend per output folder, from this run's classes.
         self._write_class_key(self._class_names_for_run(prompt))
 
         # Auto Annotate Remaining always overwrites: each per-image

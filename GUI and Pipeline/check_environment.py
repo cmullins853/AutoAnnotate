@@ -109,16 +109,16 @@ def main():
             print(f"  {WARN} {mod:<14} not found -> {note}")
 
     # ── per-user settings + image I/O ─────────────────────────────────────────
-    # The box-prompt class names persist to a per-user JSON file, and every
-    # image read/write goes through numpy so paths with non-ASCII characters
-    # work on Windows (OpenCV's own imread/imwrite use the ANSI API there and
-    # fail silently). Both are exercised here rather than trusted.
+    # The per-user settings dir has to be creatable and writable, and every image
+    # read/write goes through numpy so paths with non-ASCII characters work on
+    # Windows (OpenCV's own imread/imwrite use the ANSI API there and fail
+    # silently). Both are exercised here rather than trusted.
     header("Per-user settings and image I/O")
     try:
         sys.path.insert(0, REPO_ROOT)
         from autoannotate.config import USER_CONFIG_DIR, user_config_path
         probe = user_config_path(".write_probe")
-        with open(probe, "w", encoding="utf-8") as f:
+        with open(probe, "w", encoding="utf-8", newline="\n") as f:
             f.write("ok")
         os.remove(probe)
         print(f"  {OK} settings dir writable : {USER_CONFIG_DIR}")

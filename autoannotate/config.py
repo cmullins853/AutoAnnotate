@@ -106,9 +106,14 @@ WEIGHTS_DIR = os.path.join(REPO_ROOT, "GUI and Pipeline")
 BASE_DIR = WEIGHTS_DIR
 
 # Per-user settings that must outlive a single run and follow the user rather
-# than the checkout (currently just the box-prompt class names). expanduser
-# resolves to ~/.autoannotate on macOS/Linux and %USERPROFILE%\.autoannotate on
-# Windows, so the same code path serves every OS.
+# than the checkout. expanduser resolves to ~/.autoannotate on macOS/Linux and
+# %USERPROFILE%\.autoannotate on Windows, so the same code path serves every OS.
+#
+# NOTHING currently writes here. The box-prompt class names used to, and are now
+# deliberately session-only (see gui/session_state.py: they outlive the window
+# but never the app). This is kept as the one place a future persisted setting
+# should go, and check_environment probes it so a read-only home directory is
+# caught before something depends on it.
 USER_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".autoannotate")
 
 

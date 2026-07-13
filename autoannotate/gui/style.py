@@ -34,13 +34,24 @@ def class_color_qt(idx):
     return QtGui.QColor(*class_color_rgb(idx))
 
 
+class DragOnlySlider(QtWidgets.QSlider):
+    """QSlider that a passing scroll wheel cannot move.
+
+    The control column scrolls; a wheel gesture crossing a threshold slider
+    used to silently change it. Ignoring the wheel here hands the event to the
+    scroll area, so thresholds only change by a direct drag or click."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 def add_input_scheme_actions(menu, parent):
     """Append the Trackpad/Mouse input-scheme picker to an Image Resize menu.
 
     One shared session flag drives every view (the annotation canvas and both
     side-by-side panes): trackpads pan with a two-finger scroll and zoom by
-    pinching, mice pan with the wheel (Shift for sideways) and zoom with
-    Ctrl/Cmd + wheel. The menu re-reads the flag on show, so the different
+    pinching, mice zoom with the wheel and pan with a right-button drag, no
+    modifier keys. The menu re-reads the flag on show, so the different
     windows' menus can never disagree."""
     from . import session_state
 
@@ -52,7 +63,7 @@ def add_input_scheme_actions(menu, parent):
             ("trackpad", "Trackpad input",
              "Two-finger scroll pans, pinch zooms. Left-drag draws."),
             ("mouse", "Mouse input",
-             "Wheel pans, Shift+wheel pans sideways, Ctrl/Cmd+wheel zooms. "
+             "Wheel zooms toward the cursor, right-drag pans. "
              "Left-drag draws.")):
         act = QtWidgets.QAction(label, parent)
         act.setCheckable(True)

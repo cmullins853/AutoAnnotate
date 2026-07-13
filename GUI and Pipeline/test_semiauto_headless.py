@@ -9,7 +9,7 @@ rendering.
 Run with the repo venv:
     QT_QPA_PLATFORM=offscreen .venv/bin/python "GUI and Pipeline/test_semiauto_headless.py"
 """
-import os, sys, types
+import os, sys, tempfile, types
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 # ── Stub the heavy modules so the package can import without them ─────────
@@ -127,6 +127,18 @@ _results = []
 def check(name, cond, detail=""):
     _results.append((name, bool(cond), detail))
     print(("PASS" if cond else "FAIL"), "-", name, ("" if cond else f"  [{detail}]"))
+
+_skipped = []
+def skip(name, why):
+    """Record a check that could NOT run on this machine.
+
+    A bare `return` out of a test used to make its checks simply vanish: the run
+    still printed "all checks passed" while quietly testing less, and the total
+    is the only thing anyone reads. A skip is reported in the summary instead, so
+    a missing dependency or a missing vendored file is visible rather than silent.
+    """
+    _skipped.append((name, why))
+    print("SKIP -", name, f"  [{why}]")
 
 def mk_window():
     """Bare ManualWindow: skips the heavy __init__/model load but initializes
@@ -1885,7 +1897,7 @@ t49()
 def t50():
     import tempfile, os as _os
     from autoannotate.pipeline.labels import save_boxes_yolo as _sb, \
-        save_polys_yolo as _sp, save_classes_txt as _sc
+        save_polys_yolo as _sp
     d = tempfile.mkdtemp()
     img = _os.path.join(d, "img.jpg")  # cv2.imread is stubbed to 100x100
     _sb([[10, 10, 30, 30], [40, 40, 60, 60]], img, d)
@@ -1900,9 +1912,6 @@ def t50():
     first_cols = [l.split()[0] for l in open(_os.path.join(d, "img.txt"))]
     check("T50 polys skip degenerate but keep class alignment",
           first_cols == ["2", "1"], first_cols)
-    _sc(["blueberry", "leaf"], d)
-    names = open(_os.path.join(d, "classes.txt")).read().splitlines()
-    check("T50 classes.txt one name per line", names == ["blueberry", "leaf"], names)
 
 t50()
 
@@ -2369,9 +2378,9 @@ def t61():
 t61()
 
 # ══════════════════════════════════════════════════════════════════════════
-# T62: classes.txt must not shrink. _max_box_class_used is bounded by the
+# T62: the class table must not shrink. _max_box_class_used is bounded by the
 # configured class count, not by whichever boxes happen to be drawn right now
-# (advancing to an undrawn image used to rewrite classes.txt down to one line).
+# (advancing to an undrawn image used to rewrite the table down to one row).
 # ══════════════════════════════════════════════════════════════════════════
 def t62():
     import types as _types
@@ -2384,7 +2393,7 @@ def t62():
         get_prompt_boxes_with_cls_in_image_coords=lambda: ([], []))
     check("T62 no drawn boxes -> count from the registry",
           w._max_box_class_used() == 2, w._max_box_class_used())
-    check("T62 classes.txt keeps every configured name",
+    check("T62 class table keeps every configured name",
           w._class_names_for_run("") == ["berry", "leaf", "stem"],
           w._class_names_for_run(""))
 
@@ -2857,7 +2866,7 @@ def t70():
     out = (res.stdout or "").strip().splitlines()
     got = out[-1] if out else ""
     if res.returncode != 0 and "ModuleNotFoundError" in (res.stderr or ""):
-        print("SKIP - T70 unicode round-trip (real cv2 not installed)")
+        skip("T70 unicode round-trip", "real cv2 not installed")
         return
     check("T70 non-ASCII write+read round-trips", got.startswith("1 1"),
           got or (res.stderr or "")[-300:])
@@ -2932,29 +2941,25 @@ def t71():
 t71()
 
 # ══════════════════════════════════════════════════════════════════════════
-# T72: classes.txt stays a plain YOLO name list (importers read the WHOLE line
-# as the class name, so a trailing colour would rename every class). The colour
-# key lives in the sibling class_colors.txt.
+# T72: class_colors.txt is THE class record (classes.txt was retired as
+# redundant: the name column already lives in the colour table). The writer
+# also removes a stale classes.txt so an old one cannot drift out of sync.
 # ══════════════════════════════════════════════════════════════════════════
 def t72():
     import tempfile as _tf
 
-    save_classes_txt = G["save_classes_txt"]
     save_class_colors_txt = G["save_class_colors_txt"]
     from autoannotate.palette import class_color_image_rgb, rgb_to_hex
 
     with _tf.TemporaryDirectory() as d:
-        save_classes_txt(["berry", "leaf"], d)
-        lines = open(os.path.join(d, "classes.txt")).read().splitlines()
-        check("T72 classes.txt is one bare name per line", lines == ["berry", "leaf"], lines)
-        check("T72 classes.txt has no colour on any line",
-              all("#" not in ln for ln in lines), lines)
-        check("T72 classes.txt line index is the class id",
-              lines.index("leaf") == 1, lines)
-
+        # A classes.txt left over from a pre-retirement run must be cleaned up.
+        with open(os.path.join(d, "classes.txt"), "w", encoding="utf-8") as f:
+            f.write("stale\n")
         path = save_class_colors_txt(["berry", "leaf"], d)
-        check("T72 class_colors.txt written beside classes.txt",
+        check("T72 class_colors.txt written",
               path == os.path.join(d, "class_colors.txt") and os.path.exists(path), path)
+        check("T72 stale classes.txt removed",
+              not os.path.exists(os.path.join(d, "classes.txt")), "still there")
         text = open(path, encoding="utf-8").read()
         body = [ln for ln in text.splitlines() if ln and not ln.lstrip().startswith("#")]
         check("T72 one colour row per class", len(body) == 2, body)
@@ -3145,10 +3150,11 @@ def t74():
 t74()
 
 # ══════════════════════════════════════════════════════════════════════════
-# T75: input schemes + drawing on the zoomed view. Scroll pans (per the
-# Trackpad/Mouse scheme) and Ctrl/Cmd+scroll zooms, so the left button draws
-# and edits even while Image Resize is on; every coordinate routes through
-# the zoom/pan transform, so a zoomed draw lands where it looks.
+# T75: input schemes + drawing on the zoomed view. Trackpad: scroll pans,
+# Ctrl/Cmd+scroll zooms. Mouse: the wheel zooms and a right-drag pans, no
+# modifier keys. Either way the left button draws and edits even while Image
+# Resize is on; every coordinate routes through the zoom/pan transform, so a
+# zoomed draw lands where it looks.
 # ══════════════════════════════════════════════════════════════════════════
 def t75():
     import sys as _sys
@@ -3163,14 +3169,19 @@ def t75():
         session_state.STATE["input_scheme"] = "mouse"
         check("T75 explicit scheme wins", input_scheme() == "mouse", input_scheme())
 
-        check("T75 plain scroll pans", classify_wheel("mouse", 0, -40) == ("pan", 0, -40),
+        check("T75 mouse wheel zooms", classify_wheel("mouse", 0, -40) == ("zoom", -40),
               classify_wheel("mouse", 0, -40))
+        check("T75 trackpad scroll pans",
+              classify_wheel("trackpad", 0, -40) == ("pan", 0, -40),
+              classify_wheel("trackpad", 0, -40))
         check("T75 ctrl+scroll zooms in both schemes",
               classify_wheel("mouse", 0, 30, ctrl=True) == ("zoom", 30)
               and classify_wheel("trackpad", 0, 30, ctrl=True) == ("zoom", 30),
               "mismatch")
-        check("T75 mouse shift+wheel pans sideways",
-              classify_wheel("mouse", 0, 25, shift=True) == ("pan", 25, 0),
+        # The user asked for plain mouse inputs only: no Shift/Ctrl chords, so
+        # a modifier held during a mouse wheel changes nothing.
+        check("T75 mouse ignores shift (wheel still zooms)",
+              classify_wheel("mouse", 0, 25, shift=True) == ("zoom", 25),
               classify_wheel("mouse", 0, 25, shift=True))
         check("T75 trackpad supplies both axes itself",
               classify_wheel("trackpad", 12, -7, shift=True) == ("pan", 12, -7),
@@ -3201,8 +3212,33 @@ def t75():
         check("T75 left press in resize mode starts a draw drag",
               c._drag_start is not None, c._drag_start)
 
-        # The old left-drag pan is gone from the canvas (pan lives on the
-        # wheel now); the side-by-side panes keep it, having no drawing.
+        # Right-button drag pans in resize mode; a right press that comes
+        # straight back up is still a plain right-click (delete/point removal),
+        # decided by whether the cursor moved past the dead-zone.
+        ev = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                               QtCore.QPointF(100, 100), QtCore.Qt.RightButton,
+                               QtCore.Qt.RightButton, QtCore.Qt.NoModifier)
+        c.mousePressEvent(ev)
+        check("T75 right press in resize mode arms a pan",
+              c._pan_drag_last is not None, c._pan_drag_last)
+        before = (c._pan_x, c._pan_y)
+        mv = QtGui.QMouseEvent(QtCore.QEvent.MouseMove,
+                               QtCore.QPointF(130, 120), QtCore.Qt.NoButton,
+                               QtCore.Qt.RightButton, QtCore.Qt.NoModifier)
+        c.mouseMoveEvent(mv)
+        check("T75 right drag pans the zoomed view",
+              (c._pan_x, c._pan_y) != before and c._pan_drag_moved,
+              (before, (c._pan_x, c._pan_y)))
+        rel = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonRelease,
+                                QtCore.QPointF(130, 120), QtCore.Qt.RightButton,
+                                QtCore.Qt.NoButton, QtCore.Qt.NoModifier)
+        c.mouseReleaseEvent(rel)
+        check("T75 pan disarmed on release", c._pan_drag_last is None,
+              c._pan_drag_last)
+
+        # The old left-drag pan is gone from the canvas (trackpads pan with
+        # the wheel, mice with a right-drag); the side-by-side panes keep
+        # their drag-pan, having no drawing.
         canvas_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "canvas.py"),
                           encoding="utf-8").read()
         check("T75 canvas has no left-drag pan left", "_pan_last" not in canvas_src,
@@ -3224,7 +3260,7 @@ t75()
 def t76_labels():
     import tempfile, os as _os
     from autoannotate.pipeline.labels import (save_boxes_yolo, save_polys_yolo,
-                                              save_classes_txt,
+                                              save_class_colors_txt,
                                               verify_boxes_round_trip)
     d = tempfile.mkdtemp()
     img = _os.path.join(d, "img.jpg")          # imread_unicode is stubbed 100x100
@@ -3265,13 +3301,13 @@ def t76_labels():
     check("T76 save_polys_yolo creates its output dir",
           _os.path.exists(_os.path.join(fresh, "img.txt")))
 
-    # classes.txt is positional: line N IS class id N, so an embedded newline
-    # would shift the id of every class after it.
+    # The class table is positional: row N IS class id N, so an embedded
+    # newline would shift the id of every class after it.
     try:
-        save_classes_txt(["berry", "leaf\nstem"], d)
-        check("T76 save_classes_txt rejects newline in a name", False, "no error")
+        save_class_colors_txt(["berry", "leaf\nstem"], d)
+        check("T76 save_class_colors_txt rejects newline in a name", False, "no error")
     except ValueError:
-        check("T76 save_classes_txt rejects newline in a name", True)
+        check("T76 save_class_colors_txt rejects newline in a name", True)
 
     orig = G.get("imread_unicode")
     G["imread_unicode"] = lambda *a, **k: None
@@ -3297,6 +3333,32 @@ def t76_postfilter():
         [[0, 0, 10, 10], [0, 0, 10, 10], [50, 50, 60, 60]], [0, 1, 0], None, n_pos=1)
     check("T76 negative suppresses the positive it overlaps",
           b == [[50, 50, 60, 60]] and c == [0], (b, c))
+
+    # Misaligned parallel lists must RAISE, never be absorbed. A short class list
+    # used to shift every class id after the gap onto the wrong box, and a short
+    # poly list raised IndexError from deep inside the loop. Validation runs
+    # before the early returns, so even a call that would have short-circuited
+    # into a no-op (n_pos=0, no negatives) is still rejected.
+    from autoannotate.pipeline.postfilter import suppress_by_neg_boxes
+    b3 = [[0, 0, 9, 9], [10, 10, 19, 19], [20, 20, 29, 29]]
+    for name, fn in [
+        ("neg_boxes short classes", lambda: suppress_by_neg_boxes(b3, [0, 1], None, [[0, 0, 9, 9]])),
+        ("neg_boxes short polys",   lambda: suppress_by_neg_boxes(b3, [0, 1, 2], [[(0, 0)]], [[0, 0, 9, 9]])),
+        ("neg_hits missing classes", lambda: suppress_negative_hits(b3, [], None, n_pos=1)),
+        ("neg_hits short classes",  lambda: suppress_negative_hits(b3, [0, 1], None, n_pos=1)),
+        ("neg_hits bad even at n_pos=0", lambda: suppress_negative_hits(b3, [0, 1], None, n_pos=0)),
+        ("neg_boxes bad even with no negatives", lambda: suppress_by_neg_boxes(b3, [0, 1], None, [])),
+    ]:
+        try:
+            fn()
+            check(f"T76 {name} rejected", False, "no error raised")
+        except ValueError:
+            check(f"T76 {name} rejected", True)
+    # ...and a single-class run, which legitimately carries no class info, still
+    # passes through suppress_by_neg_boxes untouched.
+    kept, _, _ = suppress_by_neg_boxes(b3, [], None, [[0, 0, 9, 9]])
+    check("T76 empty classes still fine for geometry-only suppression",
+          kept == [[10, 10, 19, 19], [20, 20, 29, 29]], kept)
 
 t76_postfilter()
 
@@ -3471,36 +3533,43 @@ t76_config_env()
 # ══════════════════════════════════════════════════════════════════════════
 def t77_text_io_is_explicit():
     import re as _re
-    pkg = os.path.join(_REPO_ROOT, "autoannotate")
     # Python's open() defaults to the LOCALE encoding (cp1252 on a Windows box)
     # and to newline translation (\n -> \r\n on write). Both are invisible on
     # macOS/Linux: a non-ASCII class name or prompt raises UnicodeDecodeError
     # only on Windows, and a dataset saved on Windows comes out byte-different
     # from the same dataset saved on a Mac. Every text handle states both.
+    #
+    # EVERY shipped file, not just the package: run_app.py and check_environment.py
+    # are what a Windows user actually launches, and an unencoded open() in them
+    # fails exactly the same way. This test file is excluded; it never ships.
+    targets = []
+    for root, _dirs, files in os.walk(os.path.join(_REPO_ROOT, "autoannotate")):
+        targets += [os.path.join(root, f) for f in sorted(files) if f.endswith(".py")]
+    targets += [os.path.join(_REPO_ROOT, "run_app.py"),
+                os.path.join(_REPO_ROOT, "GUI and Pipeline", "check_environment.py")]
     offenders, writers = [], []
-    for root, _dirs, files in os.walk(pkg):
-        for fn in sorted(files):
-            if not fn.endswith(".py"):
+    for fp in targets:
+        if not os.path.exists(fp):
+            check(f"T77 {os.path.basename(fp)} exists", False, "missing")
+            continue
+        rel = os.path.relpath(fp, _REPO_ROOT)
+        for i, line in enumerate(open(fp, encoding="utf-8"), 1):
+            code = line.split("#", 1)[0]
+            # Image.open is PIL, not a text handle, and takes no encoding.
+            # `open()` with no argument is prose in a docstring, not a call.
+            if not _re.search(r"(?<!Image\.)\bopen\(\s*[^)\s]", code):
                 continue
-            fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, _REPO_ROOT)
-            for i, line in enumerate(open(fp, encoding="utf-8"), 1):
-                code = line.split("#", 1)[0]
-                # Image.open is PIL, not a text handle, and takes no encoding.
-                # `open()` with no argument is prose in a docstring, not a call.
-                if not _re.search(r"(?<!Image\.)\bopen\(\s*[^)\s]", code):
-                    continue
-                if "imread" in code or "imwrite" in code:
-                    continue
-                if _re.search(r"['\"][rwa]b['\"]", code):     # binary: no encoding needed
-                    continue
-                if "encoding=" not in code:
-                    offenders.append(f"{rel}:{i}")
-                # Any TEXT WRITE must also pin the newline, or Windows turns
-                # every \n into \r\n and the dataset stops matching a Mac's.
-                # newline="" is the csv module's own contract and counts.
-                if _re.search(r"['\"]w['\"]", code) and "newline=" not in code:
-                    writers.append(f"{rel}:{i}")
+            if "imread" in code or "imwrite" in code:
+                continue
+            if _re.search(r"['\"][rwa]b['\"]", code):     # binary: no encoding needed
+                continue
+            if "encoding=" not in code:
+                offenders.append(f"{rel}:{i}")
+            # Any TEXT WRITE must also pin the newline, or Windows turns
+            # every \n into \r\n and the dataset stops matching a Mac's.
+            # newline="" is the csv module's own contract and counts.
+            if _re.search(r"['\"]w['\"]", code) and "newline=" not in code:
+                writers.append(f"{rel}:{i}")
     check("T77 every text handle declares an encoding", not offenders, offenders[:6])
     check("T77 every text writer pins newline", not writers, writers[:6])
 
@@ -3509,15 +3578,15 @@ t77_text_io_is_explicit()
 
 def t77_label_bytes_are_platform_stable():
     import tempfile, os as _os
-    from autoannotate.pipeline.labels import save_boxes_yolo, save_classes_txt
+    from autoannotate.pipeline.labels import save_boxes_yolo, save_class_colors_txt
     d = tempfile.mkdtemp()
     img = _os.path.join(d, "img.jpg")
     save_boxes_yolo([[10, 10, 30, 30]], img, d, classes=[1])
     raw = open(_os.path.join(d, "img.txt"), "rb").read()
     check("T77 label file uses LF, never CRLF", b"\r\n" not in raw and raw.endswith(b"\n"), raw)
-    save_classes_txt(["berry", "leaf"], d)
-    raw = open(_os.path.join(d, "classes.txt"), "rb").read()
-    check("T77 classes.txt uses LF, never CRLF", b"\r\n" not in raw, raw)
+    save_class_colors_txt(["berry", "leaf"], d)
+    raw = open(_os.path.join(d, "class_colors.txt"), "rb").read()
+    check("T77 class_colors.txt uses LF, never CRLF", b"\r\n" not in raw, raw)
 
 t77_label_bytes_are_platform_stable()
 
@@ -3530,6 +3599,8 @@ def t77_no_hardcoded_cuda_autocast():
     fp = os.path.join(_REPO_ROOT, "autoannotate study", "GroundingDINO", "groundingdino",
                       "models", "GroundingDINO", "transformer.py")
     if not os.path.exists(fp):
+        skip("T77 GroundingDINO autocast is not hard-coded to cuda",
+             "vendored GroundingDINO source not present")
         return
     src = open(fp, encoding="utf-8").read()
     check("T77 GroundingDINO autocast is not hard-coded to cuda",
@@ -3576,8 +3647,344 @@ def t77_platform_device_defaults():
 t77_platform_device_defaults()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# T78: the SD regenerate runs OFF the GUI thread. Regenerate is a full Stable
+# Diffusion inpaint (seconds on a GPU, minutes on CPU); running it inline froze
+# the dialog for its whole duration and Windows offered to kill the app. These
+# checks drive a real Qt event loop, so they fail if the work ever moves back
+# onto the GUI thread or if a live thread can outlive the dialog.
+# ══════════════════════════════════════════════════════════════════════════
+def t78_regen_is_threaded():
+    import time as _t, threading as _th
+    from PIL import Image as _Image
+    import autoannotate.gui.dialogs as _dlg_mod
+    VariationPreviewDialog = G["VariationPreviewDialog"]
+
+    def _pump(pred, timeout=5.0):
+        t0 = _t.time()
+        while not pred() and _t.time() - t0 < timeout:
+            app.processEvents()
+            _t.sleep(0.005)
+        return pred()
+
+    orig = _Image.new("RGB", (16, 16), "red")
+    var0 = _Image.new("RGB", (16, 16), "green")
+    var1 = _Image.new("RGB", (16, 16), "blue")
+    gui_tid = _th.get_ident()
+    seen = {}
+
+    def slow_cb():
+        seen["tid"] = _th.get_ident()
+        _t.sleep(0.3)
+        return var1
+
+    d = VariationPreviewDialog(orig, var0, regenerate_cb=slow_cb)
+    t0 = _t.time()
+    d._regen()
+    returned_in = _t.time() - t0
+    # The whole point: the click returns AT ONCE. Inline, this took as long as
+    # the inpaint and the window was frozen for every millisecond of it.
+    check("T78 _regen returns immediately (does not block the GUI)",
+          returned_in < 0.15, f"{returned_in:.3f}s")
+    check("T78 button disabled while generating", not d.regen_btn.isEnabled())
+    # Save is disabled too. The result arrives on a QUEUED signal, so a Save taken
+    # mid-inpaint could only write the image the user is NOT looking at, and which
+    # of the two landed on disk would come down to event-delivery order.
+    check("T78 save disabled while generating", not d.save_btn.isEnabled())
+
+    # A timer only fires if the GUI thread is actually alive during the work.
+    ticks = {"n": 0}
+    timer = QtCore.QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.__setitem__("n", ticks["n"] + 1))
+    timer.start()
+    finished = _pump(lambda: d._regen_thread is None)
+    timer.stop()
+    check("T78 worker finished and cleaned up", finished, d._regen_thread)
+    check("T78 GUI stayed responsive during the inpaint", ticks["n"] > 0, ticks["n"])
+    check("T78 callback ran off the GUI thread", seen.get("tid") != gui_tid)
+    check("T78 new variation applied on the GUI thread", d.variation is var1)
+    check("T78 button re-armed", d.regen_btn.isEnabled() and d.regen_btn.text() == "Regenerate")
+    check("T78 save re-armed", d.save_btn.isEnabled())
+
+    # Failure inside the worker must surface. An exception cannot cross a thread
+    # boundary, so it travels as a message on the `failed` signal.
+    warned = {}
+    real_warn = QtWidgets.QMessageBox.warning
+    QtWidgets.QMessageBox.warning = staticmethod(
+        lambda *a, **k: warned.update(hit=True))
+    try:
+        def boom():
+            raise RuntimeError("SD ran out of memory")
+        d2 = VariationPreviewDialog(orig, var0, regenerate_cb=boom)
+        d2._regen()
+        _pump(lambda: d2._regen_thread is None)
+        check("T78 worker failure surfaces to the user", warned.get("hit") is True)
+        check("T78 button re-armed after a failure", d2.regen_btn.isEnabled())
+        check("T78 failed regenerate leaves the variation alone", d2.variation is var0)
+    finally:
+        QtWidgets.QMessageBox.warning = real_warn
+
+    # Tearing the dialog down under a live thread aborts the process with
+    # "QThread: Destroyed while thread is still running". JOINING to avoid that
+    # would freeze the GUI for the rest of the inpaint, which is the very freeze
+    # the worker exists to remove, so Cancel DETACHES: it returns at once, the
+    # thread is no longer owned by the dialog, and the abandoned result never
+    # reaches it. The process surviving this block at all is half the test.
+    d3 = VariationPreviewDialog(orig, var0, regenerate_cb=slow_cb)
+    d3._regen()
+    was_running = d3._regen_thread is not None and d3._regen_thread.isRunning()
+    t0 = _t.time()
+    d3.reject()
+    cancel_took = _t.time() - t0
+    check("T78 cancel mid-inpaint returns at once (does not join)",
+          was_running and cancel_took < 0.15, f"{cancel_took:.3f}s")
+    check("T78 cancel cuts the worker loose from the dialog",
+          d3._regen_thread is None and d3._regen_worker is None)
+    _pump(lambda: False, timeout=0.6)      # let the abandoned inpaint finish
+    check("T78 an abandoned regenerate never touches the closed dialog",
+          d3.variation is var0)
+    check("T78 the detached worker is reaped, not leaked",
+          not _dlg_mod._DETACHED_REGENS, _dlg_mod._DETACHED_REGENS)
+
+    # A second click must not start a second inpaint racing the first onto screen.
+    d4 = VariationPreviewDialog(orig, var0, regenerate_cb=slow_cb)
+    d4._regen()
+    first = d4._regen_thread
+    d4._regen()
+    check("T78 double-click does not start a second inpaint",
+          d4._regen_thread is first)
+    d4.reject()
+    # Drain the last detached worker: a QThread still running at interpreter exit
+    # takes the process down with it.
+    _pump(lambda: not _dlg_mod._DETACHED_REGENS, timeout=2.0)
+
+t78_regen_is_threaded()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T79: the review fixes that T76-T78 left unpinned. Each is a path that only
+# runs when something has already gone wrong (a corrupt image, a degenerate
+# mask, a failed unlink), which is exactly the code that never gets exercised
+# by hand and so silently rots.
+# ══════════════════════════════════════════════════════════════════════════
+def t79_dino_skips_unreadable_images():
+    import autoannotate.pipeline.dino as _dino
+    # load_image() RAISES on a corrupt/missing file, which killed the whole batch.
+    # It is the ONLY decode in the function (probing readability separately would
+    # decode every image in the folder twice), so the skip-and-carry-on fallback
+    # hangs off catching it.
+    real_load = _dino.load_image
+    def _boom(*a, **k):
+        raise RuntimeError("load_image: cannot identify image file")
+    try:
+        _dino.load_image = _boom
+        out = _dino.run_dino_from_model(object(), "corrupt.jpg", "berry", 0.3, 0.25,
+                                        save_dir=tempfile.mkdtemp())
+        check("T79 DINO skips a corrupt image instead of raising", out == [], out)
+        out3 = _dino.run_dino_from_model(object(), "corrupt.jpg", "berry", 0.3, 0.25,
+                                         save_dir=tempfile.mkdtemp(),
+                                         return_classes=True, return_scores=True)
+        check("T79 DINO fallback keeps the caller's tuple arity",
+              isinstance(out3, tuple) and len(out3) == 3 and all(x == [] for x in out3), out3)
+        # `[[]] * 3` would hand back THREE REFERENCES TO ONE list: appending a box
+        # would append a class id too. Each slot must be its own list.
+        boxes, cls_ids, scores = out3
+        boxes.append("box")
+        check("T79 DINO fallback lists are independent, not aliases",
+              cls_ids == [] and scores == [], (cls_ids, scores))
+    except RuntimeError as e:
+        check("T79 DINO skips a corrupt image instead of raising", False, str(e))
+    finally:
+        _dino.load_image = real_load
+
+t79_dino_skips_unreadable_images()
+
+
+def t79_sd_refuses_empty_preserve_mask():
+    from PIL import Image as _Image
+    import autoannotate.pipeline.sd as _sd
+    # The preserve mask is INVERTED before it reaches SD ("white = inpaint here"),
+    # so an empty preserve becomes an all-white mask and SD repaints the entire
+    # image straight over the objects it was called to protect.
+    d = tempfile.mkdtemp()
+    img = os.path.join(d, "im.png")
+    _Image.new("RGB", (64, 64), "red").save(img)
+    real_load = _sd.load_sd_inpaint
+    _sd.load_sd_inpaint = lambda **k: (_ for _ in ()).throw(
+        AssertionError("SD pipeline must not even load when nothing is preserved"))
+    try:
+        _sd.generate_variation(img, boxes_xyxy=[[5, 5, 5, 5]],   # degenerate
+                               polys_xyxy_pixel=[[(1, 1), (2, 2)]],  # < 3 points
+                               prompt="x")
+        check("T79 SD refuses to inpaint with an empty preserve mask", False, "no error")
+    except ValueError as e:
+        check("T79 SD refuses to inpaint with an empty preserve mask",
+              "preserve" in str(e).lower(), str(e))
+    except AssertionError as e:
+        check("T79 SD refuses to inpaint with an empty preserve mask", False, str(e))
+    finally:
+        _sd.load_sd_inpaint = real_load
+
+t79_sd_refuses_empty_preserve_mask()
+
+
+def t79_delete_is_transactional():
+    import autoannotate.gui.dialogs as _dlg
+    BatchVariationViewer = G["BatchVariationViewer"]
+    d = tempfile.mkdtemp()
+    img = os.path.join(d, "im.png")
+    lbl = os.path.join(d, "im.txt")
+
+    def _fresh():
+        open(img, "w", encoding="utf-8").write("x")
+        open(lbl, "w", encoding="utf-8").write("0 .5 .5 .1 .1\n")
+        v = BatchVariationViewer.__new__(BatchVariationViewer)
+        v.paths = [img]
+        v.idx = 0
+        v._label_path_for = lambda p: lbl
+        v._refresh = lambda: None
+        return v
+
+    # Happy path: both files go, entry leaves the list.
+    v = _fresh()
+    v._delete()
+    check("T79 delete removes image AND label together",
+          not os.path.exists(img) and not os.path.exists(lbl) and v.paths == [])
+
+    # Failure path: the label cannot be removed, so NOTHING may be removed. The
+    # old code deleted the image first and popped the entry regardless, orphaning
+    # the label with no way to retry.
+    v = _fresh()
+    warned = {}
+    real_warn = QtWidgets.QMessageBox.warning
+    real_replace = os.replace
+    def _replace(src, dst, *a, **k):
+        if str(src).endswith(".txt"):
+            raise OSError("simulated: label file is locked")
+        return real_replace(src, dst, *a, **k)
+    QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: warned.update(hit=True))
+    os.replace = _replace
+    try:
+        v._delete()
+    finally:
+        os.replace = real_replace
+        QtWidgets.QMessageBox.warning = real_warn
+    check("T79 a failed delete rolls back (no orphan)",
+          os.path.exists(img) and os.path.exists(lbl), (os.path.exists(img), os.path.exists(lbl)))
+    check("T79 a failed delete keeps the entry so it can be retried", v.paths == [img], v.paths)
+    check("T79 a failed delete tells the user", warned.get("hit") is True)
+    check("T79 rollback leaves no .deleting temp files",
+          not any(f.endswith(".deleting") for f in os.listdir(d)), os.listdir(d))
+
+t79_delete_is_transactional()
+
+
+def t79_keys_live_while_zoomed():
+    # Drawing already worked while zoomed (pan moved to the wheel), but the key
+    # handlers still bailed out on _resize_mode, so a zoomed-in outline could be
+    # started and then neither committed nor escaped.
+    c = mk_canvas()
+    closed = {"n": 0}
+    c.mask_close_requested.connect(lambda: closed.__setitem__("n", closed["n"] + 1))
+    c.set_mask_draw_mode(True, kind="semiauto")
+    c.set_resize_mode(True)                      # zoomed in
+    press(c, 30, 30, QtCore.Qt.LeftButton)
+    press(c, 60, 30, QtCore.Qt.LeftButton)
+    press(c, 60, 60, QtCore.Qt.LeftButton)
+    check("T79 points still land while zoomed", len(c._mask_points) == 3, len(c._mask_points))
+    keypress(c, QtCore.Qt.Key_Return)
+    check("T79 Enter still closes the outline while zoomed", closed["n"] == 1, closed["n"])
+    keypress(c, QtCore.Qt.Key_Escape)
+    check("T79 Escape still cancels while zoomed", not c._mask_points, c._mask_points)
+
+t79_keys_live_while_zoomed()
+
+
+def t79_llm_samples():
+    import ast as _ast, inspect as _inspect, textwrap as _tw
+    from autoannotate.gui import llm as _llm
+    # temperature and top_p are SILENTLY IGNORED unless do_sample=True: generate()
+    # defaults to greedy, which is the opposite of the varied, non-duplicate
+    # suggestions the prompt asks for. Checked against the source, because calling
+    # it would download and run a VLM.
+    #
+    # The CALL is parsed, not grepped for. A substring test passed on the comment
+    # that explains the fix, so deleting do_sample=True from generate() and leaving
+    # the comment behind kept the check green: it was testing the comment.
+    src = _tw.dedent(_inspect.getsource(_llm.generate_prompts))
+    kwargs = {}
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "generate"):
+            kwargs = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+    check("T79 LLM calls generate()", bool(kwargs), "no model.generate(...) found")
+    sampling = kwargs.get("do_sample")
+    check("T79 LLM generate enables sampling",
+          isinstance(sampling, _ast.Constant) and sampling.value is True,
+          _ast.dump(sampling) if sampling is not None else "do_sample not passed")
+    check("T79 LLM generate passes the sampling knobs it means to use",
+          "temperature" in kwargs and "top_p" in kwargs, sorted(kwargs))
+
+t79_llm_samples()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T80: "SAM found nothing on this image" must not take the image down with it.
+# segment_with_boxes promises one mask per box, index-aligned, or None. It was
+# instead handing back the raw results object when the model produced NO masks,
+# which is neither: save_masks then derived 0 segments from it while still
+# holding N class ids, raised, and failed the image mid-batch, leaving a stale
+# segments file that no longer matched boxes/. Only bites a multi-class run,
+# which is why nothing caught it.
+# ══════════════════════════════════════════════════════════════════════════
+def t80_empty_segmenter_output():
+    from autoannotate.pipeline.sam import segment_with_boxes
+    from autoannotate.pipeline.labels import save_masks
+
+    class _NoMasks:                 # ultralytics result when SAM finds nothing
+        masks = None
+
+    class _EmptyMasks:              # ...and when it returns an empty mask tensor
+        class masks:
+            class data:
+                shape = (0, 8, 8)
+
+    boxes = [[0, 0, 9, 9], [20, 20, 29, 29], [40, 40, 49, 49]]
+    for name, res in (("no masks", [_NoMasks()]), ("empty mask tensor", [_EmptyMasks()])):
+        out = segment_with_boxes(lambda *a, **k: res, "img.jpg", boxes)
+        check(f"T80 segmenter with {name} returns None, not a maskless result",
+              out is None, out)
+    check("T80 no boxes still returns None",
+          segment_with_boxes(lambda *a, **k: [_NoMasks()], "img.jpg", []) is None)
+
+    # The callers all guard on `is not None`, so None routes them to
+    # _clear_segment_file. Passing the maskless result through instead reached
+    # save_masks, and THIS is what it did with a 3-class run.
+    d = tempfile.mkdtemp()
+    img = os.path.join(d, "berry.jpg")
+    open(img, "wb").write(b"x")
+    try:
+        save_masks([_NoMasks()], d, img, classes=[0, 1, 0])
+        check("T80 the old maskless result would still break save_masks", False,
+              "no error: the guard in segment_with_boxes is now the only thing "
+              "standing between a mask-less run and a failed image")
+    except ValueError as e:
+        check("T80 the old maskless result would still break save_masks",
+              "0 segments but 3 classes" in str(e), str(e))
+
+t80_empty_segmenter_output()
+
+
 # ── summary ────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok, _ in _results if ok)
 total = len(_results)
 print(f"\n==== {passed}/{total} checks passed ====")
+if _skipped:
+    # Reported, not swallowed: a skip means this machine could not test something,
+    # and that has to be visible next to the total rather than shrinking it.
+    print(f"==== {len(_skipped)} skipped ====")
+    for name, why in _skipped:
+        print(f"     {name}  [{why}]")
 sys.exit(0 if passed == total else 1)

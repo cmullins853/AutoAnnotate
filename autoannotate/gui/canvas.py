@@ -62,6 +62,11 @@ class AnnotationCanvas(QtWidgets.QWidget):
         self._pan_x        = 0.0
         self._pan_y        = 0.0
         self._resize_mode  = False
+        # Right-button drag pan (Image Resize mode). Armed on press; only once
+        # the cursor actually travels does it become a pan, so a right-CLICK
+        # still performs its normal action on release.
+        self._pan_drag_last  = None
+        self._pan_drag_moved = False
         # Darken Tint: view-only dimming overlay (set via the Image Resize
         # dropdown). Pure paint-time effect, never baked or saved.
         self._dark_tint    = False
@@ -1030,12 +1035,15 @@ class AnnotationCanvas(QtWidgets.QWidget):
 
     # Zoom / pan (Image Resize mode)
     def set_resize_mode(self, enabled):
-        """Arm scroll-to-pan, pinch / Ctrl+wheel zoom. The left button keeps
-        DRAWING and editing even while the mode is on (every coordinate routes
-        through _get_scale_offset, so a zoomed draw lands exactly where it
-        looks). The zoom/pan PERSISTS after the mode is turned off; only
-        reset_view() (Save & Confirm / new image) returns to fit."""
+        """Arm zoom/pan per the input scheme (Trackpad: two-finger scroll pans,
+        pinch or Ctrl+wheel zooms; Mouse: wheel zooms, right-drag pans). The
+        left button keeps DRAWING and editing even while the mode is on (every
+        coordinate routes through _get_scale_offset, so a zoomed draw lands
+        exactly where it looks). The zoom/pan PERSISTS after the mode is turned
+        off; only reset_view() (Save & Confirm / new image) returns to fit."""
         self._resize_mode = bool(enabled)
+        self._pan_drag_last  = None
+        self._pan_drag_moved = False
 
     def reset_view(self):
         """Return to fit-to-window (zoom 1.0, no pan)."""
@@ -1093,9 +1101,10 @@ class AnnotationCanvas(QtWidgets.QWidget):
         if not self._resize_mode or not self._orig_w:
             super().wheelEvent(event)
             return
-        # Scroll PANS and Ctrl/Cmd+scroll zooms (pinch also zooms, in event()),
-        # so the left button stays free for drawing on the zoomed view. The
-        # Trackpad/Mouse scheme decides how Shift and the axes read.
+        # The left button stays free for drawing on the zoomed view in both
+        # schemes. Trackpad: scroll PANS, Ctrl/Cmd+scroll (or pinch, in
+        # event()) zooms. Mouse: the wheel ZOOMS; panning is a right-drag
+        # handled in the mouse handlers, never a wheel action.
         mods = event.modifiers()
         pd = event.pixelDelta()
         dx, dy = pd.x(), pd.y()
@@ -1455,7 +1464,73 @@ class AnnotationCanvas(QtWidgets.QWidget):
         if self.selected_index is None or self.selected_index not in self.selected_indices:
             self.selected_index = kept_idx[0]
 
+    def _right_click_action(self, pos):
+        """Everything a right CLICK means, in mode order. Shared by a plain
+        press and by a resize-mode right press that came back up without
+        dragging (a right DRAG pans instead; see mousePressEvent)."""
+        if self.mask_draw_mode and self._orig_w:
+            hit = self._hit_mask_point(pos)
+            if hit is not None:
+                self._mask_points.pop(hit)
+                if self._mask_draw_kind == "autodraw":
+                    self.mask_point_added.emit()   # refresh the live preview
+                self.update()
+            return
+        if self.semiauto_edit_mode and self._orig_w:
+            if self._semiauto_sel_idx is None:
+                return
+            if self._semiauto_edit_target == "vertices":
+                hit_v = self._hit_vertex(pos)
+                if hit_v is not None:
+                    ann = self._semiauto_selected_ann()
+                    if ann is not None:
+                        if len(ann['data']) > 3:
+                            del ann['data'][hit_v]
+                            self._mask_preview_poly = [list(p) for p in ann['data']]
+                            self.update()
+                        else:
+                            # At the 3-point floor, can't go lower; offer to
+                            # delete the whole mask instead.
+                            self.semiauto_min_vertex_delete.emit()
+                return
+            hit_pt = self._hit_mask_point(pos)
+            if hit_pt is not None:
+                self._mask_points.pop(hit_pt)      # remove a point
+                self.mask_point_added.emit()
+                self.update()
+            return
+        # Default: delete drawn manual/prompt rect anns whose widget projection
+        # contains the click point. Detector-output and polygon anns untouched.
+        removed = False
+        if self._orig_w:
+            for ann in self.annotations:
+                if ann['deleted'] or ann.get('source') not in ('manual', 'prompt') or ann['type'] != 'rect':
+                    continue
+                cx, cy, w, h = ann['data']
+                x1 = (cx - w / 2) * self._orig_w
+                y1 = (cy - h / 2) * self._orig_h
+                x2 = (cx + w / 2) * self._orig_w
+                y2 = (cy + h / 2) * self._orig_h
+                wb = self._image_xyxy_to_widget(x1, y1, x2, y2)
+                if wb is None:
+                    continue
+                if self._hit_box(pos, wb):
+                    ann['deleted'] = True
+                    removed = True
+        self.update()
+        if removed:
+            self.boxes_changed.emit()
+
     def mousePressEvent(self, event):
+        # Image Resize: a right-button DRAG pans the zoomed view (the Mouse
+        # scheme's pan gesture; harmless under Trackpad). Only armed here; if
+        # the button comes straight back up, mouseReleaseEvent runs the normal
+        # right-click action, so click-to-delete and point removal still work.
+        if (self._resize_mode and self._orig_w
+                and event.button() == QtCore.Qt.RightButton):
+            self._pan_drag_last  = event.pos()
+            self._pan_drag_moved = False
+            return
         # Interactive SAM mask drawing takes first crack. All points are
         # FOREGROUND. Consumes the gesture so it never falls through to draw/edit.
         #   autodraw -> a single point; SAM previews live, Enter commits.
@@ -1464,15 +1539,10 @@ class AnnotationCanvas(QtWidgets.QWidget):
         #               first point again / double-click / Enter), Google-Draw
         #               curve-tool style.
         # Right-click removes the nearest point. Image Resize does not suspend
-        # this: panning is on the scroll wheel, so clicks stay meaningful.
+        # this: panning never uses the left button, so clicks stay meaningful.
         if self.mask_draw_mode and self._orig_w:
             if event.button() == QtCore.Qt.RightButton:
-                hit = self._hit_mask_point(event.pos())
-                if hit is not None:
-                    self._mask_points.pop(hit)
-                    if self._mask_draw_kind == "autodraw":
-                        self.mask_point_added.emit()   # refresh the live preview
-                    self.update()
+                self._right_click_action(event.pos())
                 return
             if event.button() == QtCore.Qt.LeftButton:
                 if self._mask_draw_kind == "autodraw":
@@ -1501,6 +1571,9 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # either its SAM points (live re-run) or its polygon vertices (manual).
         if self.semiauto_edit_mode and self._orig_w \
                 and event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+            if event.button() == QtCore.Qt.RightButton:
+                self._right_click_action(event.pos())
+                return
             if self._semiauto_sel_idx is None:
                 if event.button() == QtCore.Qt.LeftButton:
                     hit = self._hit_semiauto_poly(event.pos())
@@ -1533,18 +1606,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
                         return
             if self._semiauto_edit_target == "vertices":
                 hit_v = self._hit_vertex(event.pos())
-                if hit_v is not None and event.button() == QtCore.Qt.RightButton:
-                    ann = self._semiauto_selected_ann()
-                    if ann is not None:
-                        if len(ann['data']) > 3:
-                            del ann['data'][hit_v]
-                            self._mask_preview_poly = [list(p) for p in ann['data']]
-                            self.update()
-                        else:
-                            # At the 3-point floor, can't go lower; offer to
-                            # delete the whole mask instead.
-                            self.semiauto_min_vertex_delete.emit()
-                    return
                 if hit_v is not None and event.button() == QtCore.Qt.LeftButton:
                     self._vertex_drag_idx = hit_v        # start dragging a vertex
                     return
@@ -1553,9 +1614,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
                 return
             # points target
             hit_pt = self._hit_mask_point(event.pos())
-            if hit_pt is not None and event.button() == QtCore.Qt.RightButton:
-                self._mask_points.pop(hit_pt)           # remove a point
-                self.mask_point_added.emit(); self.update(); return
             if hit_pt is not None and event.button() == QtCore.Qt.LeftButton:
                 self._semiauto_drag_pt = hit_pt          # start dragging a point
                 return
@@ -1671,29 +1729,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
                 self._drag_start = event.pos()
                 self._drag_cur   = event.pos()
         elif event.button() == QtCore.Qt.RightButton:
-            p = event.pos()
-            # Right-click deletes drawn manual rect anns whose widget
-            # projection contains the click point. Detector-output anns and
-            # polygon anns are untouched.
-            removed = False
-            if self._orig_w:
-                for ann in self.annotations:
-                    if ann['deleted'] or ann.get('source') not in ('manual', 'prompt') or ann['type'] != 'rect':
-                        continue
-                    cx, cy, w, h = ann['data']
-                    x1 = (cx - w / 2) * self._orig_w
-                    y1 = (cy - h / 2) * self._orig_h
-                    x2 = (cx + w / 2) * self._orig_w
-                    y2 = (cy + h / 2) * self._orig_h
-                    wb = self._image_xyxy_to_widget(x1, y1, x2, y2)
-                    if wb is None:
-                        continue
-                    if self._hit_box(p, wb):
-                        ann['deleted'] = True
-                        removed = True
-            self.update()
-            if removed:
-                self.boxes_changed.emit()
+            self._right_click_action(event.pos())
 
     def mouseDoubleClickEvent(self, event):
         # Semi-auto: double-click closes the outline (alternative to clicking the
@@ -1731,6 +1767,18 @@ class AnnotationCanvas(QtWidgets.QWidget):
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Armed right-button pan. A dead-zone keeps a slightly wobbly right
+        # CLICK from turning into a pan and losing its click action.
+        if self._pan_drag_last is not None:
+            d = event.pos() - self._pan_drag_last
+            if self._pan_drag_moved or d.manhattanLength() >= 4:
+                self._pan_drag_moved = True
+                self._pan_x += d.x()
+                self._pan_y += d.y()
+                self._pan_drag_last = event.pos()
+                self._clamp_view()
+                self.update()
+            return
         # Semi-auto drawing: track the cursor so paintEvent can draw a rubber-band
         # line from the last placed point to the cursor (Google-Draw style).
         if self.mask_draw_mode and self._mask_draw_kind == "semiauto" \
@@ -1795,6 +1843,14 @@ class AnnotationCanvas(QtWidgets.QWidget):
         self._apply_hover_cursor(event.pos())
 
     def mouseReleaseEvent(self, event):
+        if self._pan_drag_last is not None \
+                and event.button() == QtCore.Qt.RightButton:
+            moved = self._pan_drag_moved
+            self._pan_drag_last  = None
+            self._pan_drag_moved = False
+            if not moved:
+                self._right_click_action(event.pos())
+            return
         if self.semiauto_edit_mode and self._semiauto_drag_pt is not None \
                 and event.button() == QtCore.Qt.LeftButton:
             self._semiauto_drag_pt = None

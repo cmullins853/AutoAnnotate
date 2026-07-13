@@ -141,9 +141,10 @@ class ZoomPanImageView(QtWidgets.QLabel):
         if not self._resize_mode or not self.has_image():
             super().wheelEvent(event)
             return
-        # Same wheel scheme as the annotation canvas: scroll pans, Ctrl/Cmd +
-        # scroll zooms (pinch also zooms, in event()). Left-drag still pans
-        # here too, since this view has no drawing to reserve the button for.
+        # Same wheel scheme as the annotation canvas. Trackpad: scroll pans,
+        # Ctrl/Cmd+scroll (or pinch, in event()) zooms. Mouse: the wheel zooms.
+        # Dragging with either button pans here, since this view has no
+        # drawing to reserve the left button for.
         mods = event.modifiers()
         pd = event.pixelDelta()
         dx, dy = pd.x(), pd.y()
@@ -182,7 +183,8 @@ class ZoomPanImageView(QtWidgets.QLabel):
 
     def mousePressEvent(self, event):
         if (self._resize_mode and self.has_image()
-                and event.button() == QtCore.Qt.LeftButton):
+                and event.button() in (QtCore.Qt.LeftButton,
+                                       QtCore.Qt.RightButton)):
             self._pan_last = event.pos()
             self.setCursor(QtCore.Qt.ClosedHandCursor)
             event.accept()

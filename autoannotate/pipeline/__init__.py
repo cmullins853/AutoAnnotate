@@ -4,7 +4,6 @@ users reach for most.
 """
 from .dino import clean_labels, load_dino_model, run_dino_from_model, run_image
 from .labels import (result_clean_polys, save_boxes_yolo, save_class_colors_txt,
-                     save_classes_txt,
                      save_masks, save_polys_yolo, verify_boxes_round_trip)
 from .postfilter import suppress_negative_hits
 from .overlay import adjust_masks, draw_boxes_on_image, overlay_with_borders
@@ -16,7 +15,7 @@ from .yoloe import load_yoloe, run_yoloe_text, run_yoloe_vis
 __all__ = [
     "clean_labels", "load_dino_model", "run_dino_from_model", "run_image",
     "result_clean_polys", "save_boxes_yolo", "save_class_colors_txt",
-    "save_classes_txt", "save_masks",
+    "save_masks",
     "save_polys_yolo", "verify_boxes_round_trip", "suppress_negative_hits",
     "adjust_masks", "draw_boxes_on_image", "overlay_with_borders",
     "SAM_VARIANTS", "load_sam", "release_sam3_text_predictor",

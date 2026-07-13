@@ -98,7 +98,7 @@ install once so the CUDA extension is rebuilt from the patched source:
 - [ ] The "Draw box as" dropdown lists 5 colored slots (Class 0-4). Draw boxes of two
       different classes and confirm they render in different colors on the image.
 - [ ] Regenerate: confirm each class's boxes label detections with that class (the whole
-      point that needs a GPU) and classes.txt lists class_0..class_N.
+      point that needs a GPU) and class_colors.txt lists class_0..class_N.
 - [ ] Turn "Draw Negative Box" ON, draw a red box over an object type you want gone, and
       Regenerate: confirm matching detections are suppressed. Turn it OFF to draw
       positives again.
@@ -110,8 +110,34 @@ install once so the CUDA extension is rebuilt from the patched source:
       suppression stops from then on (delete means gone).
 - [ ] Switch back to Text mode and confirm the box section hides and the text fields return.
 
+## 9c. Synthetic variations (Stable Diffusion)
+
+The regenerate now runs on a worker thread. Windows is where an inline model call
+shows up as a greyed-out window titled "Not Responding" with an offer to kill the
+app, so this section is really only testable here.
+
+- [ ] Annotate an image, click "Generate Variation", and confirm the side-by-side
+      preview opens with the original on the left and the variation on the right.
+- [ ] Click Regenerate. While "Generating..." is showing: drag the window, resize
+      it, and confirm it keeps REPAINTING (no white/frozen client area, no
+      "Not Responding" in the title bar).
+- [ ] While it generates, Regenerate AND Save are both greyed out; both come back
+      when the new variation appears.
+- [ ] Save writes the image you are looking at, into `synthetic images/`, with a
+      matching label file.
+- [ ] Click Regenerate and then Cancel WITHOUT waiting: the dialog closes
+      immediately (it must not hang until the inpaint finishes), the app stays
+      alive, and no "QThread: Destroyed while thread is still running" or
+      "Regenerate failed" box appears afterwards.
+- [ ] Force a failure (e.g. an image with no annotations, or set the strength to
+      an extreme) and confirm a "Regenerate failed" dialog appears rather than the
+      button silently springing back.
+- [ ] "Variations for Folder" on a folder with labels: the run finishes, the
+      flipper opens, and "Delete this variation" removes BOTH the .jpg and the
+      .txt (check the labels folder), leaving no `.deleting` files behind.
+
 ## 10. Regression sanity
 
 - [ ] `set QT_QPA_PLATFORM=offscreen` then
-      `python "GUI and Pipeline/test_semiauto_headless.py"` prints all checks passing.
+      `python "GUI and Pipeline/test_semiauto_headless.py"` prints all checks passing (611/611, 0 skipped; a SKIP line means something on this machine could not be tested).
 - [ ] Save labels, flip images, and confirm saved annotations reload unchanged.

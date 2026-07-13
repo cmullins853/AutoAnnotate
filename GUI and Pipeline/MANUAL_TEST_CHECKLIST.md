@@ -146,7 +146,9 @@ For each detector, load a folder, pick it, set an output folder, and run.
       "Keep SAM model / Switch anyway".
 
 ### B5. Zoom / pan (Image Resize)
-- [ ] Toggle Image Resize → wheel/trackpad-pinch zooms toward cursor; drag pans.
+- [ ] Toggle Image Resize → Trackpad input: two-finger scroll pans, pinch zooms
+      toward cursor. Mouse input: wheel zooms toward cursor, right-drag pans.
+      Left-drag draws in both schemes.
 - [ ] Overlays, handles, and click hit-tests line up correctly while zoomed.
 - [ ] Zoom persists after untoggling; "Default" resets to fit; Next Image starts
       at fit.

@@ -10,7 +10,6 @@ import cv2
 import torch
 from groundingdino.util.inference import load_model, load_image, predict
 
-from ..imageio import imread_unicode
 from .labels import save_masks
 from .sam import load_sam
 
@@ -59,17 +58,20 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
     if save_dir is None:
         save_dir = os.path.join(BASE_DIR, "DINO-labels")
         os.makedirs(save_dir, exist_ok=True)
-    # Read the image FIRST. load_image() raises on a corrupt/missing/unsupported
-    # file, which would kill the whole batch, so the skip-and-continue fallback
-    # has to be reachable before it runs. The decoded array is kept for the
-    # dimensions further down rather than decoding the same file a second time.
-    _img = imread_unicode(img_path)
-    if _img is None:
-        print(f"[DINO] {os.path.basename(img_path)}: cv2 could not read the image "
-              f"(corrupt/unsupported format); skipping it.")
-        empty = [[]] * (1 + int(return_classes) + int(return_scores))
-        return tuple(empty) if len(empty) > 1 else []
-    image_source, image = load_image(img_path)
+    # load_image() RAISES on a corrupt / missing / unsupported file, which would
+    # kill a whole batch run, so a bad image is caught and skipped instead. It
+    # also hands back the decoded array, which is where the dimensions come from
+    # further down: probing readability with a separate imread would decode every
+    # image in the folder a second time for nothing.
+    try:
+        image_source, image = load_image(img_path)
+    except Exception as e:
+        print(f"[DINO] {os.path.basename(img_path)}: could not read the image "
+              f"({type(e).__name__}: {e}); skipping it.")
+        n = 1 + int(return_classes) + int(return_scores)
+        # A fresh list per slot. `[[]] * n` would hand the caller n references to
+        # ONE list, so appending to the boxes would also append to the classes.
+        return tuple([] for _ in range(n)) if n > 1 else []
 
     # GroundingDINO expects a lowercase, period-terminated caption. Passing
     # the raw user text (mixed case, no period) hurts text-token matching
@@ -143,7 +145,7 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
     boxes = boxes[keep_idx] if keep_idx else boxes[0:0]
 
     #Convert boxes from YOLOv8 format to xyxy
-    img_height, img_width = _img.shape[:2]
+    img_height, img_width = image_source.shape[:2]
     # Area filter by kept INDEX (not clean_labels, which rebuilds the tensor
     # without saying which rows survived) so cls_ids shrinks in lockstep.
     box_list = boxes.tolist()

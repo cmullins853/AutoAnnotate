@@ -38,16 +38,18 @@ def input_scheme():
 def classify_wheel(scheme, dx, dy, ctrl=False, shift=False):
     """What a wheel event means in Image Resize mode, per scheme.
 
-    Returns ("zoom", amount), ("pan", dx, dy) or None. Plain scroll always
-    PANS (the left button is reserved for drawing on the zoomed view), and
-    Ctrl/Cmd + wheel zooms in both schemes. The difference: a trackpad
-    supplies both pan axes on its own, while a mouse wheel is vertical only,
-    so in the mouse scheme Shift turns the wheel into a horizontal pan."""
-    if ctrl:
+    Returns ("zoom", amount), ("pan", dx, dy) or None.
+
+    Mouse: the wheel ZOOMS, always, with no modifier keys involved; panning is
+    a right-button drag handled by the views, so shift/ctrl are deliberately
+    ignored here (the user wants plain mouse inputs only).
+
+    Trackpad: a two-finger scroll PANS on both axes (the left button stays
+    reserved for drawing on the zoomed view) and Ctrl/Cmd + scroll zooms,
+    alongside the native pinch gesture."""
+    if scheme == "mouse" or ctrl:
         amount = dy or dx
         return ("zoom", amount) if amount else None
-    if scheme == "mouse" and shift and dx == 0:
-        dx, dy = dy, 0
     if dx == 0 and dy == 0:
         return None
     return ("pan", dx, dy)

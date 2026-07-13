@@ -23,6 +23,36 @@ def _box_iou(a, b):
     return inter / union if union > 0.0 else 0.0
 
 
+def _require_aligned(boxes, classes, polys, fn_name, require_classes=False):
+    """Fail loudly when the parallel lists are not the same length.
+
+    A non-empty `classes` shorter than `boxes` used to be absorbed silently: the
+    filtered class list came out shorter than the filtered boxes, and every class
+    id after the gap belonged to the wrong box. A short `polys` was worse, raising
+    IndexError from inside the loop. Wrong class ids are exactly the failure these
+    filters exist to prevent, so misalignment is refused rather than propagated.
+
+    `classes` may be EMPTY only where the function never reads it: a single-class
+    run carries no class info and suppress_by_neg_boxes decides purely on
+    geometry. suppress_negative_hits passes require_classes=True, because it
+    reads classes[i] to tell a positive from a negative and cannot do its job
+    without them: given boxes but no classes it would find no negatives and
+    return everything unchanged, which looks like "nothing to suppress" and is
+    indistinguishable from success.
+
+    Called before the early-return guards, so a malformed call is rejected even
+    when the function would otherwise have short-circuited into a no-op.
+    """
+    n = len(boxes)
+    if require_classes and n and not classes:
+        raise ValueError(f'{fn_name}: {n} boxes but no classes; '
+                         f'cannot tell a positive from a negative')
+    if classes and len(classes) != n:
+        raise ValueError(f'{fn_name}: {n} boxes but {len(classes)} classes')
+    if polys is not None and len(polys) != n:
+        raise ValueError(f'{fn_name}: {n} boxes but {len(polys)} polys')
+
+
 def suppress_by_neg_boxes(boxes, classes, polys, neg_boxes, iou_thresh=0.5):
     """Drop positive detections that overlap a negative-box match.
 
@@ -35,6 +65,7 @@ def suppress_by_neg_boxes(boxes, classes, polys, neg_boxes, iou_thresh=0.5):
     """
     boxes = list(boxes or [])
     classes = list(classes or [])
+    _require_aligned(boxes, classes, polys, 'suppress_by_neg_boxes')
     if not boxes or not neg_boxes:
         return boxes, classes, polys
     out_boxes, out_classes = [], []
@@ -43,7 +74,7 @@ def suppress_by_neg_boxes(boxes, classes, polys, neg_boxes, iou_thresh=0.5):
         if any(_box_iou(b, nb) > iou_thresh for nb in neg_boxes):
             continue
         out_boxes.append(b)
-        if i < len(classes):
+        if classes:
             out_classes.append(int(classes[i]))
         if out_polys is not None:
             out_polys.append(polys[i])
@@ -60,8 +91,17 @@ def suppress_negative_hits(boxes, classes, polys, n_pos, iou_thresh=0.5):
     `iou_thresh`. Returns (boxes, classes, polys) still aligned; `polys` may
     be None and is then returned as None.
     """
+    boxes = list(boxes or [])
+    classes = list(classes or [])
+    # Validated BEFORE the early returns: a malformed call must be rejected even
+    # when it would have short-circuited into a no-op and looked like success.
+    # require_classes because this reads classes[i] to decide positive vs
+    # negative; the zips below would otherwise stop at the shorter list and
+    # silently DROP every box past its end.
+    _require_aligned(boxes, classes, polys, 'suppress_negative_hits',
+                     require_classes=True)
     if not boxes:
-        return list(boxes or []), list(classes or []), polys
+        return boxes, classes, polys
     if n_pos <= 0:
         # No positive classes at all, so by the classes[i] < n_pos rule EVERY
         # detection is a negative one. Passing them through would bake the

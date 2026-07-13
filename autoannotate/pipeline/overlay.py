@@ -66,7 +66,7 @@ def save_class_legend_image(names, out_path):
     faithful to what the model actually produced.
 
     `names` is the class list in id order (index == class id), the same list
-    written to classes.txt. Returns the path written, or None on failure.
+    written to class_colors.txt. Returns the path written, or None on failure.
     """
     names = list(names or [])
     if not names:

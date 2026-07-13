@@ -266,8 +266,15 @@ def generate_variation(image_path, boxes_xyxy=None, polys_xyxy_pixel=None,
       (variation_PIL, original_PIL). Both at the original image's size.
     """
     from PIL import Image, ImageChops
-    pipe = load_sd_inpaint(extra_caches=getattr(generate_variation, "_extra_caches", None))
-    original = Image.open(image_path).convert("RGB")
+    # The preserve mask is built BEFORE the pipeline is loaded. It decides whether
+    # this call can run at all, and load_sd_inpaint pulls multi-GB SD weights into
+    # memory; there is no sense paying that just to refuse the request below.
+    # Closed explicitly: PIL keeps the file handle open until the lazy Image is
+    # collected, and the empty-preserve check below returns without loading SD,
+    # so a batch of rejected images would otherwise sit on one open handle each
+    # (on Windows that blocks the later write to the same folder).
+    with Image.open(image_path) as _src:
+        original = _src.convert("RGB")
     iw, ih = original.size
     # Preserve-mask: white inside annotated regions. SD's mask convention
     # is "white = inpaint here", so we INVERT this before passing it.
@@ -295,6 +302,7 @@ def generate_variation(image_path, boxes_xyxy=None, polys_xyxy_pixel=None,
         raise ValueError(
             "generate_variation: no valid regions to preserve (all boxes/polys "
             "were empty or degenerate); refusing to inpaint the whole image.")
+    pipe = load_sd_inpaint(extra_caches=getattr(generate_variation, "_extra_caches", None))
     preserve_pil = Image.fromarray(preserve)
     # SD-1.5 inpaint takes its trained resolution as input. We use
     # _SD_INPAINT_RES (see module-level constant + comment) to make

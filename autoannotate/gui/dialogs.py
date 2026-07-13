@@ -63,7 +63,7 @@ class InfoBadge(QtWidgets.QLabel):
 class BoxClassesDialog(QtWidgets.QDialog):
     """Editor for how many box-prompt classes exist and what each is called.
 
-    The names become classes.txt and the legend image, so they are what anyone
+    The names become class_colors.txt and the legend image, so they are what anyone
     auditing the labelled folder later reads. Each row is prefixed with the
     color that class draws in, on the canvas and in the saved review images.
     The count is capped at MAX_BOX_CLASSES, the point past which the palette
@@ -145,7 +145,7 @@ class BoxClassesDialog(QtWidgets.QDialog):
 
     def names(self):
         """The edited class names, index == class id. An emptied field falls
-        back to class_<i> so classes.txt never carries a blank line."""
+        back to class_<i> so the class table never carries a blank name."""
         out = []
         for i in range(self.count_spin.value()):
             text = self._edits[i][1].text().strip()
@@ -284,6 +284,44 @@ class SemiAutoSettingsDialog(QtWidgets.QDialog):
         return self.simplify_spin.value() / 100.0
 
 
+class _RegenWorker(QtCore.QObject):
+    """Runs the caller's regenerate callback OFF the GUI thread.
+
+    The callback is a full Stable Diffusion inpaint: seconds on a GPU, minutes
+    on CPU. Calling it inline froze the dialog for its whole duration (Windows
+    paints an unresponsive window "Not Responding" and offers to kill it). The
+    result comes back over a queued signal, so it is applied on the GUI thread,
+    which is the only thread allowed to touch widgets.
+    """
+    done = QtCore.pyqtSignal(object)    # the new PIL variation, or None
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, cb):
+        super().__init__()
+        self._cb = cb
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            self.done.emit(self._cb())
+        except Exception as e:
+            # Exceptions cannot cross a thread boundary, so carry the message.
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+# Regenerates that outlived their dialog. A QThread whose last Python reference
+# is dropped gets garbage-collected, and destroying a RUNNING QThread aborts the
+# process, so a cut-loose thread has to be held somewhere until it finishes.
+_DETACHED_REGENS = set()
+
+
+def _drop_detached_regen(thread, worker):
+    """The cut-loose SD call has finished: let Qt reap both objects."""
+    _DETACHED_REGENS.discard((thread, worker))
+    worker.deleteLater()
+    thread.deleteLater()
+
+
 class VariationPreviewDialog(QtWidgets.QDialog):
     """Side-by-side preview for the single-image variation flow.
 
@@ -309,6 +347,9 @@ class VariationPreviewDialog(QtWidgets.QDialog):
         self.original    = original_pil
         self.variation   = variation_pil
         self.regenerate_cb = regenerate_cb
+        # In-flight regenerate, or (None, None) when idle. See _regen.
+        self._regen_thread = None
+        self._regen_worker = None
         self.accepted_save = False  # set True iff Save was clicked
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -336,18 +377,18 @@ class VariationPreviewDialog(QtWidgets.QDialog):
         btn_row = QtWidgets.QHBoxLayout(); btn_row.setSpacing(BTN_GAP)
         self.regen_btn  = QtWidgets.QPushButton("Regenerate")
         cancel_btn      = QtWidgets.QPushButton("Cancel")
-        save_btn        = QtWidgets.QPushButton("Save")
-        save_btn.setStyleSheet(btn_qss(BTN_GREEN, 14))
+        self.save_btn   = QtWidgets.QPushButton("Save")
+        self.save_btn.setStyleSheet(btn_qss(BTN_GREEN, 14))
         self.regen_btn.setToolTip("Re-roll the Stable Diffusion variation with the same settings.")
         cancel_btn.setToolTip("Discard this variation and close without saving.")
-        save_btn.setToolTip("Keep this variation and save it to the synthetic images folder.")
+        self.save_btn.setToolTip("Keep this variation and save it to the synthetic images folder.")
         self.regen_btn.clicked.connect(self._regen)
         cancel_btn.clicked.connect(self.reject)
-        save_btn.clicked.connect(self._save)
+        self.save_btn.clicked.connect(self._save)
         btn_row.addStretch()
         btn_row.addWidget(self.regen_btn)
         btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
+        btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
 
         self._render()
@@ -379,36 +420,115 @@ class VariationPreviewDialog(QtWidgets.QDialog):
         self._render()
 
     def _save(self):
+        # Save is disabled for as long as an inpaint is in flight (see _regen),
+        # so self.variation is always the image currently on screen. It cannot be
+        # made to WAIT for the running inpaint instead: the result arrives on a
+        # QUEUED signal, and joining the thread does not deliver queued signals,
+        # so a wait here would accept() while self.variation still held the old
+        # image and the caller would race the queued update to read it.
         self.accepted_save = True
         self.accept()
 
     def _regen(self):
-        # KNOWN LIMITATION: regenerate_cb is a full SD inpaint and runs HERE, on
-        # the GUI thread, so the window is frozen for its duration (Windows will
-        # label it "Not Responding"). The button is disabled first, so the run
-        # cannot be double-fired, and it is only ever a wait, never a wrong
-        # result. Moving it to a QThread worker is the real fix.
-        if self.regenerate_cb is None:
+        """Kick off the SD regenerate on a worker thread and return immediately.
+
+        The dialog stays responsive (drag, resize, Cancel) while the inpaint
+        runs. `_regen_thread` is the in-flight guard: the button is disabled
+        anyway, but a second click that slipped through would otherwise start a
+        second inpaint whose result races the first one onto the screen.
+        """
+        if self.regenerate_cb is None or self._regen_thread is not None:
             return
         self.regen_btn.setEnabled(False)
         self.regen_btn.setText("Generating...")
-        QtWidgets.QApplication.processEvents()
-        try:
-            new_var = self.regenerate_cb()
-            if new_var is not None:
-                self.variation = new_var
-                self._render()
-        except Exception as e:
-            # A print goes nowhere a GUI user will ever look: the button just
-            # springs back and the image does not change, which reads as a
-            # silent no-op rather than a failure.
-            print(f"[VariationPreviewDialog] regenerate failed: {e}")
-            QtWidgets.QMessageBox.warning(
-                self, "Regenerate failed",
-                f"The variation could not be regenerated.\n\n{e}")
-        finally:
-            self.regen_btn.setEnabled(True)
-            self.regen_btn.setText("Regenerate")
+        # Save is disabled too: the result lands asynchronously, so a Save taken
+        # mid-inpaint could only ever write the image the user is NOT looking at.
+        self.save_btn.setEnabled(False)
+
+        self._regen_thread = QtCore.QThread(self)
+        self._regen_worker = _RegenWorker(self.regenerate_cb)
+        self._regen_worker.moveToThread(self._regen_thread)
+        self._regen_thread.started.connect(self._regen_worker.run)
+        # These land on the GUI thread (queued across the thread boundary), so
+        # touching widgets from them is safe.
+        self._regen_worker.done.connect(self._on_regen_done)
+        self._regen_worker.failed.connect(self._on_regen_failed)
+        self._regen_worker.done.connect(self._regen_thread.quit)
+        self._regen_worker.failed.connect(self._regen_thread.quit)
+        self._regen_thread.finished.connect(self._on_regen_finished)
+        self._regen_thread.start()
+
+    def _on_regen_done(self, new_var):
+        if new_var is not None:
+            self.variation = new_var
+            self._render()
+
+    def _on_regen_failed(self, msg):
+        # A print goes nowhere a GUI user will ever look: the button just springs
+        # back and the image does not change, which reads as a silent no-op.
+        print(f"[VariationPreviewDialog] regenerate failed: {msg}")
+        QtWidgets.QMessageBox.warning(
+            self, "Regenerate failed",
+            f"The variation could not be regenerated.\n\n{msg}")
+
+    def _on_regen_finished(self):
+        """Thread has left its event loop: drop it and re-arm the buttons."""
+        worker, thread = self._regen_worker, self._regen_thread
+        self._regen_worker = None
+        self._regen_thread = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+        self.regen_btn.setEnabled(True)
+        self.regen_btn.setText("Regenerate")
+        self.save_btn.setEnabled(True)
+
+    def _detach_regen(self):
+        """Cut an in-flight regenerate loose so closing never blocks or aborts.
+
+        Qt aborts the process ("QThread: Destroyed while thread is still
+        running") if the dialog is torn down while it still owns a live thread.
+        JOINING the thread instead would freeze the GUI for the rest of the
+        inpaint (minutes on CPU), which is the exact freeze the worker was added
+        to remove: Cancel has to come back at once. So the thread is unparented
+        and its signals are disconnected from this dialog. The SD call runs to
+        completion in the background, its result is discarded (the user asked to
+        close), and both objects delete themselves once it stops.
+        """
+        thread, worker = self._regen_thread, self._regen_worker
+        self._regen_thread = None
+        self._regen_worker = None
+        if thread is None or worker is None:
+            return
+        # Nothing this thread emits may reach the dialog again: a queued done /
+        # failed delivered after Cancel would repaint a dead dialog, or pop a
+        # "Regenerate failed" box over the main window for a run the user
+        # already abandoned.
+        for sig, slot in ((worker.done, self._on_regen_done),
+                          (worker.failed, self._on_regen_failed),
+                          (thread.finished, self._on_regen_finished)):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass                      # already disconnected; nothing to do
+        # worker.done/failed are still wired to thread.quit, so the thread still
+        # leaves its event loop when the SD call returns.
+        thread.setParent(None)
+        if not thread.isRunning():
+            _drop_detached_regen(thread, worker)
+            return
+        _DETACHED_REGENS.add((thread, worker))
+        thread.finished.connect(
+            lambda t=thread, w=worker: _drop_detached_regen(t, w))
+
+    def closeEvent(self, event):
+        self._detach_regen()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._detach_regen()
+        super().reject()
 
 
 class BatchVariationViewer(QtWidgets.QDialog):

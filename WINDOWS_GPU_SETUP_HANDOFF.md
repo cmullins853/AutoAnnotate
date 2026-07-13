@@ -704,7 +704,7 @@ Example:
 blueberry, leaf, stem
 ```
 
-Each class is detected in a single model pass. Class IDs are preserved in the saved labels, and a `classes.txt` file is written so the labels remain interpretable.
+Each class is detected in a single model pass. Class IDs are preserved in the saved labels, and a `class_colors.txt` table is written so the labels remain interpretable.
 
 This matters because the research desktop may process large image folders. Running one combined pass is more efficient than running the same model repeatedly for each class.
 

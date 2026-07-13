@@ -237,11 +237,18 @@ def segment_with_boxes(sam_model, image_path, boxes, conf=1e-6):
     if not boxes:
         return None
     results = sam_model(image_path, bboxes=boxes, conf=conf, verbose=False, save=False)
+    # NO OUTPUT is None, per the contract above, NOT a results object carrying no
+    # masks. Handing that back broke the one-mask-per-box promise the callers are
+    # built on: save_masks(results, classes=box_classes) derives its segments from
+    # the masks, so it saw 0 segments against N class ids and raised, failing the
+    # image mid-batch and leaving a stale segments file that no longer matched
+    # boxes/. Every caller already tests `is not None` and then clears the
+    # segments file, which is the right answer for an image SAM found nothing on.
     if not results or getattr(results[0], "masks", None) is None:
-        return results
+        return None
     data = results[0].masks.data  # (M, H, W) bool/float tensor at orig size
     if data is None or data.shape[0] == 0:
-        return results
+        return None
     mh, mw = data.shape[-2:]
     n = len(boxes)
 

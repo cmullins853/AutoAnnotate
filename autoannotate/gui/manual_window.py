@@ -97,7 +97,7 @@ def _parse_saved_labels(box_path, seg_path, dup_iou=0.7):
     mask, which is a real detection, not a duplicate."""
     polys, poly_cls = [], []
     if seg_path and os.path.exists(seg_path):
-        with open(seg_path) as f:
+        with open(seg_path, encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) < 7:  # cls + at least 3 points
@@ -131,7 +131,7 @@ def _parse_saved_labels(box_path, seg_path, dup_iou=0.7):
 
     rects, rect_cls = [], []
     if box_path and os.path.exists(box_path):
-        with open(box_path) as f:
+        with open(box_path, encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) < 5:
@@ -3983,7 +3983,7 @@ class ManualWindow(QtWidgets.QWidget):
         live = [a for a in anns if not a.get('deleted', False) and not is_input_only(a)]
         polys = [a for a in live if a['type'] == 'poly']
         rects = [a for a in live if a['type'] == 'rect']
-        with open(f'{box_dir}/{stem}.txt', 'w') as bf:
+        with open(f'{box_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as bf:
             for a in polys:
                 xs = [p[0] for p in a['data']]; ys = [p[1] for p in a['data']]
                 cx = (min(xs) + max(xs)) / 2; cy = (min(ys) + max(ys)) / 2
@@ -3995,7 +3995,7 @@ class ManualWindow(QtWidgets.QWidget):
         # Only (re)write the segment file when there are polygons to write,
         # so a bbox-mode regenerate doesn't blank an earlier mask file.
         if polys:
-            with open(f'{seg_dir}/{stem}.txt', 'w') as sf:
+            with open(f'{seg_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as sf:
                 for a in polys:
                     coords = ' '.join(f'{x:.6f} {y:.6f}' for x, y in a['data'])
                     sf.write(f'{int(a.get("cls", 0))} {coords}\n')
@@ -4723,7 +4723,7 @@ class ManualWindow(QtWidgets.QWidget):
             # a results object; for one-shot we hand-roll it.
             try:
                 stem = os.path.splitext(os.path.basename(image_path))[0]
-                with open(os.path.join(seg_dir, f"{stem}.txt"), "w") as f:
+                with open(os.path.join(seg_dir, f"{stem}.txt"), "w", encoding="utf-8", newline="\n") as f:
                     for pi, poly in enumerate(ann_polys):
                         coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
                         _cls = poly_cls[pi] if poly_cls is not None else 0
@@ -5708,7 +5708,7 @@ class ManualWindow(QtWidgets.QWidget):
         # so a segmentation-mode session still produces a usable bbox
         # label for downstream training.
         if boxes_pixel is not None or polys_pixel is not None:
-            with open(out_lbl, "w") as f:
+            with open(out_lbl, "w", encoding="utf-8", newline="\n") as f:
                 for x1, y1, x2, y2 in (boxes_pixel or []):
                     cx = (x1 + x2) / 2 / iw
                     cy = (y1 + y2) / 2 / ih
@@ -5727,7 +5727,7 @@ class ManualWindow(QtWidgets.QWidget):
                     bh = (y2 - y1) / ih
                     f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
             if polys_pixel:
-                with open(out_seg, "w") as f:
+                with open(out_seg, "w", encoding="utf-8", newline="\n") as f:
                     for poly in polys_pixel:
                         coords = " ".join(
                             f"{p[0] / iw:.6f} {p[1] / ih:.6f}" for p in poly
@@ -5925,7 +5925,7 @@ class ManualWindow(QtWidgets.QWidget):
                 boxes, polys = [], []
                 # Polys from segments/<stem>.txt if present.
                 if os.path.exists(seg_path):
-                    with open(seg_path, "r") as f:
+                    with open(seg_path, "r", encoding="utf-8") as f:
                         for line in f:
                             parts = line.strip().split()
                             if len(parts) < 7:  # cls + at least 3 (x,y) pairs
@@ -5942,7 +5942,7 @@ class ManualWindow(QtWidgets.QWidget):
                                 polys.append(poly)
                 # Boxes from label_path (the boxes/<stem>.txt the
                 # outer loop already located).
-                with open(label_path, "r") as f:
+                with open(label_path, "r", encoding="utf-8") as f:
                     for line in f:
                         parts = line.strip().split()
                         if len(parts) < 5:
@@ -6121,8 +6121,8 @@ class ManualWindow(QtWidgets.QWidget):
         # dropdown happens to sit on now.
         in_flight_manual, in_flight_cls_list = \
             self.image_label.get_boxes_with_cls_in_image_coords()
-        with open(f'{seg_dir}/{stem}.txt', 'w') as sf, \
-             open(f'{box_dir}/{stem}.txt', 'w') as bf:
+        with open(f'{seg_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as sf, \
+             open(f'{box_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as bf:
             for ann in polys:
                 poly = ann['data']
                 cid = int(ann.get('cls', 0))
@@ -7030,7 +7030,7 @@ class ManualWindow(QtWidgets.QWidget):
         (basename stem) so it targets the same file save_masks would write."""
         stem = os.path.splitext(os.path.basename(image_path))[0]
         os.makedirs(seg_dir, exist_ok=True)
-        open(os.path.join(seg_dir, f"{stem}.txt"), "w").close()
+        open(os.path.join(seg_dir, f"{stem}.txt"), "w", encoding="utf-8", newline="\n").close()
 
     def _retry_factor(self):
         """Multiplier for the ONE lower-threshold retry on an empty detection in
@@ -7118,7 +7118,7 @@ class ManualWindow(QtWidgets.QWidget):
         os.makedirs(seg_rev, exist_ok=True)
         report = os.path.join(review_dir, "review_report.csv")
         try:
-            with open(report, "w", newline="") as f:
+            with open(report, "w", newline="", encoding="utf-8") as f:
                 w = _csv.writer(f)
                 w.writerow(["image", "stage", "status", "reason", "detector",
                             "prompt", "orig_threshold", "retry_threshold"])

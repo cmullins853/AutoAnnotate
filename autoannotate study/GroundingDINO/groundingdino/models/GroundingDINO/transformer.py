@@ -862,7 +862,15 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # torch.cuda.amp.autocast is deprecated and is removed/errs on newer
         # torch (e.g. the Windows CUDA 2.12 build); torch.amp.autocast is the
         # supported form and works on CPU/MPS/CUDA alike (torch >= 2.0).
-        with torch.amp.autocast("cuda", enabled=False):
+        #
+        # The device type comes from tgt and is NOT hard-coded to "cuda". This
+        # block exists to force the FFN to fp32, but autocast state is tracked
+        # PER DEVICE TYPE: asking to disable "cuda" autocast while running on
+        # MPS (Mac) or CPU (Linux box with no GPU) leaves the CPU/MPS autocast
+        # still enabled, so the FFN quietly ran in reduced precision on exactly
+        # the platforms the guard was supposed to protect. It never raised, so
+        # nothing surfaced it.
+        with torch.amp.autocast(tgt.device.type, enabled=False):
             tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)

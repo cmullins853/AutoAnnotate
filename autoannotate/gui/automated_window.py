@@ -154,7 +154,7 @@ class AutomatedWindow(QtWidgets.QWidget):
         # Write segments file with remaining mask polygons
         seg_dir = self.output_folder + '/segments'
         os.makedirs(seg_dir, exist_ok=True)
-        with open(f'{seg_dir}/{stem}.txt', 'w') as f:
+        with open(f'{seg_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as f:
             for poly in active:
                 coords = ' '.join(f'{x:.6f} {y:.6f}' for x, y in poly)
                 f.write(f'0 {coords}\n')
@@ -162,7 +162,7 @@ class AutomatedWindow(QtWidgets.QWidget):
         # Write bounding boxes file derived from polygon bounding rects
         box_dir = self.output_folder + '/boxes'
         os.makedirs(box_dir, exist_ok=True)
-        with open(f'{box_dir}/{stem}.txt', 'w') as f:
+        with open(f'{box_dir}/{stem}.txt', 'w', encoding='utf-8', newline='\n') as f:
             for poly in active:
                 xs = [p[0] for p in poly]
                 ys = [p[1] for p in poly]

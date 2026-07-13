@@ -47,9 +47,14 @@ def _atomic_write_lines(path, lines):
     the new ones half-written. Every row is now rendered up front and the real
     file is only swapped in once the whole set is on disk: the label file is
     always either the complete old one or the complete new one.
+
+    Written with an explicit newline="\\n" and utf-8: the default 'w' mode
+    translates \\n to \\r\\n on Windows, so the same annotations saved on Windows
+    and on macOS produced byte-different label files. os.replace is atomic and
+    overwrites an existing destination on POSIX and Windows alike.
     """
     tmp = f'{path}.tmp'
-    with open(tmp, 'w') as f:
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(lines)
     os.replace(tmp, path)
 
@@ -97,7 +102,7 @@ def verify_boxes_round_trip(boxes_xyxy, image_path, save_dir, tol_px=1.5):
     if not os.path.exists(path):
         return False, float('inf')
     loaded = []
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         for line in f:
             parts = line.strip().split()
             if len(parts) < 5:
@@ -214,7 +219,7 @@ def save_classes_txt(names, output_dir):
         return
     _validate_class_names(names, 'save_classes_txt')
     os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "classes.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(output_dir, "classes.txt"), "w", encoding="utf-8", newline="\n") as f:
         for n in names:
             f.write(f"{n}\n")
 
@@ -253,7 +258,7 @@ def save_class_colors_txt(names, output_dir):
     def _line(cells):
         return "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
 
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("# " + _line(head) + "\n")
         for r in rows:
             f.write("  " + _line(r) + "\n")

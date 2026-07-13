@@ -3464,6 +3464,118 @@ def t76_config_env():
 t76_config_env()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# T77: cross-OS durability. The app ships on macOS, Windows and Linux from one
+# codebase, and the platform-specific failures here are all SILENT: they do not
+# raise on the machine you develop on, so only a check like this catches them.
+# ══════════════════════════════════════════════════════════════════════════
+def t77_text_io_is_explicit():
+    import re as _re
+    pkg = os.path.join(_REPO_ROOT, "autoannotate")
+    # Python's open() defaults to the LOCALE encoding (cp1252 on a Windows box)
+    # and to newline translation (\n -> \r\n on write). Both are invisible on
+    # macOS/Linux: a non-ASCII class name or prompt raises UnicodeDecodeError
+    # only on Windows, and a dataset saved on Windows comes out byte-different
+    # from the same dataset saved on a Mac. Every text handle states both.
+    offenders, writers = [], []
+    for root, _dirs, files in os.walk(pkg):
+        for fn in sorted(files):
+            if not fn.endswith(".py"):
+                continue
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, _REPO_ROOT)
+            for i, line in enumerate(open(fp, encoding="utf-8"), 1):
+                code = line.split("#", 1)[0]
+                # Image.open is PIL, not a text handle, and takes no encoding.
+                # `open()` with no argument is prose in a docstring, not a call.
+                if not _re.search(r"(?<!Image\.)\bopen\(\s*[^)\s]", code):
+                    continue
+                if "imread" in code or "imwrite" in code:
+                    continue
+                if _re.search(r"['\"][rwa]b['\"]", code):     # binary: no encoding needed
+                    continue
+                if "encoding=" not in code:
+                    offenders.append(f"{rel}:{i}")
+                # Any TEXT WRITE must also pin the newline, or Windows turns
+                # every \n into \r\n and the dataset stops matching a Mac's.
+                # newline="" is the csv module's own contract and counts.
+                if _re.search(r"['\"]w['\"]", code) and "newline=" not in code:
+                    writers.append(f"{rel}:{i}")
+    check("T77 every text handle declares an encoding", not offenders, offenders[:6])
+    check("T77 every text writer pins newline", not writers, writers[:6])
+
+t77_text_io_is_explicit()
+
+
+def t77_label_bytes_are_platform_stable():
+    import tempfile, os as _os
+    from autoannotate.pipeline.labels import save_boxes_yolo, save_classes_txt
+    d = tempfile.mkdtemp()
+    img = _os.path.join(d, "img.jpg")
+    save_boxes_yolo([[10, 10, 30, 30]], img, d, classes=[1])
+    raw = open(_os.path.join(d, "img.txt"), "rb").read()
+    check("T77 label file uses LF, never CRLF", b"\r\n" not in raw and raw.endswith(b"\n"), raw)
+    save_classes_txt(["berry", "leaf"], d)
+    raw = open(_os.path.join(d, "classes.txt"), "rb").read()
+    check("T77 classes.txt uses LF, never CRLF", b"\r\n" not in raw, raw)
+
+t77_label_bytes_are_platform_stable()
+
+
+def t77_no_hardcoded_cuda_autocast():
+    # The vendored GroundingDINO forced its FFN to fp32 with an autocast guard
+    # hard-coded to "cuda". Autocast state is tracked PER DEVICE TYPE, so on MPS
+    # (Mac) or CPU (Linux, no GPU) that guard disabled nothing and the FFN
+    # silently ran in reduced precision. It never raised. Derive from the tensor.
+    fp = os.path.join(_REPO_ROOT, "autoannotate study", "GroundingDINO", "groundingdino",
+                      "models", "GroundingDINO", "transformer.py")
+    if not os.path.exists(fp):
+        return
+    src = open(fp, encoding="utf-8").read()
+    check("T77 GroundingDINO autocast is not hard-coded to cuda",
+          'autocast("cuda"' not in src and "autocast(tgt.device.type" in src)
+
+t77_no_hardcoded_cuda_autocast()
+
+
+def t77_platform_device_defaults():
+    import importlib, platform as _plat, sys as _sys
+    # macOS pins SD to cpu (MPS has hung SD-1.5 on 8GB); Windows/Linux stay
+    # UNSET so _sd_select_device() can prefer CUDA. An explicit value, from the
+    # shell or from .env, must beat the default on every OS.
+    def _load(osname, explicit=None):
+        for k in [k for k in _sys.modules if k.startswith("autoannotate")]:
+            del _sys.modules[k]
+        os.environ.pop("AUTOANNOTATE_SD_DEVICE", None)
+        if explicit:
+            os.environ["AUTOANNOTATE_SD_DEVICE"] = explicit
+        real = _plat.system
+        _plat.system = lambda: osname
+        try:
+            importlib.import_module("autoannotate.config")
+            return os.environ.get("AUTOANNOTATE_SD_DEVICE")
+        finally:
+            _plat.system = real
+
+    prev = os.environ.get("AUTOANNOTATE_SD_DEVICE")
+    try:
+        check("T77 macOS defaults SD to cpu", _load("Darwin") == "cpu")
+        check("T77 Windows leaves SD unset (auto-detect)", _load("Windows") is None)
+        check("T77 Linux leaves SD unset (auto-detect)", _load("Linux") is None)
+        for osname in ("Darwin", "Windows", "Linux"):
+            got = _load(osname, explicit="cuda")
+            check(f"T77 explicit SD device wins on {osname}", got == "cuda", got)
+    finally:
+        os.environ.pop("AUTOANNOTATE_SD_DEVICE", None)
+        if prev is not None:
+            os.environ["AUTOANNOTATE_SD_DEVICE"] = prev
+        for k in [k for k in _sys.modules if k.startswith("autoannotate")]:
+            del _sys.modules[k]
+        importlib.import_module("autoannotate.config")
+
+t77_platform_device_defaults()
+
+
 # ── summary ────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok, _ in _results if ok)
 total = len(_results)

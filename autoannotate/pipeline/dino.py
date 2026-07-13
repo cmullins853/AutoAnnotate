@@ -229,8 +229,11 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
         clean_boxes = clean_boxes.tolist()
         for i, x in enumerate(clean_boxes):
             x.insert(0, cls_ids[i] if i < len(cls_ids) else 0)
-        with open(f'{save_dir}/{os.path.splitext(os.path.basename(img_path))[0]}.txt', 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile, delimiter=' ')
+        # newline='' is the csv module's contract; encoding and an explicit LF
+        # lineterminator keep DINO labels byte-identical to the ones the other
+        # writers produce (csv's default dialect emits CRLF on every platform).
+        with open(f'{save_dir}/{os.path.splitext(os.path.basename(img_path))[0]}.txt', 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile, delimiter=' ', lineterminator='\n')
             writer.writerows(clean_boxes)
     if return_scores and len(det_scores) != len(absolute_boxes):
         det_scores = [None] * len(absolute_boxes)

@@ -17,7 +17,7 @@ def prompt_optimizer(prompts_file, gt_path, img_path, save_file, threshold, DINO
     os.makedirs(inf_path, exist_ok=True)
 
     # Initialize result dictionary from prompt file
-    with open(prompts_file, 'r') as file:
+    with open(prompts_file, 'r', encoding='utf-8') as file:
         result_dict = {x.strip(): {} for x in file}
 
     # Process each prompt
@@ -39,7 +39,7 @@ def prompt_optimizer(prompts_file, gt_path, img_path, save_file, threshold, DINO
     results = sorted(result_dict.items(), key=lambda a: a[1]['iou_scores'], reverse=True)
     print("Results:", results)
 
-    with open(save_file, 'w') as output:
+    with open(save_file, 'w', encoding='utf-8', newline='\n') as output:
         for prompt_stats in results:
             output.write(str(prompt_stats) + '\n')
     return results
@@ -167,7 +167,7 @@ def confidence_optimizer(prompt, DINO, gt_path, img_path, threshold):
 
 def read_and_draw_boxes_from_file(file_path, image_dim=(1280, 720)):
     boxes = []
-    with open(file_path, 'r') as file:
+    with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
             class_id, x, y, width, height = map(float, line.strip().split())
             x1 = (x-(width/2))*image_dim[0]
@@ -281,7 +281,7 @@ def read_and_draw_boxes(results, image_dim=(1280, 720)):
 
 def clean_labels_from_file(file_path, cleaning_threshold=0.6):
     # Read the file and check if it has more than one line
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
     if len(lines) > 1:
@@ -295,7 +295,7 @@ def clean_labels_from_file(file_path, cleaning_threshold=0.6):
                 accepted_lines.append(line)
 
         # Overwrite the file with accepted lines
-        with open(file_path, 'w') as f:
+        with open(file_path, 'w', encoding='utf-8', newline='\n') as f:
             if len(accepted_lines) > 0:
                 for line in accepted_lines:
                     f.write(line)

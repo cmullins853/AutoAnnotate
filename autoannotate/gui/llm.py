@@ -32,7 +32,7 @@ def sort_largest_file(folder_path):
         if file_name.endswith('.txt'):
             file_path = os.path.join(folder_path, file_name)
             # Open the file and count lines
-            with open(file_path, 'r') as file:
+            with open(file_path, 'r', encoding='utf-8') as file:
                 line_count = sum(1 for line in file)
             # Add the file and line count to the dictionary
             file_line_counts[file_name] = line_count

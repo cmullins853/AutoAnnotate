@@ -1,0 +1,71 @@
+# AutoAnnotate - Windows 11 + NVIDIA (CUDA) install file.
+#
+# PLATFORM: Windows 11, Python 3.13, NVIDIA GPU with CUDA. This is one of THREE
+# requirements files; pick the one for your machine:
+#   - requirements.txt            generic floors, no upper pins (any OS)
+#   - requirements-macos.lock     exact pins proven on macOS / Apple Silicon (MPS)
+#   - requirements-windows.txt    THIS FILE: Windows + NVIDIA CUDA
+#
+# Proven Windows environment (RTX 4060 Laptop, CUDA Toolkit 13.2, MSVC 14.51):
+#   Python 3.13, torch 2.12.1+cu132, torchvision 0.27.1+cu132,
+#   transformers 4.50.3, ultralytics 8.4.90.
+# See WINDOWS_GPU_SETUP_HANDOFF.md for the full desktop setup and the
+# GroundingDINO build steps.
+#
+# WHY THE +cuXXX PINS AND THE EXTRA INDEX: pinning the torch stack to explicit
+# CUDA local versions (and adding the PyTorch CUDA wheel index) forces pip to
+# install the GPU wheels. Without it, pip and its dependents (ultralytics,
+# diffusers, ...) silently pull the CPU build or a mismatched torchvision, and
+# CUDA acceleration is lost. The exact "+cu132" pins only exist on the PyTorch
+# index, so they cannot be satisfied by a wrong wheel from PyPI.
+#
+# INSTALL (PowerShell), from the repo root, inside your venv:
+#   pip install --upgrade pip
+#   pip uninstall -y torch torchvision torchaudio        # clear any CPU build first
+#   pip install -r requirements-windows.txt
+#   pip install --no-build-isolation -e "autoannotate study/GroundingDINO"
+#
+# If your machine uses a different CUDA version, change EVERY cu132 below AND the
+# --extra-index-url to match (e.g. cu124), then rebuild GroundingDINO.
+#
+# For a fully reproducible lock on your exact machine, after a working install:
+#   pip freeze > requirements-windows.lock
+
+--extra-index-url https://download.pytorch.org/whl/cu132
+
+# --- CUDA torch stack (exact GPU wheels; do NOT relax these pins) ------------
+torch==2.12.1+cu132
+torchvision==0.27.1+cu132
+
+# --- Core -------------------------------------------------------------------
+numpy>=1.24
+
+# --- Detection / segmentation ----------------------------------------------
+# Pinned to the proven Windows build; SAM3 needs >=8.3.237.
+#
+# 8.4.90's SAM3SemanticPredictor behaves exactly as the macOS 8.4.33 build for
+# box exemplars: `nc = 1` is forced whenever `bboxes` is passed, so one call can
+# only ever find ONE class. Multi-class box prompts run one pass per class
+# (ManualWindow._run_sam3_boxes_multiclass). Checked against both wheels.
+ultralytics==8.4.90
+
+# --- Vision / image I/O -----------------------------------------------------
+opencv-python>=4.8
+Pillow>=10.0
+shapely>=2.0
+
+# --- Transformers / Hugging Face -------------------------------------------
+# Pinned: transformers 5.x removed BertModel.get_head_mask, which
+# GroundingDINO's BERT wrapper calls (crashes at DINO model load otherwise).
+transformers==4.50.3
+accelerate>=0.30
+huggingface_hub>=0.20
+
+# --- Stable Diffusion synthetic image generation ---------------------------
+diffusers>=0.27
+
+# --- GUI --------------------------------------------------------------------
+PyQt5>=5.15
+
+# --- Config / env -----------------------------------------------------------
+python-dotenv>=1.0

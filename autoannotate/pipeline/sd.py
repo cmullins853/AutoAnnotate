@@ -285,6 +285,16 @@ def generate_variation(image_path, boxes_xyxy=None, polys_xyxy_pixel=None,
             continue
         pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
         cv2.fillPoly(preserve, [pts], 255)
+    if not preserve.any():
+        # Enforce the contract in this function's own docstring. Nothing survived
+        # the clipping (every box degenerate or off-image, every poly too short),
+        # so the preserve mask is empty. The mask is INVERTED below, so an empty
+        # preserve becomes an all-white "inpaint here" mask and SD would repaint
+        # the entire image straight over the annotated objects it was called to
+        # protect. Refuse instead of destroying them.
+        raise ValueError(
+            "generate_variation: no valid regions to preserve (all boxes/polys "
+            "were empty or degenerate); refusing to inpaint the whole image.")
     preserve_pil = Image.fromarray(preserve)
     # SD-1.5 inpaint takes its trained resolution as input. We use
     # _SD_INPAINT_RES (see module-level constant + comment) to make

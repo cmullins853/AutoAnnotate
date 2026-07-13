@@ -66,14 +66,16 @@ $RECYCLE.BIN/
 # ============================
 # Editors / IDEs
 # ============================
-.vscode/
+# Ignore .vscode contents (use /* not the bare dir so a single file can be
+# re-included; git cannot un-ignore a file whose parent dir is excluded).
+.vscode/*
+# ...but share one settings file so the .env terminal-injection setting (and
+# any other project-wide editor defaults) apply on every machine.
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo
 
-# Claude Code per-user config (absolute paths + personal allowlist).
-# Shared project config at .claude/settings.json stays tracked.
-.claude/settings.local.json
 
 # ============================
 # Environment / secrets

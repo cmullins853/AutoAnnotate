@@ -92,7 +92,7 @@ def run_sam3_text(image_path, names, conf=0.25, max_area_frac=0.9):
     return out_boxes, results
 
 def run_sam3_boxes(image_path, bboxes, conf=0.25, max_area_frac=0.9):
-    """SAM3 semantic segmentation from BBOX EXAMPLES.
+    """SAM3 semantic segmentation from BBOX EXAMPLES of ONE class.
 
     Same SAM3SemanticPredictor as run_sam3_text, but driven by example
     boxes instead of a text concept: SAM3 finds and segments OTHER objects
@@ -100,8 +100,20 @@ def run_sam3_boxes(image_path, bboxes, conf=0.25, max_area_frac=0.9):
     not the fixed box regions. Reuses the cached predictor on purpose --
     SAM3 weights are multi-GB and a second instance would OOM an 8 GB box.
 
+    SINGLE CONCEPT PER CALL. ultralytics' SAM3SemanticPredictor forces
+    `nc = 1` the moment `bboxes` is passed (_inference_features), and its
+    per-box `labels` array is a positive/negative exemplar flag, NOT a class
+    id. So every box handed to one call is an example of the SAME thing, and
+    every detection comes back as class 0. Passing boxes from two classes at
+    once does not raise -- it silently blends them into one concept and
+    returns one class, which is exactly the bug this docstring exists to
+    prevent. For N classes, make N calls (see
+    ManualWindow._run_sam3_boxes_multiclass) and tag each pass's output with
+    the class of the exemplars that drove it.
+
     Args:
-      bboxes: list of [x1, y1, x2, y2] example boxes in image pixel coords.
+      bboxes: list of [x1, y1, x2, y2] example boxes in image pixel coords,
+        all of them examples of one class.
     Returns:
       (out_boxes_xyxy_list, raw_results) - same shape as run_sam3_text;
       raw_results[0].masks.xyn aligns with raw_results[0].boxes.xyxy.

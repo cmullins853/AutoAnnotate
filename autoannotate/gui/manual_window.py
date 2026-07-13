@@ -1,6 +1,7 @@
 """ManualWindow: the main annotation workflow (detect, segment, edit, save, augment)."""
 import os
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -8,27 +9,152 @@ import torch
 from PIL import Image
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-from ..config import AUTOANNOTATE_DEBUG, CUMULATIVE_DIR, GROUNDING_DINO_DIR, WEIGHTS_DIR
+from ..config import (AUTOANNOTATE_DEBUG, CUMULATIVE_DIR, DEFAULT_MAX_AREA_FRAC,
+                      GROUNDING_DINO_DIR, WEIGHTS_DIR, effective_max_area_frac)
+from ..imageio import imread_unicode, imwrite_unicode
 from ..pipeline import sam as sam_module
 from ..pipeline.dino import load_dino_model, run_dino_from_model
 from ..pipeline.labels import (_mask_to_polys, result_clean_polys, save_boxes_yolo,
-                               save_masks, save_polys_yolo, verify_boxes_round_trip)
-from ..pipeline.overlay import adjust_masks, draw_boxes_on_image, overlay_with_borders
+                               save_class_colors_txt, save_classes_txt, save_masks,
+                               save_polys_yolo, verify_boxes_round_trip)
+from ..pipeline.overlay import (adjust_masks, draw_boxes_on_image, overlay_with_borders,
+                                save_class_legend_image)
+from ..pipeline.postfilter import suppress_by_neg_boxes, suppress_negative_hits
 from ..pipeline.sam import (load_sam, run_sam3_boxes, run_sam3_text,
                             segment_with_boxes)
 from ..pipeline.sd import _SD_STRENGTH, generate_variation
 from ..pipeline.yoloe import load_yoloe, run_yoloe_text, run_yoloe_vis
+from . import session_state
 from .canvas import AnnotationCanvas
-from .dialogs import (BatchVariationViewer, InfoBadge, SDPromptDialog,
+from .dialogs import (BatchVariationViewer, BoxClassesDialog, InfoBadge, SDPromptDialog,
                       SemiAutoSettingsDialog, VariationPreviewDialog)
 from .spatial import SpatialGrid
 from .style import (BTN_BLUE, BTN_GAP, BTN_GREEN, BTN_GREY, BTN_ORANGE, BTN_PURPLE,
-                    BTN_RED, TGL_DRAW_ON, TGL_EDIT_ON, TOOLTIP_AUTODRAW, TOOLTIP_BOX,
-                    TOOLTIP_SEMIAUTO, TOOLTIP_SEMIAUTO_EDIT, _SD_DEFAULT_NEG,
-                    _SD_DEFAULT_PROMPT, btn_qss, lock_during, slider_qss, toggle_qss,
+                    BTN_RED, MAX_BOX_CLASSES, TGL_DRAW_ON, TGL_EDIT_ON,
+                    TOOLTIP_AUTODRAW, TOOLTIP_BOX, TOOLTIP_SEMIAUTO,
+                    TOOLTIP_SEMIAUTO_EDIT, _SD_DEFAULT_NEG,
+                    _SD_DEFAULT_PROMPT, add_input_scheme_actions, btn_qss,
+                    chip_btn_qss, class_color_bgr, class_color_image_rgb,
+                    class_color_qt, lock_during, slider_qss, toggle_qss,
                     tool_toggle_qss)
 
+
+def format_duration(seconds):
+    """Human-readable wall-clock duration: '48s', '3m 07s', '1h 12m 30s'.
+
+    Used for the Auto Annotate Remaining summary, where the point is for the
+    user to plan around the runtime of a comparable run, so minutes and seconds
+    matter and milliseconds do not."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+# Annotation sources that are detector INPUT ONLY: yellow positive prompt boxes
+# and red negative prompt boxes. They are drawn live, fed to the model, and then
+# thrown away. They are never baked into the overlay, never segmented, and never
+# written to a label file. Every "is this a real annotation" test must go through
+# is_input_only(), not a bare `source != 'prompt'`, which silently lets the red
+# negative boxes through and saves them as if the user had annotated them.
+INPUT_ONLY_SOURCES = ('prompt', 'neg_prompt')
+
+
+def is_input_only(ann):
+    """True for an annotation (or a raw source string) that is a detector input
+    rather than a saved annotation."""
+    src = ann if isinstance(ann, str) else (ann or {}).get('source')
+    return src in INPUT_ONLY_SOURCES
+
+
+def parse_prompt_classes(prompt):
+    """Split a prompt string into an ordered class-name list: comma-separated,
+    stripped, empties dropped. 'blueberry, leaf' -> ['blueberry', 'leaf'];
+    '' / None -> []. Class ids in saved labels follow this order."""
+    if not prompt:
+        return []
+    return [n.strip() for n in str(prompt).split(",") if n.strip()]
+
+
+def _parse_saved_labels(box_path, seg_path, dup_iou=0.7):
+    """Read one image's saved YOLO label files back into canvas-ready form:
+    (rects, rect_cls, polys, poly_cls), all normalized. rects are
+    [cx, cy, bw, bh]; polys are [[x, y], ...] point lists; the class columns
+    ride along. Used by Previous Image to restore an already-edited image
+    WITHOUT re-running the model.
+
+    _write_label_files / _persist_annotations write a box line for every
+    polygon, so any box whose bbox overlaps a loaded polygon's bbox above
+    `dup_iou` is skipped here; loading both would double every mask. The match
+    is class-aware: that companion box line always carries the SAME class as its
+    polygon, so a box only shadows a polygon of its own class. Matching across
+    classes would delete a genuine class-B box that merely overlaps a class-A
+    mask, which is a real detection, not a duplicate."""
+    polys, poly_cls = [], []
+    if seg_path and os.path.exists(seg_path):
+        with open(seg_path) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 7:  # cls + at least 3 points
+                    continue
+                try:
+                    cid = int(float(parts[0]))
+                    vals = [float(v) for v in parts[1:]]
+                except ValueError:
+                    continue
+                if len(vals) % 2 != 0:
+                    vals = vals[:-1]
+                pts = [[vals[i], vals[i + 1]] for i in range(0, len(vals), 2)]
+                if len(pts) < 3:
+                    continue
+                polys.append(pts)
+                poly_cls.append(cid)
+    poly_bbs = []
+    for pts, pcls in zip(polys, poly_cls):
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        poly_bbs.append(((min(xs), min(ys), max(xs), max(ys)), pcls))
+
+    def _iou(a, b):
+        ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+        iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        ub = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        u = ua + ub - inter
+        return inter / u if u > 0 else 0.0
+
+    rects, rect_cls = [], []
+    if box_path and os.path.exists(box_path):
+        with open(box_path) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                try:
+                    cid = int(float(parts[0]))
+                    cx, cy, bw, bh = (float(v) for v in parts[1:5])
+                except ValueError:
+                    continue
+                bb = (cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2)
+                if any(pcls == cid and _iou(bb, pb) > dup_iou
+                       for pb, pcls in poly_bbs):
+                    continue
+                rects.append([cx, cy, bw, bh])
+                rect_cls.append(cid)
+    return rects, rect_cls, polys, poly_cls
+
+
 class ManualWindow(QtWidgets.QWidget):
+    # Most fields you will ever need for distinct concepts; each field is still
+    # comma-multi-class, so this caps the field count, not the class count. The
+    # Add buttons grey out at the cap.
+    MAX_PROMPT_FIELDS = 5
     # Detector and segmenter are picked independently. YOLOE-seg is a one-shot
     # detector+segmenter; when chosen, the segmenter dropdown locks to "(none)".
     DETECTORS = [
@@ -74,6 +200,9 @@ class ManualWindow(QtWidgets.QWidget):
         # Parallel array: 'detector' or 'manual' for each entry of live_boxes.
         # Used to tag rect/poly annotations on regen and on mode switch.
         self.live_box_sources = []
+        # Parallel per-box class ids for multi-class prompts; None means all
+        # class 0 (the single-class fast path, no behavior change).
+        self.live_box_classes = None
         # Last segmentation polygons (normalized 0-1) keyed by box index in live_boxes,
         # so switching seg->bbox->seg without edits doesn't re-run SAM unnecessarily.
         self.live_polys_cache = None
@@ -121,16 +250,34 @@ class ManualWindow(QtWidgets.QWidget):
         self.showFullScreen()
         self.setStyleSheet("background-color: #454545;")
 
-        # Scale UI to screen height so everything fits on any Mac display
+        # Scale UI to screen height so everything fits on any display
         _geo = QtWidgets.QApplication.primaryScreen().geometry()
         screen_h, screen_w = _geo.height(), _geo.width()
         # Buttons trimmed ~20% (was screen_h // 16) so the controls take less
         # room and the image canvas can claim more of the window.
         btn_h  = max(34, screen_h // 20)
         font   = max(13, screen_h // 58)
-        # Cap the left control column so it can't grow into the image; the
-        # image column gets the horizontal stretch instead (see right_layout).
-        left_panel_w = max(300, min(360, screen_w // 6))
+        # Size the left control column from the FONT METRICS of its longest
+        # real labels instead of a fixed 360px cap. On tall/high-DPI screens
+        # the font grows with screen_h but a hard width cap does not, which
+        # clipped "Segmentation" and the "(YOLOE 0.10)" confidence suffixes
+        # on non-Mac resolutions. The 0.28 * screen_w ceiling keeps the image
+        # column dominant; the +60 covers layout margins, checkbox indicators,
+        # and button padding.
+        _probe_font = QtGui.QFont()
+        _probe_font.setPixelSize(font)
+        _fm = QtGui.QFontMetrics(_probe_font)
+        _longest = max(_fm.horizontalAdvance(s) for s in (
+            "Detector confidence: 100  (YOLOE 0.20)",
+            "Bounding Box    Segmentation",
+            "Use First Image as Prompt: OFF",
+            "Include Earlier Images: OFF",
+            "Auto Annotate Remaining",
+        ))
+        left_panel_w = max(300, min(int(screen_w * 0.28), _longest + 60))
+        # Secondary guard: if even the widened column cannot fit the scaled
+        # font (very narrow screens), cap the font instead of clipping text.
+        font = min(font, max(13, left_panel_w // 24))
 
         main_layout = QtWidgets.QHBoxLayout()
         main_layout.setSpacing(10)
@@ -177,7 +324,11 @@ class ManualWindow(QtWidgets.QWidget):
         self.detector_combo.addItems(self.DETECTORS)
         self.detector_combo.setStyleSheet(f"font-size: {font}px; color: white; background-color: black;")
         self.detector_combo.setFixedHeight(int(btn_h * 0.75))
-        self.detector_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+        # Ignored (not Expanding) horizontal policy: drop the content-driven
+        # minimum width so the two equal-stretch columns split evenly instead of
+        # the detector column stealing width for its longer item names. Long
+        # names elide in the closed combo but show in full when it is opened.
+        self.detector_combo.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
                                           QtWidgets.QSizePolicy.Fixed)
         self.detector_combo.setToolTip("Pick the object detector. DINO is text-prompted; YOLOE-vis "
                                        "is box-prompted; YOLOE-seg and SAM3 accept either. Greyed "
@@ -210,7 +361,9 @@ class ManualWindow(QtWidgets.QWidget):
             "Green = your hand work\n"
             "Magenta = model output\n"
             "Cyan = selected / preview\n"
-            "Red = delete / negative\n\n"
+            "Red = delete / negative\n"
+            "Multi-class prompts: each extra class gets its own outline color\n"
+            "(hover the info dot in the Prompts panel)\n\n"
             "Button colors:\n"
             "Green = short to medium press time\n"
             "Yellow/Orange = medium press time\n"
@@ -229,7 +382,9 @@ class ManualWindow(QtWidgets.QWidget):
         self.segmenter_combo.addItems(self.SEGMENTERS)
         self.segmenter_combo.setStyleSheet(f"font-size: {font}px; color: white; background-color: black;")
         self.segmenter_combo.setFixedHeight(int(btn_h * 0.75))
-        self.segmenter_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+        # Ignored horizontal policy so it matches the detector combo width (see
+        # the note there); the two columns then split the row evenly.
+        self.segmenter_combo.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
                                            QtWidgets.QSizePolicy.Fixed)
         self.segmenter_combo.setToolTip("Pick the segmenter that turns detector boxes into masks. "
                                         "Locks to (none) for one-shot detectors (YOLOE-seg / SAM3) "
@@ -277,18 +432,190 @@ class ManualWindow(QtWidgets.QWidget):
             lambda checked: checked and self._on_prompt_mode_changed("boxes")
         )
 
+        # Prompts (positive + negative) live inside one collapsible dropdown so
+        # the control column stays short: collapse it and every field hides while
+        # the text is kept and still used. Each field is comma-multi-class, and
+        # separate fields let you organize distinct concepts ("human, person" in
+        # one, "car, vehicle" in the next). _positive_prompt_text() /
+        # _negative_classes() join all fields so the pipeline is unchanged, and
+        # the persistent widgets carry across images + Auto Annotate Remaining.
+        # The class that hand-drawn boxes/masks get is picked in the Draw Boxes
+        # menu; the info dot here only shows which color maps to which class.
+
+        # Shared metrics for every dynamically-created prompt field.
+        self._prompt_field_style = f"font-size: {font}px; color: white; background-color: black;"
+        self._prompt_field_h = int(btn_h * 0.75)
+        self._field_font = font
+
+        # Toggle row: the full-width collapse button + the color-legend info dot.
+        # The info dot sits OUTSIDE the collapsible panel so it stays visible even
+        # when the prompts are collapsed.
+        prompts_toggle_row = QtWidgets.QHBoxLayout()
+        prompts_toggle_row.setSpacing(6)
+        self.prompts_toggle_btn = QtWidgets.QPushButton("Prompts ▾")
+        self.prompts_toggle_btn.setCheckable(True)
+        self.prompts_toggle_btn.setChecked(True)
+        self.prompts_toggle_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
+        self.prompts_toggle_btn.setFixedHeight(int(btn_h * 0.8))
+        self.prompts_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                              QtWidgets.QSizePolicy.Fixed)
+        self.prompts_toggle_btn.setToolTip(
+            "Show or hide the text prompt and negative prompt fields. Collapse it "
+            "to free up space; whatever you typed is kept and still used.")
+        self.prompts_toggle_btn.toggled.connect(self._toggle_prompts_panel)
+        prompts_toggle_row.addWidget(self.prompts_toggle_btn, 1)
+        # Info dot: which outline color maps to which class (and the negatives).
+        # Lives on the toggle row so collapsing the panel never hides it.
+        self.class_info_dot = InfoBadge("i")
+        _cdot = int(font * 1.6)
+        self.class_info_dot.setFixedSize(_cdot, _cdot)
+        self.class_info_dot.setAlignment(QtCore.Qt.AlignCenter)
+        self.class_info_dot.setStyleSheet(
+            f"color: {BTN_BLUE}; font-size: {int(font * 0.85)}px; font-weight: bold; "
+            f"border: 1px solid {BTN_BLUE}; border-radius: {_cdot // 2}px;")
+        self.class_info_dot.setCursor(QtCore.Qt.WhatsThisCursor)
+        self.class_info_dot.setToolTip("Hover to see which outline color each class uses.")
+        prompts_toggle_row.addWidget(self.class_info_dot)
+        left_layout.addLayout(prompts_toggle_row)
+
+        self.prompts_panel = QtWidgets.QWidget()
+        prompts_layout = QtWidgets.QVBoxLayout(self.prompts_panel)
+        prompts_layout.setContentsMargins(0, 0, 0, 0)
+        prompts_layout.setSpacing(BTN_GAP)
+
         self.prompt_label_widget = QtWidgets.QLabel("Enter Prompt:")
         self.prompt_label_widget.setStyleSheet(lbl_style)
-        left_layout.addWidget(self.prompt_label_widget)
+        self.prompt_label_widget.setToolTip("What to detect. Type one concept per field and use "
+                                            "Add prompt for a different one (e.g. 'person' in one "
+                                            "field, 'car' in the next). Commas inside a field add "
+                                            "extra classes. Everything you type here stays as you "
+                                            "move between images and run Auto Annotate Remaining.")
+        prompts_layout.addWidget(self.prompt_label_widget)
 
-        self.prompt_entry = QtWidgets.QLineEdit()
-        self.prompt_entry.setStyleSheet(f"font-size: {font}px; color: white; background-color: black;")
-        self.prompt_entry.setFixedHeight(int(btn_h * 0.75))
-        self.prompt_entry.setToolTip("Text describing what to detect (e.g. 'blueberry'). Used by "
-                                     "text-capable detectors; comma-separate multiple classes.")
-        # Typing/clearing the prompt changes whether Auto Annotate can run.
-        self.prompt_entry.textChanged.connect(lambda _t: self._refresh_auto_annotate_enabled())
-        left_layout.addWidget(self.prompt_entry)
+        self.prompt_rows = []
+        self.prompt_fields_layout = QtWidgets.QVBoxLayout()
+        self.prompt_fields_layout.setSpacing(BTN_GAP)
+        prompts_layout.addLayout(self.prompt_fields_layout)
+        self._add_prompt_field()   # first positive field
+        # prompt_entry aliases the first field for back-compat + headless tests.
+        self.prompt_entry = self.prompt_rows[0]["edit"]
+
+        self.add_prompt_btn = QtWidgets.QPushButton("+ Add prompt")
+        self.add_prompt_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
+        self.add_prompt_btn.setFixedHeight(self._prompt_field_h)
+        self.add_prompt_btn.setToolTip("Add another prompt field for a different concept (up to 5). "
+                                       "Each field can still be comma-separated for multiple "
+                                       "classes; all fields run together in one pass.")
+        self.add_prompt_btn.clicked.connect(lambda: self._add_prompt_field(focus=True))
+        prompts_layout.addWidget(self.add_prompt_btn)
+
+        # Negative prompt: same multi-field treatment, detected in the SAME pass;
+        # any positive hit overlapping a negative one is dropped. Never required.
+        self.neg_prompt_label = QtWidgets.QLabel("Negative classes (optional):")
+        self.neg_prompt_label.setStyleSheet(lbl_style)
+        self.neg_prompt_label.setToolTip("Things to rule out, one concept per field (e.g. 'leaf' "
+                                         "while detecting 'blueberry'). They are found in the same "
+                                         "pass and any detection overlapping them is dropped. "
+                                         "Leave blank to skip; negatives never stop the model from "
+                                         "running, and they carry across images like the prompts.")
+        prompts_layout.addWidget(self.neg_prompt_label)
+
+        self.neg_prompt_rows = []
+        self.neg_prompt_fields_layout = QtWidgets.QVBoxLayout()
+        self.neg_prompt_fields_layout.setSpacing(BTN_GAP)
+        prompts_layout.addLayout(self.neg_prompt_fields_layout)
+        self._add_neg_prompt_field()   # first negative field
+        # neg_prompt_entry aliases the first field for back-compat + headless.
+        self.neg_prompt_entry = self.neg_prompt_rows[0]["edit"]
+
+        self.add_neg_prompt_btn = QtWidgets.QPushButton("+ Add negative")
+        self.add_neg_prompt_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
+        self.add_neg_prompt_btn.setFixedHeight(self._prompt_field_h)
+        self.add_neg_prompt_btn.setToolTip("Add another negative prompt field to suppress a "
+                                           "different concept (up to 5). Optional; negatives never "
+                                           "gate whether the model can run.")
+        self.add_neg_prompt_btn.clicked.connect(lambda: self._add_neg_prompt_field(focus=True))
+        prompts_layout.addWidget(self.add_neg_prompt_btn)
+
+        left_layout.addWidget(self.prompts_panel)
+        self.active_class = 0
+        # Box-prompt class names, index == class id. Session-only ON PURPOSE:
+        # kept in the in-process store so they survive moving between images
+        # and round trips through the main menu, but a fresh launch always
+        # starts from one unnamed class. Edited via the Classes... dialog and
+        # written verbatim into classes.txt and the legend image.
+        self.box_class_names = self._load_box_class_names()
+
+        # Box prompts section: shown ONLY in Boxes mode (the Text/Boxes radio
+        # swaps this with the text Prompts panel above). It holds the box class
+        # picker, the Classes... editor, the color-legend info dot, and the
+        # negative-box toggle. The box classes are their own colored slots,
+        # independent of the text prompt fields.
+        self.box_prompt_section = QtWidgets.QWidget()
+        _box_col = QtWidgets.QVBoxLayout(self.box_prompt_section)
+        _box_col.setContentsMargins(0, 0, 0, 0)
+        _box_col.setSpacing(BTN_GAP)
+
+        _dc_row = QtWidgets.QHBoxLayout()
+        _dc_row.setSpacing(6)
+        _dc_label = QtWidgets.QLabel("Draw box as:")
+        _dc_label.setStyleSheet(lbl_style)
+        _dc_row.addWidget(_dc_label)
+        self.draw_class_combo = QtWidgets.QComboBox()
+        self.draw_class_combo.setStyleSheet(self._prompt_field_style)
+        self.draw_class_combo.setFixedHeight(self._prompt_field_h)
+        self.draw_class_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                            QtWidgets.QSizePolicy.Fixed)
+        self.draw_class_combo.setToolTip(
+            "Which class the next positive box you draw is tagged as. Up to "
+            f"{MAX_BOX_CLASSES} colored classes; each draws in its own color so "
+            "you can tell them apart. Use Classes... to add, remove or rename them.")
+        self.draw_class_combo.currentIndexChanged.connect(self._on_draw_class_combo_changed)
+        _dc_row.addWidget(self.draw_class_combo, 1)
+        # Box color legend info dot.
+        self.box_info_dot = InfoBadge("i")
+        _bdot = int(font * 1.6)
+        self.box_info_dot.setFixedSize(_bdot, _bdot)
+        self.box_info_dot.setAlignment(QtCore.Qt.AlignCenter)
+        self.box_info_dot.setStyleSheet(
+            f"color: {BTN_BLUE}; font-size: {int(font * 0.85)}px; font-weight: bold; "
+            f"border: 1px solid {BTN_BLUE}; border-radius: {_bdot // 2}px;")
+        self.box_info_dot.setCursor(QtCore.Qt.WhatsThisCursor)
+        self.box_info_dot.setToolTip("Hover for the box color legend.")
+        _dc_row.addWidget(self.box_info_dot)
+        _box_col.addLayout(_dc_row)
+
+        # Class count + names. Opens the Box Classes dialog; the names persist
+        # across restarts and are what classes.txt records.
+        self.box_classes_btn = QtWidgets.QPushButton("Classes…")
+        self.box_classes_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
+        self.box_classes_btn.setFixedHeight(self._prompt_field_h)
+        self.box_classes_btn.setToolTip(
+            "Choose how many kinds of box you draw and name each one. The names "
+            "are saved into classes.txt and the class_legend.png next to your "
+            "labels. Each class draws in its own color.\n\n"
+            "SAM3 searches for one class at a time, so every extra class adds "
+            "one more SAM3 pass per image.")
+        self.box_classes_btn.clicked.connect(self._open_box_classes_dialog)
+        _box_col.addWidget(self.box_classes_btn)
+
+        # Negative box toggle: while ON, drags draw RED negative boxes (one type)
+        # whose look-alikes are suppressed across the folder.
+        self.neg_box_btn = QtWidgets.QPushButton("Draw Negative Box: OFF")
+        self.neg_box_btn.setCheckable(True)
+        self.neg_box_btn.setChecked(False)
+        self.neg_box_btn.setStyleSheet(toggle_qss(BTN_RED, font))
+        self.neg_box_btn.setFixedHeight(self._prompt_field_h)
+        self.neg_box_btn.setToolTip("When ON, the boxes you draw are NEGATIVE (red): their look "
+                                    "is suppressed across every image, so detections matching them "
+                                    "are dropped. Turn OFF to go back to drawing positive class "
+                                    "boxes. Optional; never required to run.")
+        self.neg_box_btn.toggled.connect(self._on_neg_box_toggled)
+        _box_col.addWidget(self.neg_box_btn)
+
+        left_layout.addWidget(self.box_prompt_section)
+
+        self._refresh_class_legend()
 
         # Display-mode toggles sit directly above the confidence sliders.
         self.checkbox_layout = QtWidgets.QHBoxLayout()
@@ -304,6 +631,62 @@ class ManualWindow(QtWidgets.QWidget):
         self.box_checkbox.stateChanged.connect(self._on_box_checked)
         self.mask_checkbox.stateChanged.connect(self._on_mask_checked)
         left_layout.addLayout(self.checkbox_layout)
+
+        # Per-class settings: with 2+ classes each class can override the three
+        # global sliders below (a berry class wants a low max-area cap, a leaf
+        # class a high one). Hidden entirely for a single-class session, which
+        # keeps the classic layout and behavior untouched.
+        self.class_settings_panel = QtWidgets.QWidget()
+        _cs_layout = QtWidgets.QVBoxLayout(self.class_settings_panel)
+        _cs_layout.setContentsMargins(0, 0, 0, 0)
+        _cs_layout.setSpacing(4)
+        _cs_header = QtWidgets.QLabel("Per-Class Settings")
+        _cs_header.setStyleSheet(lbl_style)
+        _cs_header.setToolTip(
+            "Each class keeps its own detector confidence, segmenter confidence "
+            "and max detection size. Pick a class and move its sliders; they "
+            "apply immediately. The global sliders below overwrite every class "
+            "at once and need an explicit Apply.")
+        _cs_layout.addWidget(_cs_header)
+        self.class_settings_combo = QtWidgets.QComboBox()
+        self.class_settings_combo.setToolTip("Which class the three sliders below tune.")
+        self.class_settings_combo.setStyleSheet(f"font-size: {font}px;")
+        _cs_layout.addWidget(self.class_settings_combo)
+
+        def _cs_slider(label_text, lo, init):
+            lab = QtWidgets.QLabel(label_text)
+            lab.setStyleSheet(lbl_style)
+            s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            s.setRange(lo, 100)
+            s.setValue(init)
+            s.setFixedHeight(30)
+            s.setStyleSheet(slider_qss())
+            _cs_layout.addWidget(lab)
+            _cs_layout.addWidget(s)
+            return lab, s
+
+        self.cls_det_label, self.cls_det_slider = _cs_slider(
+            "Class detector confidence: 50", 0, 50)
+        self.cls_seg_label, self.cls_seg_slider = _cs_slider(
+            "Class segmenter confidence: 30", 0, 30)
+        self.cls_area_label, self.cls_area_slider = _cs_slider(
+            "Class max detection size: 0.50", 5, 50)
+        self.class_settings_combo.currentIndexChanged.connect(self._on_class_settings_combo)
+        self.cls_det_slider.valueChanged.connect(lambda v: self._on_class_slider("det", v))
+        self.cls_seg_slider.valueChanged.connect(lambda v: self._on_class_slider("seg", v))
+        self.cls_area_slider.valueChanged.connect(lambda v: self._on_class_slider("max_area", v))
+        left_layout.addWidget(self.class_settings_panel)
+        self.class_settings_panel.setVisible(False)
+
+        self.global_sliders_header = QtWidgets.QLabel("Global sliders (all classes)")
+        self.global_sliders_header.setStyleSheet(lbl_style)
+        self.global_sliders_header.setToolTip(
+            "With 2+ classes these three sliders stop applying live: move them, "
+            "then press Apply to All Classes to overwrite every class's "
+            "individual settings, or Revert. Runs are blocked while a change "
+            "sits unapplied.")
+        left_layout.addWidget(self.global_sliders_header)
+        self.global_sliders_header.setVisible(False)
 
         # Detector confidence (filters detector-output boxes)
         det_label = QtWidgets.QLabel("Detector confidence: 50")
@@ -343,6 +726,62 @@ class ManualWindow(QtWidgets.QWidget):
         self.mask_threshold_slider.valueChanged.connect(self._update_mask_threshold_label)
         self.box_threshold_slider = self.mask_threshold_slider  # legacy alias
 
+        # Max detection size: drop any box/mask covering more than this fraction
+        # of the image. Low keeps big blobs out (e.g. blueberries), high allows
+        # large detections (e.g. a red leaf). Read live by _max_area_frac(), so
+        # every detector and Auto Annotate Remaining honor it, and it persists
+        # across images like the other sliders. Slider 5..100 -> 0.05..1.00.
+        # Initialize from any AUTOANNOTATE_MAX_AREA_FRAC in the env so an
+        # existing .env setting is respected, else config.DEFAULT_MAX_AREA_FRAC.
+        _maf_init = effective_max_area_frac()
+        _maf_default = max(5, min(100, int(round(_maf_init * 100))))
+        maxarea_label = QtWidgets.QLabel(f"Max detection size: {_maf_default / 100.0:.2f}")
+        maxarea_label.setStyleSheet(lbl_style)
+        maxarea_label.setToolTip(
+            "Drops any detection covering more than this fraction of the image. "
+            "Lower it for small objects so stray oversized masks are removed "
+            "(e.g. blueberries at ~0.10-0.30); raise it for large objects you "
+            "do want kept (e.g. a red leaf, near 1.00). Applies to every "
+            "detector and to Auto Annotate Remaining.")
+        left_layout.addWidget(maxarea_label)
+        self.max_area_label = maxarea_label
+
+        self.max_area_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.max_area_slider.setRange(5, 100)
+        self.max_area_slider.setValue(_maf_default)
+        self.max_area_slider.setFixedHeight(30)
+        self.max_area_slider.setStyleSheet(slider_qss())
+        left_layout.addWidget(self.max_area_slider)
+        self.max_area_slider.valueChanged.connect(self._update_max_area_label)
+
+        # Apply / Revert for the global sliders while per-class settings are
+        # active: a global slider move must be confirmed (it overwrites every
+        # class) or reverted, and Regenerate / the batch refuse to run while
+        # this row is showing. Single-class sessions never see it.
+        self.global_apply_row = QtWidgets.QWidget()
+        _ga_layout = QtWidgets.QHBoxLayout(self.global_apply_row)
+        _ga_layout.setContentsMargins(0, 0, 0, 0)
+        self.global_apply_btn = QtWidgets.QPushButton("Apply to All Classes")
+        self.global_apply_btn.setStyleSheet(btn_qss(BTN_ORANGE, font))
+        self.global_apply_btn.setToolTip(
+            "Overwrite EVERY class's individual settings with the three global "
+            "slider values (asks for confirmation first).")
+        self.global_revert_btn = QtWidgets.QPushButton("Revert")
+        self.global_revert_btn.setStyleSheet(btn_qss(BTN_GREY, font))
+        self.global_revert_btn.setToolTip(
+            "Put the global sliders back to their last applied positions.")
+        self.global_apply_btn.clicked.connect(self._apply_globals_to_classes)
+        self.global_revert_btn.clicked.connect(self._revert_global_sliders)
+        _ga_layout.addWidget(self.global_apply_btn)
+        _ga_layout.addWidget(self.global_revert_btn)
+        left_layout.addWidget(self.global_apply_row)
+        self.global_apply_row.setVisible(False)
+        self._global_dirty = False
+        self._snapshot_globals()
+        self.detection_threshold_slider.valueChanged.connect(self._on_global_slider_moved)
+        self.mask_threshold_slider.valueChanged.connect(self._on_global_slider_moved)
+        self.max_area_slider.valueChanged.connect(self._on_global_slider_moved)
+
         # (No mid-panel stretch here: the controls group together and any
         # spare vertical space falls to the bottom of the column instead of
         # leaving a dead gap above the bottom buttons.)
@@ -361,13 +800,34 @@ class ManualWindow(QtWidgets.QWidget):
         self.regen_btn = regen_btn
         bottom_layout.addWidget(regen_btn)
 
-        next_btn = QtWidgets.QPushButton("Next Image")
+        # Previous / Next share one row at half width each (Previous on the
+        # left so the pair reads in navigation order); both expand to split the
+        # column evenly and their labels still fit the font-sized column.
+        nav_row = QtWidgets.QHBoxLayout()
+        nav_row.setSpacing(BTN_GAP)
+
+        prev_btn = QtWidgets.QPushButton("Previous IMG")
+        prev_btn.setStyleSheet(btn_qss(BTN_GREY, font))
+        prev_btn.setFixedHeight(btn_h)
+        prev_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        prev_btn.setToolTip("Save the current image's labels and go back one image. The model "
+                            "does NOT run again: the previous image's saved annotations are "
+                            "reloaded from disk exactly as you left them, so trimmed and "
+                            "edited results are preserved.")
+        prev_btn.clicked.connect(lambda: lock_during(prev_btn, self.previous_image))
+        self.prev_btn = prev_btn
+        nav_row.addWidget(prev_btn)
+
+        next_btn = QtWidgets.QPushButton("Next IMG")
         next_btn.setStyleSheet(btn_qss(BTN_GREEN, font))
         next_btn.setFixedHeight(btn_h)
+        next_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         next_btn.setToolTip("Save the current image's labels and move to the next image in the folder.")
         next_btn.clicked.connect(lambda: lock_during(next_btn, self.next_image))
         self.next_btn = next_btn
-        bottom_layout.addWidget(next_btn)
+        nav_row.addWidget(next_btn)
+
+        bottom_layout.addLayout(nav_row)
 
         auto_annotate_btn = QtWidgets.QPushButton("Auto Annotate Remaining")
         auto_annotate_btn.setStyleSheet(btn_qss(BTN_RED, font))
@@ -395,17 +855,64 @@ class ManualWindow(QtWidgets.QWidget):
             "apply to the image you are on."
         )
         bottom_layout.addWidget(self.carry_forward_checkbox)
+
+        # Recycle toggle: when ON, Auto Annotate Remaining appends the images
+        # BEFORE the current one to the end of the run instead of omitting
+        # them, so starting a batch halfway through a folder still covers it.
+        self.recycle_checkbox = QtWidgets.QPushButton("Include Earlier Images: OFF")
+        self.recycle_checkbox.setCheckable(True)
+        self.recycle_checkbox.setChecked(False)
+        self.recycle_checkbox.setStyleSheet(toggle_qss(BTN_BLUE, font))
+        self.recycle_checkbox.setFixedHeight(btn_h)
+        self.recycle_checkbox.toggled.connect(self._on_recycle_toggled)
+        self.recycle_checkbox.setToolTip(
+            "When ON, Auto Annotate Remaining also processes the images BEFORE "
+            "this one, appended after the remaining ones, so nothing in the "
+            "folder is skipped. Their existing label files are overwritten "
+            "like any other batch target."
+        )
+        bottom_layout.addWidget(self.recycle_checkbox)
         self._refresh_carry_checkbox_enabled()
         self._refresh_auto_annotate_enabled()
 
         left_layout.addLayout(bottom_layout)
         left_layout.addStretch()  # trailing space keeps controls top-grouped
-        # Pack the controls into a fixed-width container so the column can't
-        # expand into the image; right_layout (the image) gets the stretch.
+        # Pack the controls into a fixed-width container, then put that inside a
+        # scroll area. Without the scroll area a tall control column (many prompt
+        # fields, or a big scaled font) makes the window's minimum height exceed
+        # the screen, which on fullscreen pushes the bottom of BOTH columns
+        # (Auto Annotate Remaining, the right-side tools) off the bottom edge and
+        # a refresh cannot bring them back. The scroll area lets the column
+        # shrink to any height and scroll instead, so the buttons are always
+        # reachable; on a normal-height screen with the prompts collapsed no
+        # scrollbar appears at all.
         left_container = QtWidgets.QWidget()
         left_container.setLayout(left_layout)
-        left_container.setFixedWidth(left_panel_w)
-        main_layout.addWidget(left_container)
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidget(left_container)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        # Give the vertical scrollbar an explicit width so it OCCUPIES layout
+        # space (a classic gutter) instead of floating over the controls the way
+        # a native overlay scrollbar does; an overlay bar sits on top of the
+        # right edge of every button and shaves it off. _SBW is that gutter.
+        _SBW = 12
+        left_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            f"QScrollBar:vertical {{ background: #3a3a3a; width: {_SBW}px; margin: 0; }}"
+            "QScrollBar::handle:vertical { background: #6a6a6a; border-radius: 5px; "
+            "min-height: 24px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { "
+            "background: transparent; }")
+        # Fixed outer width = the controls' own preferred width PLUS the gutter,
+        # so the usable viewport is always wide enough for the buttons and the
+        # scrollbar never eats into them. Measured from the built column so it is
+        # correct even when the font/labels push the controls past left_panel_w.
+        _content_w = max(left_panel_w, left_container.sizeHint().width())
+        left_scroll.setFixedWidth(_content_w + _SBW + 2)
+        main_layout.addWidget(left_scroll)
 
         # Right column: image + checkboxes
         right_layout = QtWidgets.QVBoxLayout()
@@ -474,6 +981,19 @@ class ManualWindow(QtWidgets.QWidget):
         self.mask_draw_action.triggered.connect(lambda: self._select_draw_tool("semiauto", activate=True))
         self.draw_tool_group.addAction(self.mask_draw_action)
         draw_menu.addAction(self.mask_draw_action)
+        # Class picker for hand-drawn work: choose which class the next box or
+        # mask you draw is tagged as. Populated from the prompt classes by
+        # _refresh_draw_class_menu (replaces the old Classes dropdown).
+        draw_menu.addSeparator()
+        self.draw_class_menu = draw_menu.addMenu("Class for new boxes")
+        self.draw_class_menu.setToolTipsVisible(True)
+        self.draw_class_menu.setToolTip(
+            "Pick which class the boxes and masks you draw by hand are tagged "
+            "as. The list comes from your prompt classes; hover the info dot in "
+            "the Prompts panel to see each class color.")
+        self.draw_class_group = QtWidgets.QActionGroup(self)
+        self.draw_class_group.setExclusive(True)
+        self._refresh_draw_class_menu()
         self.draw_btn.setMenu(draw_menu)
         self.draw_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
         draw_row.addWidget(self.draw_btn, 1)
@@ -489,9 +1009,11 @@ class ManualWindow(QtWidgets.QWidget):
         self.resize_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self.resize_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.resize_btn.setToolTip(
-            "Zoom (scroll / pinch) and pan (drag) the image. Your zoom stays "
-            "after you turn this off so you can annotate zoomed in; the dropdown's "
-            "Original Size (and Save & Confirm) returns the image to its original size.")
+            "Zoom (pinch / Ctrl+scroll) and pan (scroll) the image while STILL "
+            "drawing and editing with the left button. Pick Trackpad or Mouse "
+            "input in the dropdown. Your zoom stays after you turn this off; "
+            "the dropdown's Original Size (and Save & Confirm) returns the "
+            "image to its original size.")
         self.resize_btn.toggled.connect(self._toggle_resize_mode)
         resize_menu = QtWidgets.QMenu()
         resize_menu.setToolTipsVisible(True)
@@ -523,6 +1045,8 @@ class ManualWindow(QtWidgets.QWidget):
             lambda: self.image_label.set_dark_tint(True))
         self.tint_group.addAction(self.darken_tint_act)
         resize_menu.addAction(self.darken_tint_act)
+        # Trackpad/Mouse input scheme, shared with the side-by-side viewer.
+        add_input_scheme_actions(resize_menu, self)
         self.resize_btn.setMenu(resize_menu)
         self.resize_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
         draw_row.addWidget(self.resize_btn, 1)
@@ -735,6 +1259,9 @@ class ManualWindow(QtWidgets.QWidget):
         """Toggle visibility of the text-prompt UI when switching modes."""
         self.prompt_mode = mode
         self._refresh_prompt_entry_visibility()
+        # Box mode uses fixed colored class slots; text mode uses the prompt
+        # field classes. Rebuild the pickers for the new source.
+        self._refresh_draw_class_menu()
         # In Boxes mode, force box-draw on so the user can prompt by drawing.
         # Make sure the Draw button's active tool is "box" first (it may have
         # been switched to semi-auto), then activate it.
@@ -765,8 +1292,16 @@ class ManualWindow(QtWidgets.QWidget):
             or (is_sam3_det and self.prompt_mode == "boxes")
             or (is_one_shot and "YOLOE-vis" not in text and self.prompt_mode == "boxes")
         )
+        # Negative-box toggle (box mode only) routes drags to the RED negative
+        # bucket; otherwise positive prompt boxes / green annotations as before.
+        draw_neg = (needs_prompt_boxes and self.prompt_mode == "boxes"
+                    and getattr(self, "neg_box_btn", None) is not None
+                    and self.neg_box_btn.isChecked())
         if hasattr(self, "image_label"):
-            self.image_label.set_draw_subject("prompt" if needs_prompt_boxes else "annotation")
+            if draw_neg:
+                self.image_label.set_draw_subject("neg_prompt")
+            else:
+                self.image_label.set_draw_subject("prompt" if needs_prompt_boxes else "annotation")
             # Seamless switch ONLY on an explicit Text<->Boxes prompt-mode flip
             # (reclassify=True): boxes drawn before the flip get re-tagged to
             # the new bucket so a box drawn in Text mode becomes a yellow prompt
@@ -778,17 +1313,270 @@ class ManualWindow(QtWidgets.QWidget):
                 self.image_label.reclassify_user_rects(needs_prompt_boxes)
 
     def _refresh_prompt_entry_visibility(self):
-        """Single source of truth for the prompt-text entry's visibility.
-        Visible iff prompt_mode == 'text' AND the detector accepts text
-        (i.e. not YOLOE-vis, which is visual-prompts only). SAM3 standalone
-        supports both modes, so it relies on prompt_mode alone."""
+        """Show the collapsible Prompts section only when the detector accepts a
+        text prompt (text mode and not YOLOE-vis, which is visual-prompts only).
+        When shown, the panel itself follows the collapse toggle so a user who
+        closed it stays closed."""
         is_text = (getattr(self, "prompt_mode", "text") == "text")
-        is_yoloe_vis = "YOLOE-vis" in getattr(self, "detector_choice", "")
-        visible = is_text and not is_yoloe_vis
-        if hasattr(self, "prompt_entry"):
-            self.prompt_entry.setVisible(visible)
-        if hasattr(self, "prompt_label_widget"):
-            self.prompt_label_widget.setVisible(visible)
+        det = getattr(self, "detector_choice", "")
+        is_yoloe_vis = "YOLOE-vis" in det
+        box_capable = ("YOLOE-vis" in det or "YOLOE-seg" in det or "SAM3" in det)
+        # The Text/Boxes radio swaps the whole prompt UI: Text mode shows the
+        # text prompt + negative fields; Box mode shows the box-prompt section
+        # (colored class picker + negative-box toggle) and hides the text area.
+        text_ui = is_text and not is_yoloe_vis
+        box_ui = (not is_text) and box_capable
+        if hasattr(self, "prompts_toggle_btn"):
+            self.prompts_toggle_btn.setVisible(text_ui)
+            if hasattr(self, "class_info_dot"):
+                self.class_info_dot.setVisible(text_ui)
+            if hasattr(self, "prompts_panel"):
+                self.prompts_panel.setVisible(text_ui and self.prompts_toggle_btn.isChecked())
+        if hasattr(self, "box_prompt_section"):
+            self.box_prompt_section.setVisible(box_ui)
+
+    def _toggle_prompts_panel(self, checked):
+        """Show/hide the prompt + negative fields. Collapsing keeps whatever was
+        typed (the widgets persist); only their visibility changes."""
+        if hasattr(self, "prompts_panel"):
+            self.prompts_panel.setVisible(checked)
+        self.prompts_toggle_btn.setText("Prompts ▾" if checked else "Prompts ▸")
+
+    def _set_active_class(self, idx):
+        """Single source of truth for the active draw class. Sets active_class,
+        stamps it onto the canvas (so newly drawn boxes carry it), and keeps both
+        pickers (the left 'Draw box as' combo and the Draw Boxes menu) in sync
+        without re-entrancy."""
+        self.active_class = max(0, int(idx or 0))
+        if hasattr(self, "image_label"):
+            self.image_label.set_active_draw_cls(self.active_class)
+        combo = getattr(self, "draw_class_combo", None)
+        if (combo is not None and 0 <= self.active_class < combo.count()
+                and combo.currentIndex() != self.active_class):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(self.active_class)
+            combo.blockSignals(False)
+        group = getattr(self, "draw_class_group", None)
+        if group is not None:
+            acts = group.actions()
+            if 0 <= self.active_class < len(acts) and not acts[self.active_class].isChecked():
+                acts[self.active_class].setChecked(True)
+
+    def _on_active_class_changed(self, idx):
+        """Class picked in the Draw Boxes 'Class for new boxes' menu."""
+        self._set_active_class(idx)
+
+    def _on_draw_class_combo_changed(self, idx):
+        """Class picked in the left-side 'Draw box as' dropdown (box mode)."""
+        self._set_active_class(idx)
+
+    def _on_neg_box_toggled(self, on):
+        """Toggle drawing RED negative boxes vs positive class boxes (box mode)."""
+        self.neg_box_btn.setText("Draw Negative Box: ON" if on else "Draw Negative Box: OFF")
+        self._refresh_draw_subject()
+
+    def _make_field_row(self, rows, layout, on_change, tooltip):
+        """Create one prompt input row (QLineEdit + remove button), append it to
+        `rows` and `layout`, and wire textChanged/remove to `on_change`. Shared
+        by the positive and negative multi-field prompt sections."""
+        edit = QtWidgets.QLineEdit()
+        edit.setStyleSheet(self._prompt_field_style)
+        edit.setFixedHeight(self._prompt_field_h)
+        edit.setToolTip(tooltip)
+        # Compact square remove button. chip_btn_qss drops the wide horizontal
+        # padding so the glyph stays centered and uncut in a small fixed square.
+        remove = QtWidgets.QPushButton("×")   # multiplication sign, universal close glyph
+        remove.setFixedSize(self._prompt_field_h, self._prompt_field_h)
+        remove.setStyleSheet(chip_btn_qss(BTN_GREY, self._field_font))
+        remove.setToolTip("Remove this field.")
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(BTN_GAP)
+        row.addWidget(edit, 1)
+        row.addWidget(remove)
+        container = QtWidgets.QWidget()
+        container.setLayout(row)
+        entry = {"edit": edit, "remove": remove, "container": container}
+        edit.textChanged.connect(lambda _t: on_change())
+        remove.clicked.connect(lambda: self._remove_field_row(rows, entry, on_change))
+        rows.append(entry)
+        layout.addWidget(container)
+        return entry
+
+    def _remove_field_row(self, rows, entry, on_change):
+        """Remove a prompt field row. The last remaining row is cleared instead
+        of deleted so there is always at least one field to type into."""
+        if len(rows) <= 1:
+            entry["edit"].clear()
+            return
+        if entry in rows:
+            rows.remove(entry)
+            entry["container"].setParent(None)
+            entry["container"].deleteLater()
+        on_change()
+
+    def _update_field_remove_buttons(self, rows):
+        """Hide the remove button when a single field remains (there is nothing
+        to remove down to zero fields)."""
+        single = len(rows) <= 1
+        for e in rows:
+            e["remove"].setVisible(not single)
+
+    def _add_prompt_field(self, text="", focus=False):
+        """Append a positive prompt field (optionally pre-filled/focused). Caps
+        at MAX_PROMPT_FIELDS; a no-op once the cap is reached."""
+        if len(self.prompt_rows) >= self.MAX_PROMPT_FIELDS:
+            return None
+        entry = self._make_field_row(
+            self.prompt_rows, self.prompt_fields_layout,
+            self._on_prompt_fields_changed,
+            "Text describing what to detect (e.g. 'blueberry'). Comma-separate "
+            "multiple classes in one field; each gets its own class id and color.")
+        if text:
+            entry["edit"].setText(text)
+        self._on_prompt_fields_changed()
+        if focus:
+            entry["edit"].setFocus()
+        return entry
+
+    def _on_prompt_fields_changed(self):
+        """React to any positive-field add/remove/edit: keep the prompt_entry
+        alias on the first field and refresh the dependent UI."""
+        if self.prompt_rows:
+            self.prompt_entry = self.prompt_rows[0]["edit"]
+        self._update_field_remove_buttons(self.prompt_rows)
+        if hasattr(self, "add_prompt_btn"):
+            self.add_prompt_btn.setEnabled(len(self.prompt_rows) < self.MAX_PROMPT_FIELDS)
+        self._refresh_class_legend()
+        self._refresh_auto_annotate_enabled()
+
+    def _add_neg_prompt_field(self, text="", focus=False):
+        """Append a negative prompt field (optionally pre-filled/focused). Caps
+        at MAX_PROMPT_FIELDS; a no-op once the cap is reached."""
+        if len(self.neg_prompt_rows) >= self.MAX_PROMPT_FIELDS:
+            return None
+        entry = self._make_field_row(
+            self.neg_prompt_rows, self.neg_prompt_fields_layout,
+            self._on_neg_prompt_fields_changed,
+            "Comma-separated things to suppress (e.g. 'leaf' when detecting "
+            "'blueberry'). Detected in the same run; positives overlapping a "
+            "negative are dropped. Optional.")
+        if text:
+            entry["edit"].setText(text)
+        self._on_neg_prompt_fields_changed()
+        if focus:
+            entry["edit"].setFocus()
+        return entry
+
+    def _on_neg_prompt_fields_changed(self):
+        """React to any negative-field add/remove/edit: keep the
+        neg_prompt_entry alias on the first field and refresh the dropdown.
+        Negatives never gate the run, so no auto-annotate refresh here."""
+        if self.neg_prompt_rows:
+            self.neg_prompt_entry = self.neg_prompt_rows[0]["edit"]
+        self._update_field_remove_buttons(self.neg_prompt_rows)
+        if hasattr(self, "add_neg_prompt_btn"):
+            self.add_neg_prompt_btn.setEnabled(len(self.neg_prompt_rows) < self.MAX_PROMPT_FIELDS)
+        self._refresh_class_legend()
+
+    def _positive_prompt_text(self):
+        """Aggregate every positive prompt field into one comma-separated string
+        for parse_prompt_classes. Falls back to the prompt_entry alias when the
+        multi-field container is absent (headless tests)."""
+        rows = getattr(self, "prompt_rows", None)
+        if rows:
+            parts = [e["edit"].text().strip() for e in rows]
+            return ", ".join(p for p in parts if p)
+        entry = getattr(self, "prompt_entry", None)
+        return entry.text() if entry is not None else ""
+
+    def _refresh_class_legend(self):
+        """Update the prompt-panel info dot with the color legend (each positive
+        class next to its outline color, plus negatives in red) and keep the
+        Draw Boxes 'Class for new boxes' submenu in sync with the classes."""
+        dot = getattr(self, "class_info_dot", None)
+        if dot is not None:
+            pos = parse_prompt_classes(self._positive_prompt_text())
+            neg = self._negative_classes()
+            rows = ["<b>Prompt classes</b> (box / mask outline color):"]
+            if pos:
+                for i, name in enumerate(pos):
+                    swatch = ("<span style='background-color:%s;'>&nbsp;&nbsp;&nbsp;</span>"
+                              % class_color_qt(i).name())
+                    rows.append(f"{swatch} {i}: {name}")
+            else:
+                rows.append("Type a prompt to add classes.")
+            if neg:
+                rows.append("<br><b>Negative classes</b> (found, then suppressed):")
+                for name in neg:
+                    rows.append("<span style='background-color:#c83c3c;'>"
+                                "&nbsp;&nbsp;&nbsp;</span> " + name)
+            dot.set_info_text("<br>".join(rows))
+        # Box-mode legend: the configured class slots + the red negative box.
+        bdot = getattr(self, "box_info_dot", None)
+        if bdot is not None:
+            brows = ["<b>Box prompt classes</b> (the color each draws in):"]
+            for i, name in enumerate(self._box_class_names()):
+                swatch = ("<span style='background-color:%s;'>&nbsp;&nbsp;&nbsp;</span>"
+                          % class_color_qt(i).name())
+                brows.append(f"{swatch} {i}: {name}")
+            brows.append("<br><span style='background-color:#c83c3c;'>&nbsp;&nbsp;&nbsp;</span> "
+                         "Negative box (red): suppresses look-alikes across the folder")
+            brows.append("Use <b>Classes…</b> to add, remove or rename them.")
+            bdot.set_info_text("<br>".join(brows))
+        self._refresh_draw_class_menu()
+        # Class count may have changed: show/hide the per-class settings section.
+        self._refresh_class_settings_ui()
+
+    def _refresh_draw_class_menu(self):
+        """Rebuild BOTH active-class pickers from the current prompt classes,
+        one colored entry each: the left 'Draw box as' combo (box mode) and the
+        Draw Boxes menu 'Class for new boxes' submenu. Clamps the active class
+        when the list shrinks and stamps it onto the canvas so newly drawn boxes
+        carry it. Each picker is a no-op until it has been built. In Boxes mode
+        the classes come from the Box Classes dialog, independent of the text
+        prompt fields; in Text mode they come from the prompt fields."""
+        is_box = (getattr(self, "prompt_mode", "text") == "boxes")
+        if is_box:
+            names  = self._box_class_names()
+            labels = [f"{i}: {n}" for i, n in enumerate(names)]
+        else:
+            names  = parse_prompt_classes(self._positive_prompt_text()) or ["object"]
+            labels = [f"{i}: {name}" for i, name in enumerate(names)]
+        cur = int(getattr(self, "active_class", 0) or 0)
+        if cur >= len(names):
+            cur = 0
+        self.active_class = cur
+
+        combo = getattr(self, "draw_class_combo", None)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.clear()
+            for i, label in enumerate(labels):
+                pix = QtGui.QPixmap(14, 14)
+                pix.fill(class_color_qt(i))
+                combo.addItem(QtGui.QIcon(pix), label)
+            combo.setCurrentIndex(cur)
+            combo.blockSignals(False)
+
+        menu = getattr(self, "draw_class_menu", None)
+        group = getattr(self, "draw_class_group", None)
+        if menu is not None and group is not None:
+            for act in group.actions():
+                group.removeAction(act)
+            menu.clear()
+            for i, label in enumerate(labels):
+                pix = QtGui.QPixmap(14, 14)
+                pix.fill(class_color_qt(i))
+                act = QtWidgets.QAction(QtGui.QIcon(pix), label, self)
+                act.setCheckable(True)
+                act.setChecked(i == cur)
+                act.triggered.connect(lambda _c=False, idx=i: self._on_active_class_changed(idx))
+                group.addAction(act)
+                menu.addAction(act)
+
+        if hasattr(self, "image_label"):
+            self.image_label.set_active_draw_cls(self.active_class)
 
     def _sync_pipeline_for_prompt_mode(self):
         """If current preset is incompatible with the prompt mode, snap to a sensible default."""
@@ -1142,18 +1930,274 @@ class ManualWindow(QtWidgets.QWidget):
     def _max_area_frac(self):
         """Fraction of the image area a single detection may cover before it is
         dropped as a spurious whole-/large-image match. Applied UNIFORMLY across
-        every detector (DINO, YOLOE, SAM2/SAM3). Default 0.5 -- drops any box
-        covering more than half the image (tuned for small-object fruit/berry
-        folders). Raise it (e.g. 0.8-0.9) for genuinely large subjects, or lower
-        it further (e.g. 0.3) for tiny objects /
-        texture folders like fescue, where SAM3 box-exemplar can match a broad
-        region whose box still slips under the loose 0.9 cutoff. From
-        AUTOANNOTATE_MAX_AREA_FRAC; clamped to (0, 1]."""
+        every detector (DINO, YOLOE, SAM2/SAM3) and Auto Annotate Remaining.
+
+        Source of truth is the "Max detection size" slider when the GUI is built
+        (live-adjustable, persists across images): lower it for small objects
+        like blueberries so stray oversized masks are removed, raise it for large
+        subjects like a red leaf. Headless windows (tests) have no slider, so it
+        falls back to AUTOANNOTATE_MAX_AREA_FRAC, then config.DEFAULT_MAX_AREA_FRAC.
+        Clamped to (0, 1]."""
+        slider = getattr(self, "max_area_slider", None)
+        if slider is not None:
+            f = slider.value() / 100.0
+            return f if 0.0 < f <= 1.0 else DEFAULT_MAX_AREA_FRAC
         try:
-            f = float(os.environ.get("AUTOANNOTATE_MAX_AREA_FRAC", "0.5"))
+            f = float(os.environ.get("AUTOANNOTATE_MAX_AREA_FRAC",
+                                     str(DEFAULT_MAX_AREA_FRAC)))
         except (TypeError, ValueError):
-            f = 0.5
-        return f if 0.0 < f <= 1.0 else 0.5
+            f = DEFAULT_MAX_AREA_FRAC
+        return f if 0.0 < f <= 1.0 else DEFAULT_MAX_AREA_FRAC
+
+    def _update_max_area_label(self, value):
+        """Reflect the Max detection size slider (5..100) as a 0.05..1.00 frac."""
+        self.max_area_label.setText(f"Max detection size: {value / 100.0:.2f}")
+
+    # -- per-class thresholds ----------------------------------------------
+    # A blueberry class and a leaf class need different tuning (a berry wants a
+    # low max-area cap, a leaf a high one), so each class id can override the
+    # three sliders. One configured class = none of this is consulted and every
+    # code path below degrades to the plain slider values.
+    def _active_class_ids(self):
+        """Class ids in play for the CURRENT run configuration: box mode counts
+        the configured box classes, text mode the positive prompt fields.
+        Always at least [0]."""
+        try:
+            if getattr(self, "prompt_mode", "text") == "boxes":
+                n = len(self._box_class_names())
+            else:
+                n = len(parse_prompt_classes(self._positive_prompt_text()) or ["object"])
+        except Exception:
+            n = 1
+        return list(range(max(1, n)))
+
+    def _per_class_active(self):
+        """Two or more classes configured: per-class settings and the
+        confirm-gated global sliders are in play."""
+        return len(self._active_class_ids()) >= 2
+
+    def _class_setting(self, cls, key, fallback):
+        """One class's override for `key` ("det" / "seg" / "max_area"), or the
+        global fallback. Values are 0..1 like the sliders they mirror."""
+        entry = session_state.STATE.get("class_settings", {}).get(int(cls or 0))
+        if entry is not None and key in entry:
+            try:
+                v = float(entry[key])
+                if 0.0 <= v <= 1.0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        return float(fallback)
+
+    def _class_det_thresh(self, cls, det_thresh):
+        return self._class_setting(cls, "det", det_thresh)
+
+    def _class_seg_thresh(self, cls, mask_thresh):
+        return self._class_setting(cls, "seg", mask_thresh)
+
+    def _class_max_area(self, cls):
+        return self._class_setting(cls, "max_area", self._max_area_frac())
+
+    def _det_thresh_floor(self, det_thresh):
+        """Loosest detector confidence across the active classes. Single-pass
+        detectors run the model ONCE at this floor so no class is pre-pruned;
+        the exact per-class cut then happens on the returned detections, which
+        carry their own confidence."""
+        if not self._per_class_active():
+            return det_thresh
+        return min(self._class_det_thresh(c, det_thresh)
+                   for c in self._active_class_ids())
+
+    def _seg_thresh_floor(self, mask_thresh):
+        """Loosest segmenter-confidence knob across the active classes. DINO's
+        text_threshold is a single-pass token filter, so it CANNOT vary per
+        class; the floor is the best it can honor."""
+        if not self._per_class_active():
+            return mask_thresh
+        return min(self._class_seg_thresh(c, mask_thresh)
+                   for c in self._active_class_ids())
+
+    def _max_area_frac_loosest(self):
+        """Loosest max-area across the active classes, for the pre-filters
+        inside the pipeline calls; the exact per-class cut happens where class
+        ids sit aligned with detections."""
+        if not self._per_class_active():
+            return self._max_area_frac()
+        return max(self._class_max_area(c) for c in self._active_class_ids())
+
+    @staticmethod
+    def _result_conf_list(r):
+        """Per-detection confidences from an ultralytics result, or []. Guarded
+        because stubs and older builds may not expose boxes.conf."""
+        try:
+            _cf = getattr(r.boxes, "conf", None)
+            if _cf is None:
+                return []
+            return [float(v) for v in _cf.tolist()]
+        except Exception:
+            return []
+
+    def _cut_boxes_by_class_area(self, image_path, boxes, polys, cls_ids):
+        """Exact per-class max-area cut on absolute-xyxy detections, keeping
+        the aligned polys/class lists in lockstep. No-op with one class (the
+        branch already cut at the plain global value)."""
+        if not boxes or not self._per_class_active():
+            return boxes, polys, cls_ids
+        try:
+            with Image.open(image_path) as im:
+                iw, ih = im.size
+        except Exception:
+            return boxes, polys, cls_ids
+        total = float(iw * ih)
+        if total <= 0:
+            return boxes, polys, cls_ids
+        kb, kp, kc = [], [], []
+        for i, b in enumerate(boxes):
+            c = int(cls_ids[i]) if cls_ids is not None and i < len(cls_ids) else 0
+            if (b[2] - b[0]) * (b[3] - b[1]) >= total * self._class_max_area(c):
+                continue
+            kb.append(b)
+            if polys is not None:
+                kp.append(polys[i] if i < len(polys) else None)
+            if cls_ids is not None:
+                kc.append(cls_ids[i] if i < len(cls_ids) else 0)
+        return (kb,
+                kp if polys is not None else None,
+                kc if cls_ids is not None else None)
+
+    # -- per-class settings UI ---------------------------------------------
+    def _selected_settings_class(self):
+        combo = getattr(self, "class_settings_combo", None)
+        if combo is None or combo.currentIndex() < 0:
+            return 0
+        return int(combo.currentIndex())
+
+    def _refresh_class_settings_ui(self):
+        """Show or hide the per-class section and the global Apply machinery
+        based on how many classes are configured. One class = the classic UI,
+        with the sliders applying live and nothing extra on screen."""
+        panel = getattr(self, "class_settings_panel", None)
+        if panel is None:
+            return
+        active = self._per_class_active()
+        panel.setVisible(active)
+        self.global_sliders_header.setVisible(active)
+        if not active:
+            self._global_dirty = False
+            self.global_apply_row.setVisible(False)
+            self._snapshot_globals()
+            return
+        if getattr(self, "prompt_mode", "text") == "boxes":
+            names = self._box_class_names()
+        else:
+            names = parse_prompt_classes(self._positive_prompt_text()) or ["object"]
+        combo = self.class_settings_combo
+        prev = max(0, combo.currentIndex())
+        combo.blockSignals(True)
+        combo.clear()
+        for i, name in enumerate(names):
+            pm = QtGui.QPixmap(14, 14)
+            pm.fill(class_color_qt(i))
+            combo.addItem(QtGui.QIcon(pm), f"{i}: {name}")
+        combo.setCurrentIndex(min(prev, combo.count() - 1))
+        combo.blockSignals(False)
+        self._load_class_sliders(self._selected_settings_class())
+
+    def _load_class_sliders(self, cls):
+        """Point the three per-class sliders at `cls`, showing its stored
+        values (the global slider values when it has no overrides yet)."""
+        det = self._class_det_thresh(cls, self.detection_threshold_slider.value() / 100)
+        seg = self._class_seg_thresh(cls, self.mask_threshold_slider.value() / 100)
+        area = self._class_max_area(cls)
+        for slider, val, lo in ((self.cls_det_slider, det, 0),
+                                (self.cls_seg_slider, seg, 0),
+                                (self.cls_area_slider, area, 5)):
+            slider.blockSignals(True)
+            slider.setValue(max(lo, min(100, int(round(val * 100)))))
+            slider.blockSignals(False)
+        self._update_class_slider_labels()
+
+    def _update_class_slider_labels(self):
+        self.cls_det_label.setText(
+            f"Class detector confidence: {self.cls_det_slider.value()}")
+        self.cls_seg_label.setText(
+            f"Class segmenter confidence: {self.cls_seg_slider.value()}")
+        self.cls_area_label.setText(
+            f"Class max detection size: {self.cls_area_slider.value() / 100.0:.2f}")
+
+    def _on_class_settings_combo(self, _idx):
+        self._load_class_sliders(self._selected_settings_class())
+
+    def _on_class_slider(self, key, value):
+        """Per-class sliders apply immediately, like the classic sliders."""
+        cls = self._selected_settings_class()
+        entry = session_state.STATE["class_settings"].setdefault(int(cls), {})
+        entry[key] = value / 100.0
+        self._update_class_slider_labels()
+
+    def _snapshot_globals(self):
+        """Remember the applied global slider positions so Revert can restore
+        them. Guarded for windows built without the sliders (headless)."""
+        try:
+            self._global_applied = {
+                "det": self.detection_threshold_slider.value(),
+                "seg": self.mask_threshold_slider.value(),
+                "max_area": self.max_area_slider.value(),
+            }
+        except AttributeError:
+            self._global_applied = None
+
+    def _on_global_slider_moved(self, *_):
+        """With 2+ classes a global slider move is only a REQUEST until Apply
+        confirms it; with one class it applies live, exactly as always."""
+        if not self._per_class_active():
+            self._snapshot_globals()
+            return
+        self._global_dirty = True
+        self.global_apply_row.setVisible(True)
+
+    def _global_sliders_blocked(self):
+        """True while an unconfirmed global slider change is pending: runs are
+        refused so results always come from settings the user has stood by."""
+        return self._per_class_active() and bool(getattr(self, "_global_dirty", False))
+
+    def _apply_globals_to_classes(self):
+        """Confirmed global apply: overwrite every class's individual settings
+        with the three global slider values."""
+        n = len(self._active_class_ids())
+        box = self._styled_message(
+            f"This overwrites the individual settings of all {n} classes with "
+            f"the global slider values.", "Apply to All Classes")
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
+        if box.exec_() != QtWidgets.QMessageBox.Ok:
+            return
+        det = self.detection_threshold_slider.value() / 100.0
+        seg = self.mask_threshold_slider.value() / 100.0
+        area = self.max_area_slider.value() / 100.0
+        for c in self._active_class_ids():
+            session_state.STATE["class_settings"][int(c)] = {
+                "det": det, "seg": seg, "max_area": area}
+        self._global_dirty = False
+        self.global_apply_row.setVisible(False)
+        self._snapshot_globals()
+        self._load_class_sliders(self._selected_settings_class())
+
+    def _revert_global_sliders(self):
+        """Put the global sliders back to their last applied positions."""
+        snap = getattr(self, "_global_applied", None)
+        if snap:
+            for slider, key in ((self.detection_threshold_slider, "det"),
+                                (self.mask_threshold_slider, "seg"),
+                                (self.max_area_slider, "max_area")):
+                slider.blockSignals(True)
+                slider.setValue(snap[key])
+                slider.blockSignals(False)
+            # blockSignals also skipped the label updaters; run them by hand.
+            self._update_detection_threshold_label(self.detection_threshold_slider.value())
+            self._update_mask_threshold_label(self.mask_threshold_slider.value())
+            self._update_max_area_label(self.max_area_slider.value())
+        self._global_dirty = False
+        self.global_apply_row.setVisible(False)
 
     def _yoloe_effective_conf(self, slider_conf):
         """Rescale the user-facing slider value (0..1) into YOLOE's practical
@@ -1194,6 +2238,11 @@ class ManualWindow(QtWidgets.QWidget):
             "Use First Image as Prompt: ON" if on else "Use First Image as Prompt: OFF")
         self._refresh_auto_annotate_enabled()
 
+    def _on_recycle_toggled(self, on):
+        """Recycle toggled: label text only; the color follows :checked."""
+        self.recycle_checkbox.setText(
+            "Include Earlier Images: ON" if on else "Include Earlier Images: OFF")
+
     def _refresh_carry_checkbox_enabled(self):
         """The carry toggle drives BOX-exemplar carry (this image's drawn boxes
         -> every remaining image). DINO is text-only with no box path, so its
@@ -1223,7 +2272,7 @@ class ManualWindow(QtWidgets.QWidget):
         if not self.images:
             return False
         det_key, _, _ = self._detector_keys_for_pipeline()
-        has_text  = bool(self.prompt_entry.text().strip()) if hasattr(self, "prompt_entry") else False
+        has_text  = bool(self._positive_prompt_text().strip())
         has_boxes = bool(self.image_label.get_prompt_boxes_in_image_coords()
                          or getattr(self, "_carry_anchor", None))
         if det_key in ("dino_swint", "dino_swinb"):
@@ -1322,16 +2371,94 @@ class ManualWindow(QtWidgets.QWidget):
         seg_name = {"sam2_t": "SAM2", "sam3": "SAM3"}.get(seg_key)
         return det_name + (f"_{seg_name}" if seg_name else "")
 
+    def _write_class_key(self, names, output_folder=None):
+        """Write the three things that explain a run's class ids.
+
+          classes.txt        plain YOLO name list, one per line, nothing else:
+                             importers read the whole line as the class name, so
+                             a trailing colour would rename every class.
+          class_colors.txt   which colour each id is drawn in, in plain text.
+          class_legend.png   the same key as an image, under annotated_<model>/,
+                             BESIDE boxes/ and masks/ rather than inside them, so
+                             no labelled review image is ever painted over.
+
+        Never raises: a failed key write must not lose a run's labels."""
+        folder = output_folder or self.output_folder
+        if not folder or not names:
+            return
+        try:
+            save_classes_txt(names, folder)
+        except Exception as e:
+            print(f"[classes] classes.txt write failed: {e}")
+        try:
+            save_class_colors_txt(names, folder)
+        except Exception as e:
+            print(f"[classes] class_colors.txt write failed: {e}")
+        try:
+            save_class_legend_image(
+                names, os.path.join(folder, f'annotated_{self._model_tag()}',
+                                    'class_legend.png'))
+        except Exception as e:
+            print(f"[classes] legend image write failed: {e}")
+
     # Detection / segmentation dispatch
     def _run_sam3_crop_composite(self, image_path, ref, conf):
-        """SAM3 box-prompt carry by APPEARANCE (crop compositing).
+        """SAM3 appearance carry for a possibly MULTI-CLASS reference bundle.
+
+        run_sam3_boxes finds one concept per call, so each class's exemplar
+        crops are composited and prompted on their own pass; blending two
+        classes into one patch block would blend them into one concept and
+        return one class. Detections are tagged with the class of the pass that
+        produced them and concatenated. Same-class duplicates are dropped, two
+        classes claiming one object are both kept (see _nms_dedup).
+
+        Returns (boxes_xyxy, polys_norm, cls_ids, results). `results` is the raw
+        ultralytics output of the single pass when the bundle has one class, and
+        None for a genuine multi-class carry, where no single result object can
+        describe every pass. Callers use the polys, which are canonical."""
+        crops = list((ref or {}).get("crops") or [])
+        boxes_xyxy = list((ref or {}).get("boxes_xyxy") or [])
+        cls = list((ref or {}).get("cls") or [])
+        if len(cls) != len(crops):
+            cls = [0] * len(crops)
+        by_cls = {}
+        for crop, box, c in zip(crops, boxes_xyxy, cls):
+            by_cls.setdefault(int(c or 0), {"crops": [], "boxes_xyxy": []})
+            by_cls[int(c or 0)]["crops"].append(crop)
+            by_cls[int(c or 0)]["boxes_xyxy"].append(box)
+        if len(by_cls) <= 1:
+            # Single class: exactly the call this always made. Unchanged cost.
+            b, p, r = self._run_sam3_crop_composite_single(image_path, ref, conf)
+            only_cls = next(iter(by_cls), 0)
+            return b, p, [only_cls] * len(b), r
+
+        all_boxes, all_polys, all_cls = [], [], []
+        for c in sorted(by_cls):
+            sub = dict(ref)
+            sub.update(by_cls[c])
+            b, p, _r = self._run_sam3_crop_composite_single(image_path, sub, conf)
+            all_boxes.extend(b)
+            all_polys.extend(p)
+            all_cls.extend([c] * len(b))
+            print(f"[SAM3 carry] class {c}: {len(by_cls[c]['crops'])} exemplar(s) "
+                  f"-> {len(b)} detection(s)")
+        all_boxes, all_polys, all_cls = self._nms_dedup(
+            all_boxes, all_polys, classes=all_cls)
+        return all_boxes, all_polys, all_cls, None
+
+    def _run_sam3_crop_composite_single(self, image_path, ref, conf):
+        """SAM3 box-prompt carry by APPEARANCE (crop compositing), ONE class.
 
         Paste the carried image-1 box crops into a compact top-left block of
         THIS image, box-prompt SAM3 at those patches, then drop detections that
         land inside the patches. SAM3 then segments the same-LOOKING objects
         ANYWHERE in the image -- no coordinate dependence (verified ~93% berry
         precision vs ~1% for coordinate carry). Returns (boxes_xyxy, polys_norm,
-        results); each box hugs its segmentation."""
+        results); each box hugs its segmentation.
+
+        Every crop passed here must be an exemplar of the SAME class: SAM3's
+        semantic predictor collapses a box prompt to a single concept. The
+        per-class loop lives in _run_sam3_crop_composite."""
         crops = (ref or {}).get("crops") or []
         img = self._imread_cached(image_path)
         if img is None or not crops:
@@ -1358,9 +2485,11 @@ class ManualWindow(QtWidgets.QWidget):
         if not patches:
             return [], [], None
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name
-        cv2.imwrite(tmp, comp)
+        imwrite_unicode(tmp, comp)
         try:
-            _, results = run_sam3_boxes(tmp, patches, conf=conf, max_area_frac=self._max_area_frac())
+            # Loosest per-class max area: this runs one class at a time, and the
+            # caller applies each class's exact cap afterwards.
+            _, results = run_sam3_boxes(tmp, patches, conf=conf, max_area_frac=self._max_area_frac_loosest())
         finally:
             try:
                 os.unlink(tmp)
@@ -1369,7 +2498,7 @@ class ManualWindow(QtWidgets.QWidget):
         r = results[0] if results else None
         boxes, polys, keep = [], [], []
         if r is not None and r.masks is not None and r.boxes is not None:
-            max_area = ih * iw * self._max_area_frac()
+            max_area = ih * iw * self._max_area_frac_loosest()
             seg_list = result_clean_polys(r)
             PATCH_MARGIN = 8   # px; also catch detections hugging a patch edge
             def _on_patch(bx):
@@ -1428,8 +2557,104 @@ class ManualWindow(QtWidgets.QWidget):
             filtered = None
         return boxes, polys, ([filtered] if filtered is not None else None)
 
+    def _prior_anchors_by_class(self):
+        """Prior detector output as {cls: [xyxy, ...]} in image-pixel coords.
+
+        Anchors the SAM3 exemplar pool on what the detector already found, so a
+        regenerate with no fresh drawn box still re-detects the existing
+        objects. Grouped by class because each class is searched on its own
+        pass: anchoring a class-1 search with class-0 objects would drag the
+        concept back toward class 0. 'restored' annotations (Previous Image
+        reload) count as prior model output too."""
+        by_cls = {}
+        if not hasattr(self, "image_label"):
+            return by_cls
+        ow = self.image_label._orig_w or 0
+        oh = self.image_label._orig_h or 0
+        if not ow or not oh:
+            return by_cls
+        for ann in self.image_label.annotations:
+            if ann.get('deleted') or ann.get('source') not in ('detector', 'restored'):
+                continue
+            if ann['type'] == 'rect':
+                cx, cy, w, h = ann['data']
+                x1 = (cx - w / 2) * ow
+                y1 = (cy - h / 2) * oh
+                x2 = (cx + w / 2) * ow
+                y2 = (cy + h / 2) * oh
+            else:  # poly
+                xs = [p[0] for p in ann['data']]
+                ys = [p[1] for p in ann['data']]
+                if not xs or not ys:
+                    continue
+                x1 = min(xs) * ow; x2 = max(xs) * ow
+                y1 = min(ys) * oh; y2 = max(ys) * oh
+            if x2 - x1 >= 4 and y2 - y1 >= 4:
+                by_cls.setdefault(int(ann.get('cls', 0) or 0), []).append([x1, y1, x2, y2])
+        return by_cls
+
+    def _run_sam3_boxes_multiclass(self, image_path, exemplars_xyxy, exemplar_cls,
+                                   conf, text_prompt, prior_anchors_by_cls=None):
+        """SAM3 box-exemplar re-detection across ONE OR MORE classes.
+
+        run_sam3_boxes answers "find everything that looks like these boxes"
+        for a SINGLE concept -- ultralytics forces nc=1 whenever bboxes are
+        passed. Handing it boxes from two classes at once does not error, it
+        silently averages them into one concept and returns one class. So each
+        class gets its own pass, seeded with only its own exemplars and its own
+        prior anchors, and its detections are tagged with that class.
+
+        One distinct class means exactly one pass, identical to the call this
+        replaced: the extra cost only appears when the user actually draws more
+        than one class. Same-class duplicates are dropped; two classes claiming
+        the same object are both kept (see _nms_dedup).
+
+        Returns (boxes_xyxy, polys_norm, cls_ids, results). `results` is the raw
+        ultralytics output of the single pass when there is one class, else None
+        -- no single result object can describe several passes, and the polys
+        are what every caller actually consumes.
+        """
+        prior_anchors_by_cls = prior_anchors_by_cls or {}
+        by_cls = {}
+        for box, c in zip(exemplars_xyxy, exemplar_cls or []):
+            by_cls.setdefault(int(c or 0), []).append(box)
+        # No drawn exemplars (a regenerate consumed them): the prior anchors
+        # alone drive the search, one pass per class already on the canvas.
+        classes = sorted(by_cls) or sorted(prior_anchors_by_cls) or [0]
+
+        if len(classes) == 1:
+            c = classes[0]
+            boxes, polys, results = self._run_sam3_boxes_partitioned(
+                image_path, by_cls.get(c, []), self._class_det_thresh(c, conf),
+                text_prompt,
+                supplementary_exemplars=prior_anchors_by_cls.get(c, []),
+            )
+            return boxes, polys, [c] * len(boxes), results
+
+        all_boxes, all_polys, all_cls = [], [], []
+        summary = []
+        for c in classes:
+            ex = by_cls.get(c, [])
+            # Each class's pass runs at ITS OWN detector confidence; a berry
+            # class and a leaf class rarely want the same cutoff.
+            boxes, polys, _r = self._run_sam3_boxes_partitioned(
+                image_path, ex, self._class_det_thresh(c, conf), text_prompt,
+                supplementary_exemplars=prior_anchors_by_cls.get(c, []),
+            )
+            all_boxes.extend(boxes)
+            all_polys.extend(polys)
+            all_cls.extend([c] * len(boxes))
+            summary.append(f"cls {c} ({len(ex)} exemplar(s)) -> {len(boxes)} dets")
+        print(f"[SAM3 multi-class] {len(classes)} passes: " + ", ".join(summary))
+        all_boxes, all_polys, all_cls = self._nms_dedup(
+            all_boxes, all_polys, classes=all_cls)
+        return all_boxes, all_polys, all_cls, None
+
     def _run_sam3_boxes_partitioned(self, image_path, exemplars_xyxy, conf, text_prompt, supplementary_exemplars=None):
         """SAM3 box-exemplar mode with ROI partitioning.
+
+        Every exemplar passed here must be an example of the SAME class; the
+        per-class loop lives in _run_sam3_boxes_multiclass.
 
         A drawn box that covers a large fraction of the image is usually
         the user trying to bound a SEARCH AREA, not give an exemplar.
@@ -1459,7 +2684,9 @@ class ManualWindow(QtWidgets.QWidget):
             return [], [], None
         ih, iw = img.shape[:2]
         img_area = float(ih * iw) or 1.0
-        max_area = img_area * self._max_area_frac()  # drop whole-image detections (same filter as run_sam3_*)
+        # Loosest per-class max area: this is a per-class pass and the caller
+        # applies each class's exact cap afterwards.
+        max_area = img_area * self._max_area_frac_loosest()  # drop whole-image detections (same filter as run_sam3_*)
         huge, normal = [], []
         for b in exemplars_xyxy:
             x1, y1, x2, y2 = b
@@ -1485,7 +2712,7 @@ class ManualWindow(QtWidgets.QWidget):
         # objects -- the user's intent on Regenerate isn't to start over.
         if global_pool:
             boxes_list, results = run_sam3_boxes(
-                image_path, global_pool, conf=conf, max_area_frac=self._max_area_frac(),
+                image_path, global_pool, conf=conf, max_area_frac=self._max_area_frac_loosest(),
             )
             global_results = results
             r = results[0] if results else None
@@ -1526,14 +2753,14 @@ class ManualWindow(QtWidgets.QWidget):
             tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
             try:
                 tmp.close()
-                cv2.imwrite(tmp.name, crop)
+                imwrite_unicode(tmp.name, crop)
                 if crop_exemplars:
                     _, results = run_sam3_boxes(
-                        tmp.name, crop_exemplars, conf=conf, max_area_frac=self._max_area_frac(),
+                        tmp.name, crop_exemplars, conf=conf, max_area_frac=self._max_area_frac_loosest(),
                     )
                 elif text_prompt and text_prompt.strip():
                     _, results = run_sam3_text(
-                        tmp.name, text_prompt, conf=conf, max_area_frac=self._max_area_frac(),
+                        tmp.name, text_prompt, conf=conf, max_area_frac=self._max_area_frac_loosest(),
                     )
                 else:
                     # No normal exemplar AND no text prompt -- nothing we
@@ -1550,7 +2777,7 @@ class ManualWindow(QtWidgets.QWidget):
             r = results[0] if results else None
             if r is None or r.masks is None or r.boxes is None:
                 continue
-            crop_max_area = ch * cw * self._max_area_frac()
+            crop_max_area = ch * cw * self._max_area_frac_loosest()
             xyxy_list = r.boxes.xyxy.tolist()
             xyn_list = result_clean_polys(r)
             for box, seg in zip(xyxy_list, xyn_list):
@@ -1576,7 +2803,168 @@ class ManualWindow(QtWidgets.QWidget):
         global_boxes, global_polys = self._nms_dedup(global_boxes, global_polys)
         return global_boxes, global_polys, global_results
 
+    def _active_class_index(self):
+        """Class id assigned to manual draws and box-prompt detections, set by
+        the class dropdown in the prompt section. 0 when the dropdown does not
+        exist (headless tests) or the first class is selected."""
+        return int(getattr(self, "active_class", 0) or 0)
+
+    def _drawn_prompt_box_classes(self):
+        """Class ids of the prompt boxes currently drawn on the canvas, or []
+        when there are none (or headless, where image_label is absent)."""
+        if not hasattr(self, "image_label"):
+            return []
+        try:
+            _b, cls = self.image_label.get_prompt_boxes_with_cls_in_image_coords()
+        except Exception:
+            return []
+        return [int(c or 0) for c in cls]
+
+    def _prompt_box_classes(self, prompt_boxes_img):
+        """Per-box class id array parallel to prompt_boxes_img, for multi-class
+        box prompts.
+
+        prompt_boxes_img is either this image's drawn prompt boxes or, once a
+        regenerate has consumed them, the frozen carry anchor. Both now record a
+        class per box, so take the class list from whichever one matches in
+        length: padding a carried multi-class prompt with the active class was
+        what collapsed every carried detection onto one class. Falls back to the
+        active class (all-zeros headless), the single-class fast path."""
+        n = len(prompt_boxes_img)
+        if not n:
+            return []
+        for cls in (self._drawn_prompt_box_classes(), self._carry_anchor_cls_list()):
+            if len(cls) == n:
+                return list(cls)
+        return [self._active_class_index()] * n
+
+    @staticmethod
+    def _ref_cls_array(ref):
+        """YOLOE visual-prompt `cls` array for a carry bundle: one class id per
+        reference box. Bundles frozen before classes were recorded fall back to
+        all-zeros, which is what YOLOE always received before."""
+        boxes = (ref or {}).get("boxes_xyxy") or []
+        cls = (ref or {}).get("cls") or []
+        if len(cls) != len(boxes):
+            return np.zeros(len(boxes), dtype=np.int32)
+        return np.array([int(c or 0) for c in cls], dtype=np.int32)
+
+    def _visual_prompt_classes(self, prompt_boxes_img, ref=None):
+        """Class ids of the exemplars actually driving this run's visual prompt:
+        the carry bundle's classes when carrying from a reference image, else
+        the drawn/anchored prompt boxes'. Used to decide whether the prompt is
+        genuinely multi-class."""
+        ref_cls = (ref or {}).get("cls")
+        if ref_cls:
+            return [int(c or 0) for c in ref_cls]
+        return self._prompt_box_classes(prompt_boxes_img)
+
+    def _negative_classes(self):
+        """Ordered negative class names from ALL negative-prompt fields, or []
+        when none exist (headless tests) or every field is empty."""
+        rows = getattr(self, "neg_prompt_rows", None)
+        if rows:
+            text = ", ".join(e["edit"].text().strip() for e in rows
+                             if e["edit"].text().strip())
+            return parse_prompt_classes(text)
+        entry = getattr(self, "neg_prompt_entry", None)
+        if entry is None:
+            return []
+        return parse_prompt_classes(entry.text())
+
+    @staticmethod
+    def _default_box_class_names():
+        return ["class_0"]
+
+    def _load_box_class_names(self):
+        """Box-prompt class names from the in-process session store, or the
+        one-class default. Session-only ON PURPOSE (see session_state): names
+        outlive this window but never the app. Never raises: a malformed store
+        just means the defaults."""
+        try:
+            stored = session_state.STATE.get("box_class_names") or []
+            names = [str(n).strip() for n in stored if str(n).strip()]
+            if names:
+                return names[:MAX_BOX_CLASSES]
+        except Exception:
+            pass
+        return self._default_box_class_names()
+
+    def _save_box_class_names(self, names):
+        """Keep the names for the rest of this app session. Deliberately NOT
+        written to disk; a fresh launch starts from one unnamed class."""
+        session_state.STATE["box_class_names"] = list(names)
+
+    def _box_class_names(self):
+        """The configured box-prompt class names (index == class id). Falls back
+        to the default when the window was built without them (headless)."""
+        return list(getattr(self, "box_class_names", None) or self._default_box_class_names())
+
+    def _open_box_classes_dialog(self):
+        """Edit how many box classes there are and what each is called. Lowering
+        the count below a class already drawn on this image is refused: the
+        drawn boxes would keep a class id with no name behind it."""
+        drawn_max = self._max_drawn_box_class()
+        note = ""
+        if drawn_max > 0:
+            note = (f"Class {drawn_max} is already drawn on this image, so the "
+                    f"count cannot go below {drawn_max + 1} until those boxes "
+                    f"are deleted.")
+        dlg = BoxClassesDialog(self, self._box_class_names(), extra_note=note)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        names = dlg.names()
+        if len(names) <= drawn_max:
+            self._styled_message(
+                f"Class {drawn_max} is drawn on this image but would no longer "
+                f"exist.\n\nDelete those boxes first, or keep at least "
+                f"{drawn_max + 1} classes.", "Box Classes").exec_()
+            return
+        self.box_class_names = names
+        self._save_box_class_names(names)
+        # The active class may now point past the end of the list.
+        if self._active_class_index() >= len(names):
+            self._set_active_class(len(names) - 1)
+        self._refresh_class_legend()
+
+    def _class_names_for_run(self, prompt):
+        """Positive class names for the current run: parsed from the prompt,
+        with a one-item fallback so classes.txt is never empty. In Boxes mode
+        the names come from the Box Classes dialog."""
+        if getattr(self, "prompt_mode", "text") == "boxes":
+            return self._box_class_names()
+        return parse_prompt_classes(prompt) or ["object"]
+
+    def _max_drawn_box_class(self):
+        """Highest class id among the positive box prompts drawn on THIS image,
+        or 0 when there are none / headless."""
+        return max([0] + self._drawn_prompt_box_classes())
+
+    def _max_box_class_used(self):
+        """Highest box class id in play: the configured class count bounds it,
+        never the boxes that happen to be drawn right now. Reading the drawn
+        boxes instead made classes.txt shrink to a single line the moment the
+        user advanced to an image they had not drawn on yet."""
+        return max(len(self._box_class_names()) - 1,
+                   self._max_drawn_box_class(),
+                   int(getattr(self, "active_class", 0) or 0))
+
+    def _cls_sync_check(self, stage, boxes, classes):
+        """Debug-only alignment guard, mirrors the [SEG-SYNC] pattern."""
+        if AUTOANNOTATE_DEBUG and classes is not None and len(classes) != len(boxes):
+            print(f"[CLS-SYNC] {stage}: {len(classes)} class ids vs "
+                  f"{len(boxes)} boxes -- class list out of sync")
+
     def _run_detector(self, image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=None):
+        """Run the detector, then apply red-negative-box suppression (a no-op
+        when no negative boxes are drawn). Single choke point so Regenerate,
+        Next Image, and Auto Annotate Remaining all inherit both."""
+        boxes, results = self._run_detector_positive(
+            image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=ref)
+        boxes = self._apply_neg_box_suppression(image_path, boxes, det_thresh)
+        return boxes, results
+
+    def _run_detector_positive(self, image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=None):
         """Run the detector portion of the current pipeline.
         det_thresh = detection threshold (0..1); mask_thresh = mask-confidence
         knob (0..1). prompt_boxes_img = absolute-xyxy boxes drawn as PROMPTS
@@ -1585,16 +2973,76 @@ class ManualWindow(QtWidgets.QWidget):
         ({'image_path','boxes_xyxy','crops'}). When present, YOLOE uses it as a
         TRUE one-shot refer_image; SAM3/DINO have no visual-crop path so they
         warn and fall back to the carried text/box prompts.
-        Returns (absolute_xyxy_boxes, optional_yoloe_seg_results)."""
+        Returns (absolute_xyxy_boxes, optional_yoloe_seg_results).
+
+        Side channels (reset on every call): self._oneshot_polys_aligned
+        (index-aligned masks for one-shot detectors) and
+        self._det_classes_aligned (index-aligned class ids; None means all
+        class 0, the guaranteed single-class fast path). Text detectors run
+        positive + negative prompt classes in ONE pass; negative hits and any
+        positive overlapping them are removed here (suppress_negative_hits),
+        so every caller (Regenerate, Next Image, batch) inherits the filter."""
         det_key, _, is_standalone = self._detector_keys_for_pipeline()
         self._oneshot_polys_aligned = None
+        self._det_classes_aligned = None
+        pos_names = parse_prompt_classes(prompt)
+        neg_names = self._negative_classes()
         if det_key == "dino_swint" or det_key == "dino_swinb":
             if ref and ref.get("crops"):
                 print(f"[carry] GroundingDINO has no visual-prompt path -- using "
                       f"carried label text only ({len(ref['crops'])} ref crop(s) skipped).")
             model = self._get_model(det_key)
             # mask_thresh feeds DINO text_threshold (class-match strictness).
-            text_thr = max(0.05, mask_thresh)
+            # Per-class runs take the loosest class's value: text_threshold is
+            # a single-pass token filter and cannot vary per class.
+            text_thr = max(0.05, self._seg_thresh_floor(mask_thresh))
+            all_names = pos_names + neg_names
+            if len(all_names) > 1:
+                # Multi-class and/or negative prompt: one DINO pass over every
+                # class. DINO's canonical concept separator is ' . ', so join
+                # the parsed names that way instead of passing raw commas.
+                # The pass runs at the loosest per-class det threshold and max
+                # area; each class's exact values are enforced on the returned
+                # scores just below.
+                dino_prompt = " . ".join(all_names)
+                boxes, cls_ids, det_scores = run_dino_from_model(
+                    model, image_path, dino_prompt, self._det_thresh_floor(det_thresh),
+                    text_thr, self._max_area_frac_loosest(),
+                    save_dir=os.path.join(self.output_folder, 'boxes'),
+                    class_names=all_names, return_classes=True, return_scores=True,
+                )
+                if self._per_class_active():
+                    try:
+                        with Image.open(image_path) as _im:
+                            _iw, _ih = _im.size
+                        _total = float(_iw * _ih)
+                    except Exception:
+                        _total = 0.0
+                    kept_b, kept_c = [], []
+                    n_pos = len(pos_names)
+                    for b, c, s in zip(boxes, cls_ids,
+                                       det_scores or [None] * len(boxes)):
+                        # Negative classes (ids past the positives) keep the
+                        # floor values: pruning them would weaken suppression.
+                        if c < n_pos:
+                            if (s is not None
+                                    and s < self._class_det_thresh(c, det_thresh)):
+                                continue
+                            if (_total > 0 and (b[2] - b[0]) * (b[3] - b[1])
+                                    >= _total * self._class_max_area(c)):
+                                continue
+                        kept_b.append(b)
+                        kept_c.append(c)
+                    boxes, cls_ids = kept_b, kept_c
+                if neg_names:
+                    boxes, cls_ids, _ = suppress_negative_hits(
+                        boxes, cls_ids, None, n_pos=len(pos_names))
+                # Drop duplicate boxes; one caption can match the same object
+                # under two phrases ("blueberry" and "blueberry cluster").
+                boxes, _, cls_ids = self._nms_dedup(boxes, classes=cls_ids)
+                self._cls_sync_check("dino", boxes, cls_ids)
+                self._det_classes_aligned = cls_ids
+                return boxes, None
             boxes = run_dino_from_model(
                 model, image_path, prompt, det_thresh, text_thr, self._max_area_frac(),
                 save_dir=os.path.join(self.output_folder, 'boxes'),
@@ -1611,12 +3059,12 @@ class ManualWindow(QtWidgets.QWidget):
                 model = self._get_model(det_key)
                 visual_prompts = dict(
                     bboxes=np.array(ref_boxes, dtype=np.float32),
-                    cls=np.zeros(len(ref_boxes), dtype=np.int32),
+                    cls=self._ref_cls_array(ref),
                 )
                 try:
                     _, results = run_yoloe_vis(model, image_path, visual_prompts,
-                                               conf=self._yoloe_effective_conf(det_thresh),
-                                               max_area_frac=self._max_area_frac(), refer_image=ref["image_path"])
+                                               conf=self._yoloe_effective_conf(self._det_thresh_floor(det_thresh)),
+                                               max_area_frac=self._max_area_frac_loosest(), refer_image=ref["image_path"])
                 except Exception as _e:
                     # refer_image one-shot can fail under memory pressure / stale
                     # model state; fall back to plain box-coordinate visual prompts
@@ -1624,34 +3072,55 @@ class ManualWindow(QtWidgets.QWidget):
                     print(f"[carry] YOLOE refer_image one-shot failed "
                           f"({type(_e).__name__}: {_e}); falling back to box-coordinate prompts")
                     _, results = run_yoloe_vis(model, image_path, visual_prompts,
-                                               conf=self._yoloe_effective_conf(det_thresh),
-                                               max_area_frac=self._max_area_frac())
+                                               conf=self._yoloe_effective_conf(self._det_thresh_floor(det_thresh)),
+                                               max_area_frac=self._max_area_frac_loosest())
             else:
                 if not prompt_boxes_img:
                     self._oneshot_polys_aligned = []
                     return [], None
                 model = self._get_model(det_key)
+                # Per-box class array so multi-class box prompts label their hits
+                # (person exemplar -> person, car exemplar -> car); zeros for the
+                # single-class fast path.
+                box_cls = self._prompt_box_classes(prompt_boxes_img)
                 visual_prompts = dict(
                     bboxes=np.array(prompt_boxes_img, dtype=np.float32),
-                    cls=np.zeros(len(prompt_boxes_img), dtype=np.int32),
+                    cls=np.array(box_cls, dtype=np.int32),
                 )
-                _, results = run_yoloe_vis(model, image_path, visual_prompts, conf=self._yoloe_effective_conf(det_thresh), max_area_frac=self._max_area_frac())
-            # YOLOE-vis is one-shot; extract both boxes and masks from the
-            # raw results so segmentation-mask display mode works. Apply the
-            # same area filter run_yoloe_vis would have, in lockstep with
-            # the masks, so boxes and polys stay aligned.
+                _, results = run_yoloe_vis(model, image_path, visual_prompts,
+                                           conf=self._yoloe_effective_conf(self._det_thresh_floor(det_thresh)),
+                                           max_area_frac=self._max_area_frac_loosest())
+            # YOLOE-vis is one-shot; extract boxes, masks AND the class YOLOE
+            # matched each hit to (from the visual-prompt cls array) so masks and
+            # class ids stay aligned through the area filter. With 2+ classes
+            # the pass ran at the loosest thresholds, so each hit is re-checked
+            # here against ITS class's confidence and max-area values.
             aligned_boxes = []
             aligned_polys = []
+            aligned_cls = []
+            per_cls = self._per_class_active()
             r = results[0] if results else None
             if r is not None and r.boxes is not None:
                 ih, iw = r.orig_shape[:2]
                 max_area = ih * iw * self._max_area_frac()
+                conf_list = self._result_conf_list(r) if per_cls else []
                 xyxy_list = r.boxes.xyxy.tolist()
+                cls_list  = r.boxes.cls.tolist() if r.boxes.cls is not None else []
                 xyn_list  = result_clean_polys(r) if r.masks is not None else []
                 for idx, box in enumerate(xyxy_list):
-                    if (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
+                    cbox = int(cls_list[idx]) if idx < len(cls_list) else 0
+                    if per_cls:
+                        if ((box[2] - box[0]) * (box[3] - box[1])
+                                >= ih * iw * self._class_max_area(cbox)):
+                            continue
+                        if (idx < len(conf_list) and conf_list[idx] is not None
+                                and conf_list[idx] < self._yoloe_effective_conf(
+                                    self._class_det_thresh(cbox, det_thresh))):
+                            continue
+                    elif (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
                         continue
                     aligned_boxes.append(box)
+                    aligned_cls.append(cbox)
                     seg = xyn_list[idx] if idx < len(xyn_list) else None
                     if seg is not None and len(seg) >= 3:
                         aligned_polys.append(seg)
@@ -1660,15 +3129,29 @@ class ManualWindow(QtWidgets.QWidget):
             # If we have a poly hole, drop the parallel box too so alignment
             # holds (display_masks_with_borders treats len(det_polys) as the
             # detector-portion count). Cheap second pass; det count is tiny.
-            kept_boxes, kept_polys = [], []
-            for b, p in zip(aligned_boxes, aligned_polys):
+            kept_boxes, kept_polys, kept_cls = [], [], []
+            for b, p, c in zip(aligned_boxes, aligned_polys, aligned_cls):
                 if p is None:
                     continue
                 kept_boxes.append(b)
                 kept_polys.append(p)
+                kept_cls.append(c)
             # Drop duplicate detections of the same object (multi-class /
             # multi-concept prompt echoing one object several times).
-            kept_boxes, kept_polys = self._nms_dedup(kept_boxes, kept_polys)
+            kept_boxes, kept_polys, kept_cls = self._nms_dedup(
+                kept_boxes, kept_polys, classes=kept_cls)
+            # Only trust YOLOE's per-hit class when the exemplars span 2+
+            # distinct classes (a true multi-class visual prompt), whether they
+            # were drawn on this image or carried from the reference one. For a
+            # single class keep the old behavior: tag every hit with the active
+            # dropdown class.
+            box_distinct = set(self._visual_prompt_classes(prompt_boxes_img, ref))
+            if len(box_distinct) >= 2:
+                self._det_classes_aligned = kept_cls
+            else:
+                vis_cls = self._active_class_index()
+                if vis_cls:
+                    self._det_classes_aligned = [vis_cls] * len(kept_boxes)
             self._oneshot_polys_aligned = kept_polys
             return kept_boxes, results
         if is_standalone and det_key == "sam3_det":
@@ -1677,9 +3160,22 @@ class ManualWindow(QtWidgets.QWidget):
                 # image-1 box crops into a corner of THIS image, box-prompt SAM3
                 # at those patches, and drop detections that land on a patch.
                 # SAM3 then finds the same-looking objects ANYWHERE in the image.
-                ab, ap, results = self._run_sam3_crop_composite(
+                # One pass per exemplar class; see _run_sam3_crop_composite.
+                ab, ap, acls, results = self._run_sam3_crop_composite(
                     image_path, ref, det_thresh)
+                # Enforce each class's exact max-area cap (the passes pruned at
+                # the loosest class value).
+                ab, ap, acls = self._cut_boxes_by_class_area(image_path, ab, ap, acls)
                 self._oneshot_polys_aligned = ap
+                if ref.get("cls"):
+                    # The carried exemplars know their own classes.
+                    self._det_classes_aligned = acls
+                else:
+                    # Bundle predates per-box classes: old active-class stamp.
+                    vis_cls = self._active_class_index()
+                    if vis_cls:
+                        self._det_classes_aligned = [vis_cls] * len(ab)
+                self._cls_sync_check("sam3_carry", ab, self._det_classes_aligned)
                 print(f"[carry] SAM3 crop-composite ({len(ref['crops'])} exemplar"
                       f"(s)) -> {len(ab)} detections")
                 return ab, results
@@ -1693,25 +3189,67 @@ class ManualWindow(QtWidgets.QWidget):
                 if not prompt or not prompt.strip():
                     self._oneshot_polys_aligned = []
                     return [], None
+                multiclass = len(pos_names) > 1 or bool(neg_names)
+                # One pass over positives + negatives; run_sam3_text parses
+                # the comma-separated names into SAM3 concepts in order.
+                sam3_prompt = (", ".join(pos_names + neg_names)
+                               if neg_names else prompt)
                 boxes_list, results = run_sam3_text(
-                    image_path, prompt, conf=det_thresh, max_area_frac=self._max_area_frac(),
+                    image_path, sam3_prompt, conf=self._det_thresh_floor(det_thresh),
+                    max_area_frac=self._max_area_frac_loosest(),
                 )
                 r = results[0] if results else None
+                # Per-detection class ids index the concept list in prompt
+                # order; read them only when needed (multiclass) and guarded,
+                # since stubs/tests may not provide boxes.cls.
+                raw_cls = None
+                if multiclass and r is not None and r.boxes is not None:
+                    _c = getattr(r.boxes, "cls", None)
+                    if _c is not None:
+                        try:
+                            raw_cls = [int(v) for v in _c.tolist()]
+                        except Exception:
+                            raw_cls = None
                 aligned_boxes = []
                 aligned_polys = []
+                aligned_cls = []
+                per_cls = self._per_class_active()
                 if r is not None and r.masks is not None and r.boxes is not None:
                     ih, iw = r.orig_shape[:2]
                     max_area = ih * iw * self._max_area_frac()
+                    conf_list = self._result_conf_list(r) if per_cls else []
+                    n_pos = len(pos_names)
                     xyxy_list = r.boxes.xyxy.tolist()
                     xyn_list  = result_clean_polys(r)
-                    for box, seg in zip(xyxy_list, xyn_list):
-                        if (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
+                    for di, (box, seg) in enumerate(zip(xyxy_list, xyn_list)):
+                        cbox = raw_cls[di] if raw_cls and di < len(raw_cls) else 0
+                        if per_cls and cbox < n_pos:
+                            # The pass ran at the loosest class thresholds;
+                            # enforce THIS class's exact values. Negative
+                            # classes keep the floor so suppression stays strong.
+                            if ((box[2] - box[0]) * (box[3] - box[1])
+                                    >= ih * iw * self._class_max_area(cbox)):
+                                continue
+                            if (di < len(conf_list) and conf_list[di] is not None
+                                    and conf_list[di] < self._class_det_thresh(cbox, det_thresh)):
+                                continue
+                        elif (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
                             continue
                         if seg is None or len(seg) < 3:
                             continue
                         aligned_boxes.append(box)
                         aligned_polys.append(seg)
-                aligned_boxes, aligned_polys = self._nms_dedup(aligned_boxes, aligned_polys)
+                        aligned_cls.append(cbox)
+                if multiclass:
+                    if neg_names:
+                        aligned_boxes, aligned_cls, aligned_polys = suppress_negative_hits(
+                            aligned_boxes, aligned_cls, aligned_polys, n_pos=len(pos_names))
+                    aligned_boxes, aligned_polys, aligned_cls = self._nms_dedup(
+                        aligned_boxes, aligned_polys, classes=aligned_cls)
+                    self._cls_sync_check("sam3_text", aligned_boxes, aligned_cls)
+                    self._det_classes_aligned = aligned_cls
+                else:
+                    aligned_boxes, aligned_polys = self._nms_dedup(aligned_boxes, aligned_polys)
                 self._oneshot_polys_aligned = aligned_polys
                 return aligned_boxes, results
             # Boxes mode, SAM3 SEMANTIC predictor: the drawn/carried boxes
@@ -1729,81 +3267,88 @@ class ManualWindow(QtWidgets.QWidget):
                 # the similarity search with.
                 self._oneshot_polys_aligned = []
                 return [], None
-            # Pull prior detector-source annotations (rects + polys) and
-            # convert to image-pixel xyxy. These anchor the SAM3 exemplar
-            # pool so a single new bad draw cannot dominate the embedding
-            # and wipe out the prior good masks (the demo bug).
-            prior_anchors = []
-            ow = self.image_label._orig_w or 0
-            oh = self.image_label._orig_h or 0
-            if ow and oh:
-                for ann in self.image_label.annotations:
-                    if ann.get('deleted') or ann.get('source') != 'detector':
-                        continue
-                    if ann['type'] == 'rect':
-                        cx, cy, w, h = ann['data']
-                        x1 = (cx - w / 2) * ow
-                        y1 = (cy - h / 2) * oh
-                        x2 = (cx + w / 2) * ow
-                        y2 = (cy + h / 2) * oh
-                    else:  # poly
-                        xs = [p[0] for p in ann['data']]
-                        ys = [p[1] for p in ann['data']]
-                        if not xs or not ys:
-                            continue
-                        x1 = min(xs) * ow; x2 = max(xs) * ow
-                        y1 = min(ys) * oh; y2 = max(ys) * oh
-                    if x2 - x1 >= 4 and y2 - y1 >= 4:
-                        prior_anchors.append([x1, y1, x2, y2])
+            # Prior detector-source annotations, grouped BY CLASS, as image-pixel
+            # xyxy. These anchor the SAM3 exemplar pool so a single new bad draw
+            # cannot dominate the embedding and wipe out the prior good masks
+            # (the demo bug). Grouped because each class gets its own pass: a
+            # class-1 search must never be anchored on class-0 objects.
+            prior_anchors = self._prior_anchors_by_class()
             # Image-only prompting: in BOX prompt mode the detector is driven
             # purely by box exemplars, so do NOT leak any leftover prompt-entry
             # text into the SAM3 search. Text only applies in Text prompt mode.
             text_for_sam3 = prompt if self.prompt_mode == "text" else ""
-            aligned_boxes, aligned_polys, results = self._run_sam3_boxes_partitioned(
-                image_path, prompt_boxes_img, det_thresh, text_for_sam3,
-                supplementary_exemplars=prior_anchors,
+            box_cls = self._prompt_box_classes(prompt_boxes_img)
+            aligned_boxes, aligned_polys, aligned_cls, results = self._run_sam3_boxes_multiclass(
+                image_path, prompt_boxes_img, box_cls, det_thresh, text_for_sam3,
+                prior_anchors_by_cls=prior_anchors,
             )
+            # The passes pruned area at the loosest class value; enforce each
+            # class's exact max-area cap now that every hit carries its class.
+            aligned_boxes, aligned_polys, aligned_cls = self._cut_boxes_by_class_area(
+                image_path, aligned_boxes, aligned_polys, aligned_cls)
             # Create the box AROUND each segmentation: a tight bbox of the SAM3
             # mask polygon, so the saved box hugs the segmentation exactly.
             aligned_boxes = self._boxes_from_seg_polys(
                 aligned_polys, image_path, fallback=aligned_boxes)
             self._oneshot_polys_aligned = aligned_polys
+            # Each detection carries the class of the exemplar pass that found
+            # it. An all-class-0 run leaves the None single-class fast path.
+            self._cls_sync_check("sam3_boxes", aligned_boxes, aligned_cls)
+            self._det_classes_aligned = self._norm_cls_list(aligned_cls)
             return aligned_boxes, results
         if det_key == "yoloe_seg":  # YOLOE-seg detector: standalone one-shot OR two-stage feeding a separate segmenter
             model = self._get_model("yoloe_seg")
             # Standalone one-shot uses mask_thresh as a "make it stricter" knob
             # on the segmenter pass; two-stage (boxes -> SAM2/SAM3) detects at
             # det_thresh like YOLOE-vis, since there mask_thresh is the segmenter knob.
-            eff_conf = self._yoloe_effective_conf(
-                max(det_thresh, mask_thresh) if is_standalone else det_thresh)
+            # With 2+ classes the pass runs at the loosest class's value and the
+            # per-hit loop below enforces each class's exact one.
+            def _seg_conf_for(c):
+                return (max(self._class_det_thresh(c, det_thresh),
+                            self._class_seg_thresh(c, mask_thresh))
+                        if is_standalone else self._class_det_thresh(c, det_thresh))
+            if self._per_class_active():
+                base_conf = min(_seg_conf_for(c) for c in self._active_class_ids())
+            else:
+                base_conf = max(det_thresh, mask_thresh) if is_standalone else det_thresh
+            eff_conf = self._yoloe_effective_conf(base_conf)
             # Boxes present (drawn or carried) => visual-prompt regardless of
             # the Text/Boxes radio; fall back to text only when no boxes.
+            used_text = False
             ref_boxes = ref.get("boxes_xyxy") if ref else None
             if ref_boxes:
                 # True one-shot from the carried Visual Reference image.
                 visual_prompts = dict(
                     bboxes=np.array(ref_boxes, dtype=np.float32),
-                    cls=np.zeros(len(ref_boxes), dtype=np.int32),
+                    cls=self._ref_cls_array(ref),
                 )
                 try:
                     _, results = run_yoloe_vis(model, image_path, visual_prompts,
-                                               conf=eff_conf, max_area_frac=self._max_area_frac(),
+                                               conf=eff_conf, max_area_frac=self._max_area_frac_loosest(),
                                                refer_image=ref["image_path"])
                 except Exception as _e:
                     print(f"[carry] YOLOE-seg refer_image one-shot failed "
                           f"({type(_e).__name__}: {_e}); falling back to box-coordinate prompts")
                     _, results = run_yoloe_vis(model, image_path, visual_prompts,
-                                               conf=eff_conf, max_area_frac=self._max_area_frac())
+                                               conf=eff_conf, max_area_frac=self._max_area_frac_loosest())
             elif prompt_boxes_img:
+                # Per-box class array so multi-class box prompts label their hits
+                # (zeros for the single-class fast path).
+                box_cls = self._prompt_box_classes(prompt_boxes_img)
                 visual_prompts = dict(
                     bboxes=np.array(prompt_boxes_img, dtype=np.float32),
-                    cls=np.zeros(len(prompt_boxes_img), dtype=np.int32),
+                    cls=np.array(box_cls, dtype=np.int32),
                 )
                 _, results = run_yoloe_vis(model, image_path, visual_prompts,
-                                           conf=eff_conf, max_area_frac=self._max_area_frac())
+                                           conf=eff_conf, max_area_frac=self._max_area_frac_loosest())
             else:
-                _, results = run_yoloe_text(model, image_path, prompt,
-                                            conf=eff_conf, max_area_frac=self._max_area_frac())
+                used_text = True
+                # One pass over positives + negatives; run_yoloe_text splits
+                # the comma-separated names for set_classes in order.
+                yoloe_prompt = (", ".join(pos_names + neg_names)
+                                if neg_names else prompt)
+                _, results = run_yoloe_text(model, image_path, yoloe_prompt,
+                                            conf=eff_conf, max_area_frac=self._max_area_frac_loosest())
             # Re-derive boxes IN LOCKSTEP with masks so live_boxes and
             # live_polys_cache stay index-aligned. The helper run_yoloe_*
             # filters by max_area only and discards masks; here we filter
@@ -1816,21 +3361,72 @@ class ManualWindow(QtWidgets.QWidget):
             r = results[0]
             if r.masks is None or r.boxes is None:
                 return [], None
+            multiclass = used_text and (len(pos_names) > 1 or bool(neg_names))
+            # Box-prompt runs are also multi-class when the drawn prompt boxes
+            # span more than class 0; read YOLOE's per-hit class the same way.
+            vis_multiclass = (not used_text) and bool(prompt_boxes_img)
+            raw_cls = None
+            if multiclass or vis_multiclass:
+                _c = getattr(r.boxes, "cls", None)
+                if _c is not None:
+                    try:
+                        raw_cls = [int(v) for v in _c.tolist()]
+                    except Exception:
+                        raw_cls = None
             ih, iw = r.orig_shape[:2]
             max_area = ih * iw * self._max_area_frac()
+            per_cls = self._per_class_active()
+            conf_list = self._result_conf_list(r) if per_cls else []
+            n_pos = len(pos_names)
             xyxy_list = r.boxes.xyxy.tolist()
             xyn_list  = result_clean_polys(r)
             aligned_boxes = []
             aligned_polys = []
-            for box, seg in zip(xyxy_list, xyn_list):
-                if (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
+            aligned_cls = []
+            for di, (box, seg) in enumerate(zip(xyxy_list, xyn_list)):
+                cbox = raw_cls[di] if raw_cls and di < len(raw_cls) else 0
+                if per_cls and (not used_text or cbox < n_pos):
+                    # Exact per-class values; the pass ran at the loosest ones.
+                    # Text-mode negative classes keep the floor so suppression
+                    # stays strong.
+                    if ((box[2] - box[0]) * (box[3] - box[1])
+                            >= ih * iw * self._class_max_area(cbox)):
+                        continue
+                    if (di < len(conf_list) and conf_list[di] is not None
+                            and conf_list[di] < self._yoloe_effective_conf(_seg_conf_for(cbox))):
+                        continue
+                elif (box[2] - box[0]) * (box[3] - box[1]) >= max_area:
                     continue
                 if seg is None or len(seg) < 3:
                     continue
                 aligned_boxes.append(box)
                 aligned_polys.append(seg)
+                aligned_cls.append(cbox)
             # Drop duplicate detections of the same object before stashing.
-            aligned_boxes, aligned_polys = self._nms_dedup(aligned_boxes, aligned_polys)
+            if multiclass:
+                if neg_names:
+                    aligned_boxes, aligned_cls, aligned_polys = suppress_negative_hits(
+                        aligned_boxes, aligned_cls, aligned_polys, n_pos=len(pos_names))
+                aligned_boxes, aligned_polys, aligned_cls = self._nms_dedup(
+                    aligned_boxes, aligned_polys, classes=aligned_cls)
+                self._cls_sync_check("yoloe_seg", aligned_boxes, aligned_cls)
+                self._det_classes_aligned = aligned_cls
+            elif vis_multiclass:
+                aligned_boxes, aligned_polys, aligned_cls = self._nms_dedup(
+                    aligned_boxes, aligned_polys, classes=aligned_cls)
+                # Only trust YOLOE's per-hit class for a true multi-class visual
+                # prompt (2+ distinct exemplar classes, drawn or carried);
+                # otherwise tag every hit with the active dropdown class (old
+                # single-class behavior).
+                box_distinct = set(self._visual_prompt_classes(prompt_boxes_img, ref))
+                if len(box_distinct) >= 2:
+                    self._det_classes_aligned = aligned_cls
+                else:
+                    vis_cls = self._active_class_index()
+                    if vis_cls:
+                        self._det_classes_aligned = [vis_cls] * len(aligned_boxes)
+            else:
+                aligned_boxes, aligned_polys = self._nms_dedup(aligned_boxes, aligned_polys)
             # Stash aligned polys on self so the display_* methods can pick
             # them up without re-doing the filter. Cleared on every run.
             # Standalone keeps YOLOE's own masks; in a two-stage run the boxes
@@ -1852,33 +3448,61 @@ class ManualWindow(QtWidgets.QWidget):
         u = ua + ub - inter
         return inter / u if u > 0 else 0.0
 
-    def _dedup_anns(self, anns, iou_thresh=0.7):
+    def _dedup_anns(self, anns, iou_thresh=0.7, cross_class=False):
         """Final overlap cleanup on a finished annotation list: drop any
         annotation whose bounding box overlaps an already-kept one by more
         than iou_thresh, so the displayed/saved set does not pile up
         near-duplicate boxes and masks across regenerates.
 
         Manual (user-drawn) annotations are considered first, so when a manual
-        box and a detector box overlap, the user's box is the one kept."""
+        box and a detector box overlap, the user's box is the one kept.
+
+        Suppression is SAME-CLASS-ONLY by default, the same rule _nms_dedup
+        applies: two classes claiming one object is a real disagreement between
+        prompts, and dropping whichever the loop reached second would hide it.
+        Both rows survive and the reviewer decides. Pass cross_class=True for
+        the old geometry-only behaviour."""
         ordered = ([a for a in anns if a.get('source') == 'manual']
                    + [a for a in anns if a.get('source') != 'manual'])
         kept, kept_bb = [], []
         for a in ordered:
             bb = self._ann_bbox_norm(a)
-            if any(self._box_iou(bb, kb) > iou_thresh for kb in kept_bb):
+            cls = int(a.get('cls', 0))
+            if any(self._box_iou(bb, kb) > iou_thresh
+                   and (cross_class or cls == kc)
+                   for kb, kc in kept_bb):
                 continue
             kept.append(a)
-            kept_bb.append(bb)
+            kept_bb.append((bb, cls))
         return kept
 
     @staticmethod
-    def _nms_dedup(boxes, polys=None, iou_thresh=0.7):
+    def _norm_cls_list(cls_list):
+        """Normalize a per-box class list: all zeros (or empty) collapses to
+        None, the single-class fast path every downstream consumer skips."""
+        if not cls_list:
+            return None
+        vals = [int(c) for c in cls_list]
+        return vals if any(vals) else None
+
+    @staticmethod
+    def _nms_dedup(boxes, polys=None, iou_thresh=0.7, classes=None, cross_class=False):
         """Drop near-identical detections, the same physical object found
         more than once (e.g. an object that matches two comma-separated
         prompt terms like 'blueberry, blueberry cluster'). Keeps the FIRST
-        box of any group whose mutual IoU exceeds iou_thresh; `polys`, if
-        given, is shrunk in lockstep so masks stay index-aligned. Distinct
-        objects only touch at much lower IoU, so they are kept."""
+        box of any group whose mutual IoU exceeds iou_thresh; `polys` and
+        `classes`, if given, are shrunk in lockstep so masks and class ids
+        stay index-aligned. Distinct objects only touch at much lower IoU,
+        so they are kept. Returns a 2-tuple, or a 3-tuple ending in the kept
+        class list when `classes` is passed.
+
+        With `classes` and cross_class=False (the default), a box is only ever
+        suppressed by another box of the SAME class. Two classes claiming one
+        object is a real disagreement between two prompts, and silently keeping
+        whichever the loop happened to reach first would hide it; both rows are
+        written and the reviewer decides. The only things that remove a
+        detection outright are negative-prompt/negative-box suppression and the
+        max-area filter. Pass cross_class=True to suppress across classes."""
         def _iou(a, b):
             ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
             ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
@@ -1888,14 +3512,23 @@ class ManualWindow(QtWidgets.QWidget):
             ub = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
             u = ua + ub - inter
             return inter / u if u > 0 else 0.0
+        same_class_only = classes is not None and not cross_class
         kept_boxes = []
         kept_polys = []
+        kept_cls = []
         for i, b in enumerate(boxes):
-            if any(_iou(b, kb) > iou_thresh for kb in kept_boxes):
+            c = (classes[i] if i < len(classes) else 0) if classes is not None else 0
+            if any(_iou(b, kb) > iou_thresh
+                   for j, kb in enumerate(kept_boxes)
+                   if not same_class_only or kept_cls[j] == c):
                 continue
             kept_boxes.append(b)
             if polys is not None:
                 kept_polys.append(polys[i] if i < len(polys) else None)
+            if classes is not None:
+                kept_cls.append(c)
+        if classes is not None:
+            return kept_boxes, (kept_polys if polys is not None else None), kept_cls
         return kept_boxes, (kept_polys if polys is not None else None)
 
     def _collect_rejected(self):
@@ -1909,7 +3542,7 @@ class ManualWindow(QtWidgets.QWidget):
             if ann.get('deleted'):
                 self._rejected_boxes.append(self._ann_bbox_norm(ann))
 
-    def _drop_rejected(self, boxes, polys=None):
+    def _drop_rejected(self, boxes, polys=None, classes=None):
         """Drop detector outputs that RE-COVER a region the user deleted on this
         image, so a regenerate does not re-add an object they removed. `boxes`
         are absolute xyxy; the reject list is normalized. Manual draws never pass
@@ -1922,9 +3555,14 @@ class ManualWindow(QtWidgets.QWidget):
         is NOT a re-detection and is KEPT. This is the fix for "deleting the big
         cluster mask wipes the smaller model masks within it": the old test
         dropped anything whose CENTER fell inside a deleted box, which nuked
-        every small berry sitting inside a big deleted cluster box."""
+        every small berry sitting inside a big deleted cluster box.
+
+        `classes`, if given, is shrunk in lockstep and the return grows to a
+        3-tuple (boxes, polys, classes)."""
         rejected = getattr(self, "_rejected_boxes", None)
         if not rejected or not boxes:
+            if classes is not None:
+                return boxes, polys, classes
             return boxes, polys
         ow = self.image_label._orig_w or 1
         oh = self.image_label._orig_h or 1
@@ -1948,7 +3586,7 @@ class ManualWindow(QtWidgets.QWidget):
             # cover_rej is tiny, so it is not treated as a re-detection. The old
             # center-in-region test had no such size guard.
             return iou > 0.6 or (cover_new > 0.7 and cover_rej > 0.7)
-        kept_b, kept_p = [], []
+        kept_b, kept_p, kept_c = [], [], []
         dropped = 0
         for i, b in enumerate(boxes):
             if any(_redetects(b, rb) for rb in rej_px):
@@ -1957,12 +3595,17 @@ class ManualWindow(QtWidgets.QWidget):
             kept_b.append(b)
             if polys is not None:
                 kept_p.append(polys[i] if i < len(polys) else None)
+            if classes is not None:
+                kept_c.append(classes[i] if i < len(classes) else 0)
         if dropped:
             print(f"[REJECT] dropped {dropped} re-detection(s) of previously-deleted object(s)")
+        if classes is not None:
+            return kept_b, (kept_p if polys is not None else None), kept_c
         return kept_b, (kept_p if polys is not None else None)
 
     @staticmethod
-    def _combine_with_dedup(det_boxes, manual_boxes, iou_thresh=0.5):
+    def _combine_with_dedup(det_boxes, manual_boxes, iou_thresh=0.5,
+                            det_classes=None, manual_cls=0, manual_classes=None):
         """Return (boxes, sources): detector boxes FIRST, then manual boxes.
         A manual box is appended only if it doesn't duplicate a kept box
         (guards SAM echoing its input boxes back as outputs). Detector
@@ -1970,7 +3613,15 @@ class ManualWindow(QtWidgets.QWidget):
         _drop_detector_dups_of_manual (manual wins / the drawn box persists),
         so by the time we get here no detector box overlaps a manual one and
         every manual box survives. Detector-first order is required by the
-        one-shot seg path, which aligns det polys to boxes[:len(det_polys)]."""
+        one-shot seg path, which aligns det polys to boxes[:len(det_polys)].
+
+        With `det_classes` (aligned with det_boxes) the return grows to
+        (boxes, sources, classes). Appended manual boxes take their own class
+        from `manual_classes` (aligned with manual_boxes) when given, else the
+        `manual_cls` scalar. Prefer manual_classes: collapsing every drawn box
+        onto one class id loses the per-box class the user actually drew.
+        Passing manual_classes alone also grows the return to 3, so per-box
+        manual classes survive even when the detector ran single-class."""
         def _iou(a, b):
             ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
             ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
@@ -1983,21 +3634,41 @@ class ManualWindow(QtWidgets.QWidget):
             return inter / union if union > 0 else 0.0
         out = list(det_boxes)
         sources = ['detector'] * len(out)
-        for mb in manual_boxes:
+        classes = None
+        if det_classes is not None or manual_classes is not None:
+            # Detector boxes default to 0 when only manual_classes was supplied:
+            # that is the single-class detector run, whose one class IS 0.
+            classes = [(det_classes[i] if det_classes is not None
+                        and i < len(det_classes) else 0)
+                       for i in range(len(out))]
+        for i, mb in enumerate(manual_boxes):
             if not any(_iou(mb, ob) > iou_thresh for ob in out):
                 out.append(list(mb))
                 sources.append('manual')
+                if classes is not None:
+                    if manual_classes is not None and i < len(manual_classes):
+                        classes.append(int(manual_classes[i]))
+                    else:
+                        classes.append(int(manual_cls))
+        if classes is not None:
+            return out, sources, classes
         return out, sources
 
     @staticmethod
-    def _drop_detector_dups_of_manual(det_boxes, manual_boxes, polys=None, iou_thresh=0.5):
+    def _drop_detector_dups_of_manual(det_boxes, manual_boxes, polys=None, iou_thresh=0.5,
+                                      classes=None):
         """Drop detector boxes (and their index-aligned polys) that duplicate a
         user-drawn manual box, so the drawn prompt box persists across a
         Regenerate with no overlapping detector box on the same object. Only
         detector entries are removed, so detector-first ordering and the
         det_boxes<->polys alignment are preserved; manual boxes are appended
-        afterwards by _combine_with_dedup. Mirrors _drop_rejected."""
+        afterwards by _combine_with_dedup. Mirrors _drop_rejected. `classes`,
+        if given, shrinks in lockstep and the return grows to a 3-tuple."""
         if not manual_boxes:
+            if classes is not None:
+                return (list(det_boxes),
+                        (list(polys) if polys is not None else None),
+                        list(classes))
             return list(det_boxes), (list(polys) if polys is not None else None)
         def _iou(a, b):
             ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
@@ -2008,13 +3679,17 @@ class ManualWindow(QtWidgets.QWidget):
             ub = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
             u = ua + ub - inter
             return inter / u if u > 0 else 0.0
-        kept_b, kept_p = [], []
+        kept_b, kept_p, kept_c = [], [], []
         for i, b in enumerate(det_boxes):
             if any(_iou(b, mb) > iou_thresh for mb in manual_boxes):
                 continue
             kept_b.append(b)
             if polys is not None:
                 kept_p.append(polys[i] if i < len(polys) else None)
+            if classes is not None:
+                kept_c.append(classes[i] if i < len(classes) else 0)
+        if classes is not None:
+            return kept_b, (kept_p if polys is not None else None), kept_c
         return kept_b, (kept_p if polys is not None else None)
 
     def _boxes_from_seg_polys(self, polys_norm, image_path, fallback=None):
@@ -2305,7 +3980,7 @@ class ManualWindow(QtWidgets.QWidget):
         seg_dir = os.path.join(self.output_folder, 'segments')
         os.makedirs(box_dir, exist_ok=True)
         os.makedirs(seg_dir, exist_ok=True)
-        live = [a for a in anns if not a.get('deleted', False) and a.get('source') != 'prompt']
+        live = [a for a in anns if not a.get('deleted', False) and not is_input_only(a)]
         polys = [a for a in live if a['type'] == 'poly']
         rects = [a for a in live if a['type'] == 'rect']
         with open(f'{box_dir}/{stem}.txt', 'w') as bf:
@@ -2330,7 +4005,7 @@ class ManualWindow(QtWidgets.QWidget):
         annotations to the freshly generated set, rebuild live state, re-save
         the label files, and re-bake the overlay so the screen matches."""
         new_anns = [self._copy_ann(a) for a in self.image_label.annotations
-                    if not a.get('deleted', False) and a.get('source') != 'prompt']
+                    if not a.get('deleted', False) and not is_input_only(a)]
         merged = self._merge_additive_anns(
             [self._copy_ann(a) for a in prior_anns], new_anns)
         # Final overlap cleanup so accumulated regenerates don't pile up
@@ -2342,12 +4017,15 @@ class ManualWindow(QtWidgets.QWidget):
         oh = self.image_label._orig_h or 1
         self.live_boxes = []
         self.live_box_sources = []
+        _merged_cls = []
         for ann in merged:
-            if ann.get('source') == 'prompt':
+            if is_input_only(ann):
                 continue
             b = self._ann_bbox_norm(ann)
             self.live_boxes.append([b[0] * ow, b[1] * oh, b[2] * ow, b[3] * oh])
             self.live_box_sources.append(ann.get('source', 'detector'))
+            _merged_cls.append(int(ann.get('cls', 0)))
+        self.live_box_classes = self._norm_cls_list(_merged_cls)
         # Force re-segmentation on the next mode switch rather than trusting a
         # cache that no longer aligns with the merged annotation list.
         self.live_polys_cache = None
@@ -2372,7 +4050,7 @@ class ManualWindow(QtWidgets.QWidget):
             # active_rects already includes manual rect anns under the
             # unified model; `manual` would re-add the same entries.
             rect_pairs = [(b, s) for b, s in self.image_label.get_active_rects_with_sources()
-                          if s != 'prompt']
+                          if not is_input_only(s)]
             self.live_boxes        = [b for b, _ in rect_pairs]
             self.live_box_sources  = [s for _, s in rect_pairs]
         elif self.current_mode == "seg":
@@ -2419,6 +4097,7 @@ class ManualWindow(QtWidgets.QWidget):
         # so a regenerate that consumes the boxes keeps the anchor intact.
         if not self.image_label.get_prompt_boxes_in_image_coords():
             self._carry_anchor = []
+            self._carry_anchor_cls = []
         elif self._carry_active():
             self._refresh_and_get_carry_anchor()
         # Drawing/removing a box can change whether Auto Annotate can run.
@@ -2433,9 +4112,10 @@ class ManualWindow(QtWidgets.QWidget):
         overlay = self.base_cv2_image.copy()
         h, w = overlay.shape[:2]
         for ann in self.image_label.get_active_annotations():
-            if ann.get('source') == 'prompt':
+            if is_input_only(ann):
                 continue  # input-only prompt boxes are drawn live, never baked/saved
-            color = (0, 200, 100) if ann.get('source') == 'manual' else (255, 0, 255)
+            color = ((0, 200, 100) if ann.get('source') == 'manual'
+                     else class_color_bgr(ann.get('cls', 0)))
             if ann['type'] == 'poly':
                 pts = np.array([[int(x * w), int(y * h)] for x, y in ann['data']],
                                dtype=np.int32)
@@ -2463,21 +4143,32 @@ class ManualWindow(QtWidgets.QWidget):
             self.baked_seg_cv2 = overlay.copy()
 
     # Annotated-image export
-    def _render_overlay_image(self, image_path, boxes=None, polys=None):
+    def _render_overlay_image(self, image_path, boxes=None, polys=None,
+                              box_classes=None, poly_classes=None):
         """Return a copy of the image with boxes (absolute xyxy) and/or polys
-        (normalized point lists) drawn on it, for saving as a reference image."""
+        (normalized point lists) drawn on it, for saving as a reference image.
+
+        Each shape takes its class color, so a reviewer scrolling the saved
+        annotated_<model> folder can tell two classes apart instead of seeing
+        one undifferentiated magenta. With no class lists everything is class 0
+        (magenta), byte-identical to the single-class output this always made."""
         img = self._imread_cached(image_path)
         if img is None:
             return None
+
+        def _cls(lst, i):
+            return lst[i] if lst is not None and i < len(lst) else 0
+
         h, w = img.shape[:2]
-        for p in (polys or []):
+        for i, p in enumerate(polys or []):
             if not p or len(p) < 3:
                 continue
             pts = np.array([[int(x * w), int(y * h)] for x, y in p], dtype=np.int32)
-            cv2.polylines(img, [pts], True, (255, 0, 255), 2)
-        for box in (boxes or []):
+            cv2.polylines(img, [pts], True, class_color_bgr(_cls(poly_classes, i)), 2)
+        for i, box in enumerate(boxes or []):
             x1, y1, x2, y2 = box
-            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 2)
+            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)),
+                          class_color_bgr(_cls(box_classes, i)), 2)
         return img
 
     def _save_annotated_image(self, image_path, overlay_cv2, kind):
@@ -2498,21 +4189,27 @@ class ManualWindow(QtWidgets.QWidget):
         # inspection); no model trains on these, so q85 is a free space win
         # vs OpenCV's default q95. Synthetic TRAINING images keep q95 in
         # _save_variation.
-        cv2.imwrite(os.path.join(ann_dir, f'{stem}.jpg'), overlay_cv2,
-                    [cv2.IMWRITE_JPEG_QUALITY, 85])
+        imwrite_unicode(os.path.join(ann_dir, f'{stem}.jpg'), overlay_cv2,
+                        [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    def _save_split_overlays(self, image_path, boxes, polys):
+    def _save_split_overlays(self, image_path, boxes, polys, classes=None):
         """Helper: render boxes-only and masks-only reference images and
         save each to its subfolder. The masks variant is skipped when
         there are no polygons (bbox-only runs don't need an empty
         polygon overlay). Boxes can be derived from polygon bboxes by
         the caller; if the caller passes an empty box list we skip
-        the boxes variant too."""
+        the boxes variant too.
+
+        `classes` is index-aligned with BOTH boxes and polys (every caller
+        builds them from the same detection list), and colors each shape by
+        class. The color key is written alongside by _write_class_key."""
         if boxes:
-            box_only = self._render_overlay_image(image_path, boxes=boxes, polys=None)
+            box_only = self._render_overlay_image(image_path, boxes=boxes, polys=None,
+                                                  box_classes=classes)
             self._save_annotated_image(image_path, box_only, 'boxes')
         if polys:
-            mask_only = self._render_overlay_image(image_path, boxes=None, polys=polys)
+            mask_only = self._render_overlay_image(image_path, boxes=None, polys=polys,
+                                                   poly_classes=classes)
             self._save_annotated_image(image_path, mask_only, 'masks')
 
     # Predictions
@@ -2520,7 +4217,7 @@ class ManualWindow(QtWidgets.QWidget):
         # Detect Enter key
         if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
             # In boxes mode the prompt comes from drawn boxes, so don't gate on text.
-            if self.prompt_mode == "boxes" or self.prompt_entry.text().strip():
+            if self.prompt_mode == "boxes" or self._positive_prompt_text().strip():
                 self.display_predictions()
             else:
                 message_box = QtWidgets.QMessageBox()
@@ -2538,7 +4235,7 @@ class ManualWindow(QtWidgets.QWidget):
             message_box.exec_()
             return
         # Validate inputs based on prompt mode.
-        if (self.prompt_mode == "text" and not self.prompt_entry.text().strip()
+        if (self.prompt_mode == "text" and not self._positive_prompt_text().strip()
                 and not self.image_label.get_prompt_boxes_in_image_coords()):
             message_box = QtWidgets.QMessageBox()
             message_box.setStyleSheet("QLabel { color: black; font-size: 24px; } QMessageBox { background-color: white; }")
@@ -2559,7 +4256,7 @@ class ManualWindow(QtWidgets.QWidget):
             message_box.exec_()
             return
 
-        prompt = self.prompt_entry.text()
+        prompt = self._positive_prompt_text()
         confidence  = self.detection_threshold_slider.value() / 100
         mask_thresh = self.mask_threshold_slider.value() / 100
         # `max_area` kept for back-compat with display_* signatures; it's
@@ -2571,22 +4268,35 @@ class ManualWindow(QtWidgets.QWidget):
             message_box.setText("Please select an output folder before running predictions.")
             message_box.exec_()
             return
+        # An unconfirmed global slider change would make this run's settings
+        # ambiguous (the sliders show values that are not applied). Refuse
+        # until the user applies or reverts. Single-class sessions never gate.
+        if self._global_sliders_blocked():
+            self._styled_message(
+                "The global sliders were changed but not applied.\n\n"
+                "Press 'Apply to All Classes' or 'Revert' first.",
+                "Class Settings").exec_()
+            return
         # Snapshot any boxes/segments the user has deleted into the reject
         # list BEFORE the regenerate replaces the annotation set, so the
         # detector's re-detections of those same objects can be suppressed.
         self._collect_rejected()
+        # Freeze the current image's red negative boxes as appearance exemplars,
+        # keeping the earlier frozen ref when this image has none drawn (so
+        # suppression survives Next Image, where the canvas starts clean).
+        self._refresh_neg_box_ref()
         # Busy state for slow paths (especially first SAM3 text load, several
         # hundred MB). processEvents() forces Qt to paint the :disabled style
         # before we block on the model call. Re-enable in finally so a crash
         # never leaves the UI dead.
         busy_btns = [b for b in (getattr(self, "auto_annotate_btn", None),
                                  getattr(self, "regen_btn", None),
-                                 getattr(self, "next_btn", None)) if b is not None]
+                                 getattr(self, "next_btn", None),
+                                 getattr(self, "prev_btn", None)) if b is not None]
         self._busy = True
         for b in busy_btns:
             b.setEnabled(False)
         QtWidgets.QApplication.processEvents()
-        import time
         _t0 = time.perf_counter()
         try:
             _ran = False
@@ -2656,11 +4366,11 @@ class ManualWindow(QtWidgets.QWidget):
             if cached is not None and cached[0] == path:
                 arr = cached[1]
             else:
-                arr = cv2.imread(path)
+                arr = imread_unicode(path)
                 self._imread_cache = (path, arr)
             return arr.copy() if arr is not None else None
         except Exception:
-            return cv2.imread(path)
+            return imread_unicode(path)
 
     def _release_every(self):
         """Inference calls between full memory releases. From
@@ -2727,7 +4437,7 @@ class ManualWindow(QtWidgets.QWidget):
         # in `prior_anns` too would (a) leave the yellow prompt box on screen
         # after regenerate and (b) double-count it against its own detection.
         prior_anns = ([self._copy_ann(a) for a in self.image_label.get_active_annotations()
-                       if a.get('source') != 'prompt'
+                       if not is_input_only(a)
                        and not (a['type'] == 'rect' and a.get('source') == 'manual')]
                       if additive else [])
 
@@ -2751,34 +4461,62 @@ class ManualWindow(QtWidgets.QWidget):
         # under the unified model. `manual_boxes_img` covers rect-form draws
         # (current state) and poly-form manuals (SAM masks of earlier draws
         # carried forward through seg mode) via the type-agnostic helper.
-        manual_boxes_img     = list(self.image_label.get_manual_anns_as_boxes_in_image_coords())
+        _manual_pairs        = self.image_label.get_manual_anns_as_boxes_with_classes_in_image_coords()
+        manual_boxes_img     = [b for b, _ in _manual_pairs]
+        manual_cls_img       = [c for _, c in _manual_pairs]
 
         det_boxes, yoloe_seg_results = self._run_detector(image_path, prompt, confidence, max_area, prompt_boxes_img + carry_prompt, ref=carry_ref)
+        det_classes = getattr(self, "_det_classes_aligned", None)
         # Suppress detections on regions the user deleted earlier on this
         # image so a regenerate doesn't bring the same objects straight back.
-        det_boxes, self._oneshot_polys_aligned = self._drop_rejected(
-            det_boxes, self._oneshot_polys_aligned)
+        if det_classes is not None:
+            det_boxes, self._oneshot_polys_aligned, det_classes = self._drop_rejected(
+                det_boxes, self._oneshot_polys_aligned, classes=det_classes)
+        else:
+            det_boxes, self._oneshot_polys_aligned = self._drop_rejected(
+                det_boxes, self._oneshot_polys_aligned)
         det_key, _, is_standalone = self._detector_keys_for_pipeline()
         # Manual wins: drop detector boxes (and their aligned one-shot polys)
         # that duplicate a user-drawn box, so the drawn prompt box persists
         # across Regenerate with no overlapping detector box on the same object.
-        det_boxes, self._oneshot_polys_aligned = self._drop_detector_dups_of_manual(
-            det_boxes, manual_boxes_img, self._oneshot_polys_aligned)
+        if det_classes is not None:
+            det_boxes, self._oneshot_polys_aligned, det_classes = self._drop_detector_dups_of_manual(
+                det_boxes, manual_boxes_img, self._oneshot_polys_aligned, classes=det_classes)
+        else:
+            det_boxes, self._oneshot_polys_aligned = self._drop_detector_dups_of_manual(
+                det_boxes, manual_boxes_img, self._oneshot_polys_aligned)
         # Final on-screen + on-disk box set = detector output (first) + manual,
         # IoU-deduped so SAM's pass-through (it echoes prompts as outputs)
         # doesn't double-count drawn boxes.
-        absolute_boxes, sources = self._combine_with_dedup(list(det_boxes), manual_boxes_img, 0.5)
+        # manual_classes, not manual_cls: each drawn box keeps the class it was
+        # drawn as, instead of every one of them inheriting the active dropdown.
+        if det_classes is not None or any(manual_cls_img):
+            absolute_boxes, sources, box_classes = self._combine_with_dedup(
+                list(det_boxes), manual_boxes_img, 0.5,
+                det_classes=det_classes, manual_classes=manual_cls_img)
+            self._cls_sync_check("display_boxes", absolute_boxes, box_classes)
+        else:
+            absolute_boxes, sources = self._combine_with_dedup(list(det_boxes), manual_boxes_img, 0.5)
+            box_classes = None
+        self._det_classes_aligned = det_classes
 
         # Persist post-edit truth: overwrite the YOLO file with the actual displayed set.
-        save_boxes_yolo(absolute_boxes, image_path, boxes_dir)
+        save_boxes_yolo(absolute_boxes, image_path, boxes_dir, classes=box_classes)
+        self._write_class_key(self._class_names_for_run(prompt), output_path)
 
-        # Color the baked overlay so manual boxes are green even outside edit mode.
-        colors = [(0, 200, 100) if s == 'manual' else (255, 0, 255) for s in sources]
+        # Color the baked overlay so manual boxes are green even outside edit
+        # mode; detector boxes take their class color (class 0 = magenta).
+        # draw_boxes_on_image paints through PIL on an RGB canvas, so it takes
+        # the RGB form; the BGR form there flips class 1 orange into blue.
+        colors = [(0, 200, 100) if s == 'manual'
+                  else class_color_image_rgb(box_classes[i] if box_classes else 0)
+                  for i, s in enumerate(sources)]
         img_with_boxes = draw_boxes_on_image(img, absolute_boxes, colors=colors)
 
         # Update live truth.
         self.live_boxes = list(absolute_boxes)
         self.live_box_sources = list(sources)
+        self.live_box_classes = self._norm_cls_list(box_classes)
         self.live_polys_cache = None
         if is_standalone and self._oneshot_polys_aligned is not None:
             # Index-aligned with det_boxes (filtered by max_area + >=3 pts in
@@ -2803,7 +4541,8 @@ class ManualWindow(QtWidgets.QWidget):
 
         self.image_label.set_clean_image(img)
         self.image_label.set_baked_image(img_with_boxes)
-        self.image_label.set_annotations(rects=rects_norm, rect_sources=sources)
+        self.image_label.set_annotations(rects=rects_norm, rect_sources=sources,
+                                         rect_cls=box_classes)
         # Bucket boxes are now durable rect annotations; clear the bucket so
         # they aren't double-counted on the next regenerate or save.
         self.image_label.annotation_boxes = []
@@ -2849,7 +4588,7 @@ class ManualWindow(QtWidgets.QWidget):
         # in `prior_anns` too would (a) leave the yellow prompt box on screen
         # after regenerate and (b) double-count it against its own detection.
         prior_anns = ([self._copy_ann(a) for a in self.image_label.get_active_annotations()
-                       if a.get('source') != 'prompt'
+                       if not is_input_only(a)
                        and not (a['type'] == 'rect' and a.get('source') == 'manual')]
                       if additive else [])
 
@@ -2872,23 +4611,44 @@ class ManualWindow(QtWidgets.QWidget):
         # Drawn boxes serve both as prompts and as saved annotations under the
         # unified model. Type-agnostic helper picks up rect-form draws plus any
         # poly-form manuals carried over from a previous seg-mode pass.
-        manual_boxes_img     = list(self.image_label.get_manual_anns_as_boxes_in_image_coords())
+        _manual_pairs        = self.image_label.get_manual_anns_as_boxes_with_classes_in_image_coords()
+        manual_boxes_img     = [b for b, _ in _manual_pairs]
+        manual_cls_img       = [c for _, c in _manual_pairs]
 
         det_boxes, yoloe_seg_results = self._run_detector(image_path, prompt, confidence, max_area, prompt_boxes_img + carry_prompt, ref=carry_ref)
+        det_classes = getattr(self, "_det_classes_aligned", None)
         # Suppress detections on regions the user deleted earlier on this
         # image so a regenerate doesn't bring the same objects straight back.
-        det_boxes, self._oneshot_polys_aligned = self._drop_rejected(
-            det_boxes, self._oneshot_polys_aligned)
+        if det_classes is not None:
+            det_boxes, self._oneshot_polys_aligned, det_classes = self._drop_rejected(
+                det_boxes, self._oneshot_polys_aligned, classes=det_classes)
+        else:
+            det_boxes, self._oneshot_polys_aligned = self._drop_rejected(
+                det_boxes, self._oneshot_polys_aligned)
         det_key, _, is_standalone = self._detector_keys_for_pipeline()
         # Manual wins: drop detector boxes (and their aligned one-shot polys)
         # that duplicate a user-drawn box, keeping det_boxes<->polys aligned and
         # detector-first ordering so the standalone seg slice below holds.
-        det_boxes, self._oneshot_polys_aligned = self._drop_detector_dups_of_manual(
-            det_boxes, manual_boxes_img, self._oneshot_polys_aligned)
+        if det_classes is not None:
+            det_boxes, self._oneshot_polys_aligned, det_classes = self._drop_detector_dups_of_manual(
+                det_boxes, manual_boxes_img, self._oneshot_polys_aligned, classes=det_classes)
+        else:
+            det_boxes, self._oneshot_polys_aligned = self._drop_detector_dups_of_manual(
+                det_boxes, manual_boxes_img, self._oneshot_polys_aligned)
         # IoU-dedup so SAM's pass-through doesn't double-count drawn boxes.
-        all_boxes, sources = self._combine_with_dedup(list(det_boxes), manual_boxes_img, 0.5)
+        # manual_classes keeps each drawn box on the class it was drawn as.
+        if det_classes is not None or any(manual_cls_img):
+            all_boxes, sources, box_classes = self._combine_with_dedup(
+                list(det_boxes), manual_boxes_img, 0.5,
+                det_classes=det_classes, manual_classes=manual_cls_img)
+            self._cls_sync_check("display_masks", all_boxes, box_classes)
+        else:
+            all_boxes, sources = self._combine_with_dedup(list(det_boxes), manual_boxes_img, 0.5)
+            box_classes = None
+        self._det_classes_aligned = det_classes
 
-        save_boxes_yolo(all_boxes, image_path, boxes_dir)
+        save_boxes_yolo(all_boxes, image_path, boxes_dir, classes=box_classes)
+        self._write_class_key(self._class_names_for_run(prompt), output_path)
 
         if not all_boxes:
             if additive and prior_anns:
@@ -2903,6 +4663,7 @@ class ManualWindow(QtWidgets.QWidget):
             self.image_label.update()
             self.live_boxes = []
             self.live_box_sources = []
+            self.live_box_classes = None
             return
 
         if is_standalone:
@@ -2937,8 +4698,11 @@ class ManualWindow(QtWidgets.QWidget):
                         ann_polys.append(seg)
                         kept_indices.append(len(det_polys) + j)
             poly_sources = [sources[i] if i < len(sources) else 'detector' for i in kept_indices]
+            poly_cls = ([box_classes[i] if i < len(box_classes) else 0 for i in kept_indices]
+                        if box_classes is not None else None)
             self.live_boxes       = [all_boxes[i] for i in kept_indices]
             self.live_box_sources = [sources[i]   for i in kept_indices]
+            self.live_box_classes = self._norm_cls_list(poly_cls)
             self.live_polys_cache = ann_polys
             if not ann_polys:
                 if additive and prior_anns:
@@ -2951,17 +4715,19 @@ class ManualWindow(QtWidgets.QWidget):
             # Render polygons manually (no sam_results to feed adjust_masks).
             image_with_borders = np.copy(img)
             h_img, w_img = img.shape[:2]
-            for poly in ann_polys:
+            for pi, poly in enumerate(ann_polys):
                 pts = np.array([[int(x * w_img), int(y * h_img)] for x, y in poly], dtype=np.int32)
-                cv2.drawContours(image_with_borders, [pts], -1, (255, 0, 255), 2)
+                _c = class_color_bgr(poly_cls[pi]) if poly_cls is not None else (255, 0, 255)
+                cv2.drawContours(image_with_borders, [pts], -1, _c, 2)
             # Save masks: write YOLO-style polygon segments. save_masks expects
             # a results object; for one-shot we hand-roll it.
             try:
                 stem = os.path.splitext(os.path.basename(image_path))[0]
                 with open(os.path.join(seg_dir, f"{stem}.txt"), "w") as f:
-                    for poly in ann_polys:
+                    for pi, poly in enumerate(ann_polys):
                         coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-                        f.write(f"0 {coords}\n")
+                        _cls = poly_cls[pi] if poly_cls is not None else 0
+                        f.write(f"{_cls} {coords}\n")
             except Exception as e:
                 print(f"[one-shot] saving polygon segments failed: {e}")
         else:
@@ -2969,30 +4735,40 @@ class ManualWindow(QtWidgets.QWidget):
                 self.image_label.set_clean_image(img)
                 return
 
-            save_masks(sam_results, seg_dir, image_path)
+            # segment_with_boxes guarantees one mask per box, in order, so the
+            # box classes label their own masks.
+            self._cls_sync_check("segmenter", all_boxes, box_classes)
+            save_masks(sam_results, seg_dir, image_path, classes=box_classes)
 
             masks = adjust_masks(sam_results)
             image_with_borders = np.copy(img)
-            for mask_i in masks:
-                image_with_borders = overlay_with_borders(image_with_borders, mask_i, color=(255, 0, 255), thickness=2)
+            for i, mask_i in enumerate(masks):
+                cls = box_classes[i] if box_classes is not None and i < len(box_classes) else 0
+                image_with_borders = overlay_with_borders(
+                    image_with_borders, mask_i, color=class_color_bgr(cls), thickness=2)
 
             ann_polys = []
             poly_sources = []
+            poly_cls = [] if box_classes is not None else None
             kept_indices = []
             for i, seg in enumerate(result_clean_polys(sam_results[0])):
                 if seg is not None and len(seg) >= 3:
                     ann_polys.append(seg)
                     poly_sources.append(sources[i] if i < len(sources) else 'detector')
+                    if poly_cls is not None:
+                        poly_cls.append(box_classes[i] if i < len(box_classes) else 0)
                     kept_indices.append(i)
             self.live_boxes       = [all_boxes[i] for i in kept_indices]
             self.live_box_sources = [sources[i]   for i in kept_indices]
+            self.live_box_classes = self._norm_cls_list(poly_cls)
             self.live_polys_cache = ann_polys
 
         # Cache for mode switching
         self.base_cv2_image = img.copy()
 
         self.image_label.set_clean_image(img)
-        kept_new = self.image_label.set_annotations(polys=ann_polys, poly_sources=poly_sources)
+        kept_new = self.image_label.set_annotations(polys=ann_polys, poly_sources=poly_sources,
+                                                    poly_cls=poly_cls)
         # set_annotations may drop detector/manual polys that duplicate a sticky
         # hand-drawn mask; shrink live_boxes/sources/polys in lockstep so they
         # stay index-aligned with the canvas annotations for _switch_to_mode
@@ -3003,6 +4779,9 @@ class ManualWindow(QtWidgets.QWidget):
                 self.live_polys_cache = [p for p, k in zip(self.live_polys_cache, kept_new) if k]
             if len(self.live_boxes) == len(kept_new):
                 self.live_box_sources = [s for s, k in zip(self.live_box_sources, kept_new) if k]
+                if (self.live_box_classes is not None
+                        and len(self.live_box_classes) == len(kept_new)):
+                    self.live_box_classes = [c for c, k in zip(self.live_box_classes, kept_new) if k]
                 self.live_boxes = [b for b, k in zip(self.live_boxes, kept_new) if k]
         # Bake the non-edit overlay from the SAME annotation set the canvas
         # edits, never from the raw SAM masks. The segmenter can emit masks
@@ -3728,6 +5507,7 @@ class ManualWindow(QtWidgets.QWidget):
                 'source': 'manual',
                 'semiauto': True,
                 'sam_points': sam_points,
+                'cls': self._active_class_index(),
             }
             self.image_label.annotations.append(ann)
             # Hand-drawn masks WIN immediately: soft-delete any DETECTOR
@@ -3735,7 +5515,8 @@ class ManualWindow(QtWidgets.QWidget):
             # anns; mask IoU keeps clustered neighbours intact).
             cand_grid = SpatialGrid.build(
                 [a for a in self.image_label.annotations
-                 if a is not ann and not a.get('deleted') and a.get('source') == 'detector'],
+                 if a is not ann and not a.get('deleted')
+                 and a.get('source') in ('detector', 'restored')],
                 self.image_label._ann_bbox_norm_xyxy)
             for a in cand_grid.query_bbox(self.image_label._ann_bbox_norm_xyxy(ann)):
                 if self.image_label._is_duplicate_of(a, ann):
@@ -3755,7 +5536,7 @@ class ManualWindow(QtWidgets.QWidget):
 
     def run_with_manual_boxes(self):
         """Skip the detector; feed manually drawn boxes straight into the current segmenter."""
-        boxes = self.image_label.get_boxes_in_image_coords()
+        boxes, box_cls = self.image_label.get_boxes_with_cls_in_image_coords()
         if not boxes:
             return
         if not self.output_folder:
@@ -3768,13 +5549,21 @@ class ManualWindow(QtWidgets.QWidget):
             sam_results = self._run_segmenter(image_path, boxes)
             if sam_results is None:
                 return
-            save_masks(sam_results, self.output_folder + '/segments', image_path)
+            # segment_with_boxes returns exactly one mask per input box, in
+            # order, so the drawn boxes' classes label their own segments.
+            self._cls_sync_check("manual_boxes", boxes, box_cls)
+            classes = self._norm_cls_list(box_cls)
+            save_masks(sam_results, os.path.join(self.output_folder, 'segments'),
+                       image_path, classes=classes)
+            self._write_class_key(self._class_names_for_run(self._positive_prompt_text()))
 
             img = self._imread_cached(image_path)
             masks = adjust_masks(sam_results)
             image_with_borders = np.copy(img)
-            for mask_i in masks:
-                image_with_borders = overlay_with_borders(image_with_borders, mask_i, color=(0, 255, 128), thickness=2)
+            for i, mask_i in enumerate(masks):
+                cls = box_cls[i] if i < len(box_cls) else 0
+                image_with_borders = overlay_with_borders(
+                    image_with_borders, mask_i, color=class_color_bgr(cls), thickness=2)
             self.show_result_image(image_with_borders)
         except Exception as e:
             import traceback
@@ -4091,7 +5880,8 @@ class ManualWindow(QtWidgets.QWidget):
         for btn in (self.gen_variation_btn, self.gen_variation_folder_btn,
                     getattr(self, "auto_annotate_btn", None),
                     getattr(self, "regen_btn", None),
-                    getattr(self, "next_btn", None)):
+                    getattr(self, "next_btn", None),
+                    getattr(self, "prev_btn", None)):
             if btn is not None:
                 btn.setEnabled(False)
         QtWidgets.QApplication.processEvents()
@@ -4300,6 +6090,11 @@ class ManualWindow(QtWidgets.QWidget):
         os.makedirs(seg_dir, exist_ok=True)
         os.makedirs(box_dir, exist_ok=True)
 
+        # Keep classes.txt current with the label files so saved class ids
+        # stay interpretable (headless windows have no prompt fields).
+        prompt_text = self._positive_prompt_text()
+        self._write_class_key(self._class_names_for_run(prompt_text))
+
         # Preserve cross-mode model output: if the user is currently in
         # bbox display mode but a previous seg-mode run already produced
         # masks for this image, write them too. Truncating seg.txt to
@@ -4309,12 +6104,12 @@ class ManualWindow(QtWidgets.QWidget):
         if not polys:
             polys = [a for a in (self.seg_anns or [])
                      if a['type'] == 'poly' and not a.get('deleted', False)
-                     and a.get('source') != 'prompt']
+                     and not is_input_only(a)]
         rects = [a for a in active if a['type'] == 'rect']
         if not rects:
             rects = [a for a in (self.bbox_anns or [])
                      if a['type'] == 'rect' and not a.get('deleted', False)
-                     and a.get('source') != 'prompt']
+                     and not is_input_only(a)]
 
         # Single-pass overwrite of both label files. The "in-flight
         # manual" boxes are bucket draws the user made AFTER the last
@@ -4322,7 +6117,10 @@ class ManualWindow(QtWidgets.QWidget):
         # need to be saved too, so we collect them up front and write
         # everything in one 'w' block. No append phase -- this is the
         # only write to each label file per save.
-        in_flight_manual = self.image_label.get_boxes_in_image_coords()
+        # Each in-flight box keeps the class it was drawn as, not the class the
+        # dropdown happens to sit on now.
+        in_flight_manual, in_flight_cls_list = \
+            self.image_label.get_boxes_with_cls_in_image_coords()
         with open(f'{seg_dir}/{stem}.txt', 'w') as sf, \
              open(f'{box_dir}/{stem}.txt', 'w') as bf:
             for ann in polys:
@@ -4337,12 +6135,12 @@ class ManualWindow(QtWidgets.QWidget):
             for ann in rects:
                 cx2, cy2, bw2, bh2 = ann['data']
                 bf.write(f'{int(ann.get("cls", 0))} {cx2:.6f} {cy2:.6f} {bw2:.6f} {bh2:.6f}\n')
-            for x1, y1, x2, y2 in in_flight_manual:
+            for (x1, y1, x2, y2), in_flight_cls in zip(in_flight_manual, in_flight_cls_list):
                 cx = (x1 + x2) / 2 / w
                 cy = (y1 + y2) / 2 / h
                 bw = (x2 - x1) / w
                 bh = (y2 - y1) / h
-                bf.write(f'0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n')
+                bf.write(f'{in_flight_cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n')
 
         # Round-trip sanity check: confirm what's on disk matches what was
         # actually written (the polys+rects collection above), not just the
@@ -4364,17 +6162,19 @@ class ManualWindow(QtWidgets.QWidget):
         elif AUTOANNOTATE_DEBUG:
             print(f"[ROUND-TRIP CHECK] OK for {stem} (max error {max_err:.3f}px)")
 
-        # Re-render overlay with only the remaining annotations
+        # Re-render overlay with only the remaining annotations, each in its
+        # class color.
         overlay = img.copy()
         for ann in active:
+            _c = class_color_bgr(ann.get('cls', 0))
             if ann['type'] == 'poly':
                 pts = np.array([[int(x * w), int(y * h)] for x, y in ann['data']], dtype=np.int32)
-                cv2.drawContours(overlay, [pts], -1, (255, 0, 255), 2)
+                cv2.drawContours(overlay, [pts], -1, _c, 2)
             elif ann['type'] == 'rect':
                 cx2, cy2, bw2, bh2 = ann['data']
                 rx1 = int((cx2 - bw2 / 2) * w); ry1 = int((cy2 - bh2 / 2) * h)
                 rx2 = int((cx2 + bw2 / 2) * w); ry2 = int((cy2 + bh2 / 2) * h)
-                cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), (255, 0, 255), 2)
+                cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), _c, 2)
 
         # Update cached baked image for current mode
         if self.current_mode == "bbox":
@@ -4392,18 +6192,23 @@ class ManualWindow(QtWidgets.QWidget):
         # Boxes are computed from poly bboxes + rect annotations + any
         # still-in-flight manual draws so the saved reference matches
         # what was written to the label files.
-        ref_boxes = []
+        # ref_cls follows the same polys-then-rects-then-in-flight order as
+        # ref_boxes, so its leading entries also line up with ref_polys.
+        ref_boxes, ref_cls = [], []
         for ann in polys:
             xs = [p[0] for p in ann['data']]; ys = [p[1] for p in ann['data']]
             ref_boxes.append([min(xs) * w, min(ys) * h,
                               max(xs) * w, max(ys) * h])
+            ref_cls.append(int(ann.get('cls', 0) or 0))
         for ann in rects:
             cx2, cy2, bw2, bh2 = ann['data']
             ref_boxes.append([(cx2 - bw2 / 2) * w, (cy2 - bh2 / 2) * h,
                               (cx2 + bw2 / 2) * w, (cy2 + bh2 / 2) * h])
+            ref_cls.append(int(ann.get('cls', 0) or 0))
         ref_boxes.extend(in_flight_manual)
+        ref_cls.extend(in_flight_cls_list)
         ref_polys = [a['data'] for a in polys]
-        self._save_split_overlays(image_path, ref_boxes, ref_polys)
+        self._save_split_overlays(image_path, ref_boxes, ref_polys, classes=ref_cls)
 
         if not silent:
             msg = QtWidgets.QMessageBox()
@@ -4444,17 +6249,32 @@ class ManualWindow(QtWidgets.QWidget):
         # Snapshot current state into live_boxes before we change anything.
         if self.image_label._orig_w is not None:
             if self.current_mode == "bbox":
-                # Active rects already reflect deletions; manual draws are widget-only.
+                # Active rects already reflect deletions, and they ALREADY include
+                # the manual draws: both these and get_boxes_in_image_coords() are
+                # views over self.image_label.annotations, the latter just filtered
+                # to source == 'manual'. Concatenating the two would list every
+                # manual box twice, the second copy re-tagged with the active class.
+                # get_active_rects_with_sources walks the annotations in order and
+                # skips deleted/non-rect, so rect_anns lines up with it 1:1 and the
+                # class of each kept box comes from that box's own annotation.
                 rect_pairs = self.image_label.get_active_rects_with_sources()
-                rects = [b for b, _ in rect_pairs]
-                rect_sources = [s for _, s in rect_pairs]
-                manual = self.image_label.get_boxes_in_image_coords()
-                self.live_boxes = rects + manual
-                self.live_box_sources = rect_sources + (['manual'] * len(manual))
+                rect_anns = [a for a in self.image_label.annotations
+                             if not a['deleted'] and a['type'] == 'rect']
+                rects, rect_sources, rect_cls = [], [], []
+                for (b, s), ann in zip(rect_pairs, rect_anns):
+                    if is_input_only(s):
+                        continue   # prompt / negative boxes are inputs, not annotations
+                    rects.append(b)
+                    rect_sources.append(s)
+                    rect_cls.append(int(ann.get('cls', 0)))
+                self.live_boxes = rects
+                self.live_box_sources = rect_sources
+                self.live_box_classes = self._norm_cls_list(rect_cls)
             elif self.current_mode == "seg":
                 # Cull live_boxes by the currently-not-deleted seg anns (index-aligned).
                 kept = []
                 kept_sources = []
+                kept_cls = []
                 for i, ann in enumerate(self.image_label.annotations):
                     if not ann['deleted'] and i < len(self.live_boxes):
                         kept.append(self.live_boxes[i])
@@ -4462,9 +6282,12 @@ class ManualWindow(QtWidgets.QWidget):
                         # array; they should agree, but the ann is what the user sees.
                         kept_sources.append(ann.get('source',
                             self.live_box_sources[i] if i < len(self.live_box_sources) else 'detector'))
+                        kept_cls.append(int(ann.get('cls', 0)))
                 manual = self.image_label.get_boxes_in_image_coords()
                 self.live_boxes = kept + manual
                 self.live_box_sources = kept_sources + (['manual'] * len(manual))
+                self.live_box_classes = self._norm_cls_list(
+                    kept_cls + [self._active_class_index()] * len(manual))
             else:
                 # No prior model run (fresh boot): capture manually drawn
                 # boxes so switching display mode doesn't wipe them. They
@@ -4472,6 +6295,9 @@ class ManualWindow(QtWidgets.QWidget):
                 rect_pairs = self.image_label.get_active_rects_with_sources()
                 self.live_boxes       = [b for b, _ in rect_pairs]
                 self.live_box_sources = [s for _, s in rect_pairs]
+                self.live_box_classes = self._norm_cls_list(
+                    [int(a.get('cls', 0)) for a in self.image_label.annotations
+                     if not a['deleted'] and a['type'] == 'rect'])
 
         if self.base_cv2_image is None:
             return
@@ -4483,7 +6309,14 @@ class ManualWindow(QtWidgets.QWidget):
             # Render bbox view from live_boxes, no model call needed.
             sources = list(self.live_box_sources) if self.live_box_sources else \
                       ['detector'] * len(self.live_boxes)
-            colors = [(0, 200, 100) if s == 'manual' else (255, 0, 255) for s in sources]
+            classes = (list(self.live_box_classes)
+                       if (self.live_box_classes is not None
+                           and len(self.live_box_classes) == len(self.live_boxes))
+                       else None)
+            # RGB form: draw_boxes_on_image paints through PIL in RGB space.
+            colors = [(0, 200, 100) if s == 'manual'
+                      else class_color_image_rgb(classes[i] if classes else 0)
+                      for i, s in enumerate(sources)]
             img_with_boxes = draw_boxes_on_image(img.copy(), self.live_boxes, colors=colors)
             rects_norm = []
             for x1, y1, x2, y2 in self.live_boxes:
@@ -4499,7 +6332,8 @@ class ManualWindow(QtWidgets.QWidget):
             # until the next regenerate consumes them. Direct assignment (not
             # clear_boxes) so we don't fire the boxes_changed signal mid-transition.
             self.image_label.annotation_boxes = []
-            self.image_label.set_annotations(rects=rects_norm, rect_sources=sources)
+            self.image_label.set_annotations(rects=rects_norm, rect_sources=sources,
+                                             rect_cls=classes)
             # Re-bake from the full annotation set (set_annotations carried the
             # sticky SAM masks) so they show as green outlines in box view too,
             # instead of vanishing. Detector rects render as magenta boxes.
@@ -4538,6 +6372,10 @@ class ManualWindow(QtWidgets.QWidget):
                 input_boxes   = list(self.live_boxes)
                 input_sources = list(self.live_box_sources) if self.live_box_sources else \
                                 ['detector'] * len(input_boxes)
+                input_classes = (list(self.live_box_classes)
+                                 if (self.live_box_classes is not None
+                                     and len(self.live_box_classes) == len(input_boxes))
+                                 else None)
                 if is_standalone:
                     # Cache covers the detector portion of live_boxes (first
                     # N entries); manual additions need SAM2 to get masks.
@@ -4547,6 +6385,7 @@ class ManualWindow(QtWidgets.QWidget):
                     sam_results = None  # not used for assembly below
                     ann_polys = list(det_polys)
                     poly_sources = list(input_sources[:n_det])
+                    poly_cls = list(input_classes[:n_det]) if input_classes is not None else None
                     if manual_boxes_only:
                         try:
                             sam = self._get_model("sam2_t")
@@ -4559,9 +6398,16 @@ class ManualWindow(QtWidgets.QWidget):
                                         kept_manual_idx.append(n_det + j)
                                 poly_sources += [input_sources[i] for i in kept_manual_idx
                                                  if i < len(input_sources)]
+                                if poly_cls is not None:
+                                    poly_cls += [input_classes[i] for i in kept_manual_idx
+                                                 if i < len(input_classes)]
                                 self.live_boxes       = input_boxes[:n_det] + [input_boxes[i] for i in kept_manual_idx]
                                 self.live_box_sources = input_sources[:n_det] + [input_sources[i] for i in kept_manual_idx
                                                                                  if i < len(input_sources)]
+                                if input_classes is not None:
+                                    self.live_box_classes = self._norm_cls_list(
+                                        input_classes[:n_det] + [input_classes[i] for i in kept_manual_idx
+                                                                 if i < len(input_classes)])
                         except Exception as e:
                             print(f"[one-shot switch] SAM2 fallback failed: {e}")
                             # Fall back: draw manual rects as 4-point polygons.
@@ -4576,43 +6422,59 @@ class ManualWindow(QtWidgets.QWidget):
                                 ann_polys.append(rect_poly)
                                 if n_det + i < len(input_sources):
                                     poly_sources.append(input_sources[n_det + i])
+                                    if poly_cls is not None and n_det + i < len(input_classes):
+                                        poly_cls.append(input_classes[n_det + i])
                 else:
                     sam_results = self._run_segmenter(image_path, self.live_boxes)
                     if sam_results is None or sam_results[0].masks is None:
                         return
                     ann_polys = []
                     poly_sources = []
+                    poly_cls = [] if input_classes is not None else None
                     kept_indices = []
                     for i, seg in enumerate(result_clean_polys(sam_results[0])):
                         if seg is not None and len(seg) >= 3:
                             ann_polys.append(seg)
                             poly_sources.append(input_sources[i]
                                                 if i < len(input_sources) else 'detector')
+                            if poly_cls is not None:
+                                poly_cls.append(input_classes[i]
+                                                if i < len(input_classes) else 0)
                             kept_indices.append(i)
                     # Shrink live_boxes/sources to only the kept ones so the
                     # next regenerate sees the right manual set.
                     self.live_boxes       = [input_boxes[i]   for i in kept_indices]
                     self.live_box_sources = [input_sources[i] for i in kept_indices]
+                    if input_classes is not None:
+                        self.live_box_classes = self._norm_cls_list(
+                            [input_classes[i] for i in kept_indices])
                 self.live_polys_cache = ann_polys
 
                 masks_overlay = img.copy()
                 if sam_results is not None:
+                    # Masks are index-aligned with the boxes fed to the segmenter,
+                    # so each one takes its own box's class color.
                     masks = adjust_masks(sam_results)
-                    for mask_i in masks:
+                    for i, mask_i in enumerate(masks):
+                        cls = (input_classes[i] if input_classes is not None
+                               and i < len(input_classes) else 0)
                         masks_overlay = overlay_with_borders(masks_overlay, mask_i,
-                                                             color=(255, 0, 255), thickness=2)
+                                                             color=class_color_bgr(cls),
+                                                             thickness=2)
                 else:
                     # Render polygons by hand from cache.
-                    for poly in ann_polys:
+                    for i, poly in enumerate(ann_polys):
+                        cls = poly_cls[i] if poly_cls is not None and i < len(poly_cls) else 0
                         pts = np.array([[int(x * w), int(y * h)] for x, y in poly], dtype=np.int32)
-                        cv2.drawContours(masks_overlay, [pts], -1, (255, 0, 255), 2)
+                        cv2.drawContours(masks_overlay, [pts], -1, class_color_bgr(cls), 2)
 
                 # poly_sources was built above (in lockstep with kept SAM masks).
                 self.image_label.set_clean_image(img)
                 # Only annotation_boxes get promoted; prompt_boxes (yellow)
                 # are user prompts that persist across mode switches.
                 self.image_label.annotation_boxes = []
-                self.image_label.set_annotations(polys=ann_polys, poly_sources=poly_sources)
+                self.image_label.set_annotations(polys=ann_polys, poly_sources=poly_sources,
+                                                 poly_cls=poly_cls)
                 # Re-bake from the full annotation set (set_annotations carried the
                 # sticky SAM masks) so the user's hand-authored masks render here
                 # too, not just the freshly-segmented detector masks.
@@ -4623,11 +6485,13 @@ class ManualWindow(QtWidgets.QWidget):
                 self.baked_seg_cv2 = baked.copy()
                 self.current_mode = "seg"
                 self._refresh_mask_draw_enabled()
-                # Persist mask file for the current edited box set.
+                # Persist mask file for the current edited box set. `input_classes`
+                # (not the post-skip poly_cls) is what lines up with the raw mask
+                # order save_polys_yolo walks, degenerate polys included.
                 if self.output_folder and sam_results is not None:
                     seg_dir = os.path.join(self.output_folder, 'segments')
                     os.makedirs(seg_dir, exist_ok=True)
-                    save_masks(sam_results, seg_dir, image_path)
+                    save_masks(sam_results, seg_dir, image_path, classes=input_classes)
             except Exception as e:
                 import traceback
                 print(traceback.format_exc())
@@ -4654,12 +6518,15 @@ class ManualWindow(QtWidgets.QWidget):
                 if self.images:
                     self.images.sort()
                     self.current_image_index = 0
+                    # Negative exemplars belong to the folder they were drawn
+                    # in; a new folder starts with none.
+                    self._neg_box_ref = None
                     # Display the first image.
                     self.display_image(self.images[self.current_image_index])
                     self._update_image_indicator()
 
                     # Check if a prompt is already entered
-                    if self.prompt_mode == "text" and self.prompt_entry.text().strip():
+                    if self.prompt_mode == "text" and self._positive_prompt_text().strip():
                         self.display_predictions()
                 else:
                     # Notify the user if the folder is empty.
@@ -4695,6 +6562,7 @@ class ManualWindow(QtWidgets.QWidget):
         self.current_mode   = None
         self.live_boxes     = []
         self.live_box_sources = []
+        self.live_box_classes = None
         self.live_polys_cache = None
         # Per-image reject list; deletions on the previous image must not
         # suppress detections on this one.
@@ -4737,6 +6605,17 @@ class ManualWindow(QtWidgets.QWidget):
                  (cx + w / 2) * ow, (cy + h / 2) * oh]
                 for cx, cy, w, h in anchor]
 
+    def _carry_anchor_cls_list(self):
+        """Class ids parallel to _carry_anchor_boxes_img(), so a carried
+        multi-class box prompt keeps its classes on every later image. Empty
+        when the anchor is empty; all-zeros for an anchor frozen before classes
+        were recorded."""
+        anchor = getattr(self, "_carry_anchor", None) or []
+        cls = list(getattr(self, "_carry_anchor_cls", None) or [])
+        if len(cls) != len(anchor):
+            return [0] * len(anchor)
+        return [int(c or 0) for c in cls]
+
     def _refresh_and_get_carry_anchor(self):
         """Frozen carry-forward exemplar set as normalized [cx, cy, w, h].
 
@@ -4747,20 +6626,25 @@ class ManualWindow(QtWidgets.QWidget):
         anchor every image (quality degradation). Rect-only + the frozen
         self._carry_anchor fallback keeps it stable yet still re-anchors on a
         genuine new user draw, and survives a Regenerate that re-tags the
-        boxes as detector output."""
+        boxes as detector output.
+
+        The per-box class ids are frozen alongside, in self._carry_anchor_cls."""
         ow = self.image_label._orig_w
         oh = self.image_label._orig_h
-        manual = []
+        manual, manual_cls = [], []
         if ow and oh:
-            for x1, y1, x2, y2 in self.image_label.get_prompt_boxes_in_image_coords():
+            boxes, cls = self.image_label.get_prompt_boxes_with_cls_in_image_coords()
+            for (x1, y1, x2, y2), c in zip(boxes, cls):
                 manual.append([
                     ((x1 + x2) / 2) / ow,
                     ((y1 + y2) / 2) / oh,
                     abs(x2 - x1) / ow,
                     abs(y2 - y1) / oh,
                 ])
+                manual_cls.append(int(c or 0))
         if manual:
             self._carry_anchor = manual
+            self._carry_anchor_cls = manual_cls
             return list(manual)
         return list(getattr(self, "_carry_anchor", []) or [])
 
@@ -4780,6 +6664,8 @@ class ManualWindow(QtWidgets.QWidget):
         self._carry_prompt_img = []
         self._carry_ref_bundle = None
         self._carry_anchor = []
+        self._carry_anchor_cls = []
+        self._neg_box_ref = None
         self.image_label.clear_all()
         self.image_label.set_clean_image(np.zeros((10, 10, 3), dtype=np.uint8))
         self._update_image_indicator()
@@ -4855,16 +6741,149 @@ class ManualWindow(QtWidgets.QWidget):
         # Run predictions for the new image.
         self.display_predictions()
 
+    def previous_image(self):
+        """Go back one image WITHOUT re-running the model. The previous
+        image's annotations are reloaded from its saved label files exactly
+        as the user left them, so trimmed/edited results are never clobbered
+        by fresh detector output. Works everywhere except the first image
+        (nothing before it) and a finished folder (deselected by
+        _finish_folder, same as before)."""
+        if getattr(self, "_busy", False):
+            return
+        if not self.images:
+            message_box = QtWidgets.QMessageBox()
+            message_box.setStyleSheet("QLabel { color: black; font-size: 24px; } QMessageBox { background-color: white; }")
+            message_box.setText("No images loaded.")
+            message_box.exec_()
+            return
+        if self.current_image_index <= 0:
+            message_box = QtWidgets.QMessageBox()
+            message_box.setStyleSheet("QLabel { color: black; font-size: 24px; } QMessageBox { background-color: white; }")
+            message_box.setText("Already at the first image.")
+            message_box.exec_()
+            return
+        # Going back would drop an in-progress semi-auto mask, so confirm first.
+        if not self._confirm_leave_unfinished("to the previous image"):
+            return
+        # Save the current image the same way Next Image does, so nothing on
+        # the canvas is lost by navigating away.
+        self._persist_annotations(silent=True)
+        # Carry state (_carry_anchor / _carry_prompt_img / _carry_ref_bundle)
+        # is deliberately untouched: back navigation is review, not prompting.
+        self.current_image_index -= 1
+        image_path = self.images[self.current_image_index]
+        self.display_image(image_path)
+        self._update_image_indicator()
+        # NO display_predictions() here: restore from disk instead.
+        self._restore_saved_annotations(image_path)
+
+    def _restore_saved_annotations(self, image_path):
+        """Install the saved label files for `image_path` back onto the canvas
+        as 'restored' annotations (rendered like detector output, lose to
+        manual in dedup, never re-fed as prompts). No model call. An image
+        with no saved labels just shows an empty canvas."""
+        if not self.output_folder:
+            return
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        box_path = os.path.join(self.output_folder, 'boxes', f'{stem}.txt')
+        seg_path = os.path.join(self.output_folder, 'segments', f'{stem}.txt')
+        rects, rect_cls, polys, poly_cls = _parse_saved_labels(box_path, seg_path)
+        if not rects and not polys:
+            return
+        self.image_label.set_annotations(
+            polys=polys, rects=rects,
+            poly_sources=['restored'] * len(polys),
+            rect_sources=['restored'] * len(rects),
+            poly_cls=poly_cls or None, rect_cls=rect_cls or None)
+        # Rebuild live truth from the restored annotations (mirrors
+        # _finalize_additive) so a later Regenerate / mode switch sees them.
+        ow = self.image_label._orig_w or 1
+        oh = self.image_label._orig_h or 1
+        self.live_boxes = []
+        self.live_box_sources = []
+        _cls = []
+        for ann in self.image_label.annotations:
+            if is_input_only(ann) or ann.get('deleted'):
+                continue
+            b = self._ann_bbox_norm(ann)
+            self.live_boxes.append([b[0] * ow, b[1] * oh, b[2] * ow, b[3] * oh])
+            self.live_box_sources.append(ann.get('source', 'detector'))
+            _cls.append(int(ann.get('cls', 0)))
+        self.live_box_classes = self._norm_cls_list(_cls)
+        # Force re-segmentation on a later mode switch instead of trusting a
+        # cache that does not exist for restored annotations.
+        self.live_polys_cache = None
+        # Pick the display mode from what was restored and sync the checkboxes
+        # silently so the UI reflects it without triggering a mode switch.
+        mode = "seg" if polys else "bbox"
+        self.current_mode = mode
+        if hasattr(self, "mask_checkbox") and hasattr(self, "box_checkbox"):
+            self.mask_checkbox.blockSignals(True)
+            self.box_checkbox.blockSignals(True)
+            self.mask_checkbox.setChecked(mode == "seg")
+            self.box_checkbox.setChecked(mode == "bbox")
+            self.mask_checkbox.blockSignals(False)
+            self.box_checkbox.blockSignals(False)
+        if mode == "seg":
+            self.seg_anns = list(self.image_label.annotations)
+        else:
+            self.bbox_anns = list(self.image_label.annotations)
+        self._rebake_overlay()
+        self.image_label.update()
+        print(f"[previous] restored {len(polys)} mask(s) + {len(rects)} box(es) "
+              f"from saved labels for {stem} (no model run)")
+
     def _collect_box_prompt_crops(self):
         """Bundle the CURRENT image's drawn boxes as the carry-forward prompt:
-        the image path, the boxes' xyxy coords in that image, and the cropped
-        pixels. The drawn boxes become the appearance prompt for every remaining
-        image. Falls back to the frozen carry anchor when a prior regenerate
-        consumed the on-screen boxes. Returns None when there are no boxes."""
+        the image path, the boxes' xyxy coords in that image, the cropped pixels,
+        and each box's class id. The drawn boxes become the appearance prompt for
+        every remaining image. Falls back to the frozen carry anchor when a prior
+        regenerate consumed the on-screen boxes. Returns None when there are no
+        boxes.
+
+        'cls' stays aligned with 'crops'/'boxes_xyxy' through the degenerate-crop
+        skip below, so a multi-class visual prompt carries its classes rather
+        than collapsing every carried detection onto the active one."""
         if not getattr(self, "images", None):
             return None
-        boxes = (self.image_label.get_prompt_boxes_in_image_coords()
-                 or self._carry_anchor_boxes_img())
+        boxes, cls = self.image_label.get_prompt_boxes_with_cls_in_image_coords()
+        if not boxes:
+            boxes = self._carry_anchor_boxes_img()
+            cls = self._carry_anchor_cls_list()
+        if not boxes:
+            return None
+        img_path = self.images[self.current_image_index]
+        img = self._imread_cached(img_path)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        crops, clean_boxes, clean_cls = [], [], []
+        for (x1, y1, x2, y2), c in zip(boxes, cls):
+            ix1 = max(0, int(round(min(x1, x2))))
+            iy1 = max(0, int(round(min(y1, y2))))
+            ix2 = min(w, int(round(max(x1, x2))))
+            iy2 = min(h, int(round(max(y1, y2))))
+            if ix2 - ix1 < 2 or iy2 - iy1 < 2:
+                continue
+            crops.append(img[iy1:iy2, ix1:ix2].copy())
+            clean_boxes.append([float(ix1), float(iy1), float(ix2), float(iy2)])
+            clean_cls.append(int(c or 0))
+        if not crops:
+            return None
+        print(f"[carry] using {len(crops)} box crop(s) from "
+              f"{os.path.basename(img_path)} as the one-shot reference "
+              f"({len(set(clean_cls))} class(es))")
+        return {"image_path": img_path, "boxes_xyxy": clean_boxes,
+                "crops": crops, "cls": clean_cls}
+
+    def _collect_neg_box_crops(self):
+        """Bundle the CURRENT image's red NEGATIVE boxes as appearance exemplars
+        (image path + xyxy + cropped pixels), same shape as the carry bundle.
+        Returns None when there are no negative boxes. The result is frozen once
+        per run so the negatives suppress across every image in a batch."""
+        if not getattr(self, "images", None) or not hasattr(self, "image_label"):
+            return None
+        boxes = self.image_label.get_neg_prompt_boxes_in_image_coords()
         if not boxes:
             return None
         img_path = self.images[self.current_image_index]
@@ -4884,9 +6903,89 @@ class ManualWindow(QtWidgets.QWidget):
             clean_boxes.append([float(ix1), float(iy1), float(ix2), float(iy2)])
         if not crops:
             return None
-        print(f"[carry] using {len(crops)} box crop(s) from "
-              f"{os.path.basename(img_path)} as the one-shot reference")
+        print(f"[neg-box] using {len(crops)} negative crop(s) from "
+              f"{os.path.basename(img_path)} to suppress look-alikes")
         return {"image_path": img_path, "boxes_xyxy": clean_boxes, "crops": crops}
+
+    def _refresh_neg_box_ref(self):
+        """Re-freeze the negative-box appearance ref from the canvas. Red boxes
+        live only on the image they were drawn on (navigation clears the
+        canvas), so an empty canvas on a DIFFERENT image keeps the earlier
+        frozen ref suppressing; an empty canvas on the ref's own source image
+        means the user deleted them there, so the ref is cleared. Delete-means-
+        gone, same rule as the positive carry anchor."""
+        fresh = self._collect_neg_box_crops()
+        if fresh is not None:
+            self._neg_box_ref = fresh
+            return
+        old = getattr(self, "_neg_box_ref", None)
+        if old is None:
+            return
+        cur = (self.images[self.current_image_index]
+               if getattr(self, "images", None) else None)
+        if old.get("image_path") == cur:
+            self._neg_box_ref = None
+
+    def _detect_neg_matches(self, image_path, neg, det_thresh, det_key):
+        """Run the negative crops as visual exemplars on `image_path` and return
+        the xyxy boxes where negatives were found. YOLOE detectors use a true
+        refer_image one-shot; SAM3 uses the crop-composite path. Any other
+        detector (e.g. DINO text-only) has no visual path -> no matches."""
+        if det_key in ("yoloe_vis", "yoloe_seg"):
+            model = self._get_model(det_key)
+            visual_prompts = dict(
+                bboxes=np.array(neg["boxes_xyxy"], dtype=np.float32),
+                cls=np.zeros(len(neg["boxes_xyxy"]), dtype=np.int32),
+            )
+            _, results = run_yoloe_vis(
+                model, image_path, visual_prompts,
+                conf=self._yoloe_effective_conf(det_thresh),
+                max_area_frac=self._max_area_frac(), refer_image=neg["image_path"])
+            r = results[0] if results else None
+            if r is None or r.boxes is None:
+                return []
+            return [list(map(float, b)) for b in r.boxes.xyxy.tolist()]
+        if det_key == "sam3_det":
+            # 4-tuple: (boxes, polys, cls_ids, results). Only the boxes matter
+            # here; negatives are one class of their own.
+            ab, _ap, _acls, _res = self._run_sam3_crop_composite(image_path, neg, det_thresh)
+            return list(ab or [])
+        return []
+
+    def _apply_neg_box_suppression(self, image_path, boxes, det_thresh):
+        """Drop positive detections whose appearance matches a red negative box.
+        Runs the frozen negative crops (self._neg_box_ref) as exemplars on THIS
+        image, then removes overlapping positives (and their aligned classes /
+        polys) via suppress_by_neg_boxes. No-op when there are no negatives, no
+        boxes, or the detector has no visual-exemplar path."""
+        if not boxes:
+            return boxes
+        neg = getattr(self, "_neg_box_ref", None)
+        if not neg or not neg.get("crops"):
+            return boxes
+        det_key, _, _ = self._detector_keys_for_pipeline()
+        if det_key not in ("yoloe_vis", "yoloe_seg", "sam3_det"):
+            return boxes
+        try:
+            neg_matches = self._detect_neg_matches(image_path, neg, det_thresh, det_key)
+        except Exception as _e:
+            print(f"[neg-box] suppression pass failed "
+                  f"({type(_e).__name__}: {_e}); skipping")
+            return boxes
+        if not neg_matches:
+            return boxes
+        classes = self._det_classes_aligned
+        polys = self._oneshot_polys_aligned
+        nb, nc, npoly = suppress_by_neg_boxes(
+            boxes, classes if classes is not None else [], polys, neg_matches)
+        if classes is not None:
+            self._det_classes_aligned = nc
+        if polys is not None:
+            self._oneshot_polys_aligned = npoly
+        dropped = len(boxes) - len(nb)
+        if dropped:
+            print(f"[neg-box] suppressed {dropped} detection(s) matching a negative box")
+        return nb
 
     def _batch_chunk_size(self):
         """How many images to DETECT before switching to the SEGMENT pass in a
@@ -4909,6 +7008,19 @@ class ManualWindow(QtWidgets.QWidget):
         carry_on = (hasattr(self, "carry_forward_checkbox")
                     and self.carry_forward_checkbox.isChecked())
         return self.current_image_index if carry_on else self.current_image_index + 1
+
+    def _batch_targets(self):
+        """Image list Auto Annotate Remaining processes: the forward slice from
+        _batch_start_index, plus (when the recycle toggle is ON) the images
+        BEFORE the start appended at the END, so starting a batch halfway
+        through a folder no longer silently omits the earlier images. Their
+        existing label files are overwritten like any other target."""
+        start = self._batch_start_index()
+        targets = self.images[start:]
+        recycle = getattr(self, "recycle_checkbox", None)
+        if recycle is not None and recycle.isChecked():
+            targets = targets + self.images[:start]
+        return targets
 
     def _clear_segment_file(self, image_path, seg_dir):
         """Overwrite this image's segments label with an EMPTY file. Called in a
@@ -5038,13 +7150,22 @@ class ManualWindow(QtWidgets.QWidget):
             self.select_output_folder()
             if not self.output_folder:
                 return
+        # Same gate as the interactive run: an unconfirmed global slider
+        # change blocks the batch until it is applied or reverted.
+        if self._global_sliders_blocked():
+            self._styled_message(
+                "The global sliders were changed but not applied.\n\n"
+                "Press 'Apply to All Classes' or 'Revert' first.",
+                "Class Settings").exec_()
+            return
 
-        # Lock the three bottom-left buttons + set the busy flag so a
-        # second click on Regenerate / Next / Auto Annotate is dropped
-        # while this run is in progress.
+        # Lock the bottom-left buttons + set the busy flag so a second click
+        # on Regenerate / Next / Previous / Auto Annotate is dropped while
+        # this run is in progress.
         _aar_busy_btns = [b for b in (getattr(self, "auto_annotate_btn", None),
                                       getattr(self, "regen_btn", None),
-                                      getattr(self, "next_btn", None)) if b is not None]
+                                      getattr(self, "next_btn", None),
+                                      getattr(self, "prev_btn", None)) if b is not None]
         for _b in _aar_busy_btns:
             _b.setEnabled(False)
         QtWidgets.QApplication.processEvents()
@@ -5054,6 +7175,11 @@ class ManualWindow(QtWidgets.QWidget):
         seg_dir   = os.path.join(self.output_folder, 'segments')
         os.makedirs(boxes_dir, exist_ok=True)
         os.makedirs(seg_dir,   exist_ok=True)
+
+        # Wall clock for the whole run, reported at the end. Started here rather
+        # than at the first detection so it covers model loading too: that is
+        # time the user waits, and it dominates a short folder.
+        run_started = time.perf_counter()
 
         # Static prompt set: the user's drawn boxes from the CURRENT image
         # are reused on every remaining image. Predictable, no compounding
@@ -5069,7 +7195,7 @@ class ManualWindow(QtWidgets.QWidget):
         carried     = [[(cx - w / 2) * ow, (cy - h / 2) * oh,
                         (cx + w / 2) * ow, (cy + h / 2) * oh]
                        for cx, cy, w, h in anchor_norm]
-        prompt      = self.prompt_entry.text() if hasattr(self, 'prompt_entry') else ''
+        prompt      = self._positive_prompt_text()
         det_thresh  = self.confidence_slider.value()  / 100
         mask_thresh = self.box_threshold_slider.value() / 100
         _, seg_key, is_standalone = self._detector_keys_for_pipeline()
@@ -5092,11 +7218,19 @@ class ManualWindow(QtWidgets.QWidget):
         # (prompt) image so the output folder gets N files, not N-1. Logic in
         # _batch_start_index (headless-tested, T46); model-agnostic: the
         # per-image loop below runs whatever pipeline is selected on it too.
-        targets   = self.images[self._batch_start_index():]
+        targets   = self._batch_targets()
         processed = 0
         failed    = []
         review    = []   # images that came back empty (after retry) or failed
         canceled  = False
+
+        # Freeze this image's red negative boxes ONCE so their appearance
+        # suppresses look-alikes on every image in the batch; a ref frozen on
+        # an earlier image is kept when this one has none drawn.
+        self._refresh_neg_box_ref()
+
+        # One classes.txt + color legend per output folder, from this run's classes.
+        self._write_class_key(self._class_names_for_run(prompt))
 
         # Auto Annotate Remaining always overwrites: each per-image
         # save below opens its label/segment files with 'w', so a
@@ -5126,7 +7260,6 @@ class ManualWindow(QtWidgets.QWidget):
         # bbox-only runs keep the simple per-image loop below.
         two_stage = bool(produce_masks and (not is_standalone) and seg_key)
         _chunk = self._batch_chunk_size() if two_stage else len(targets)
-        import time  # per-image timing in the batch logs (to spot slowdown creep)
         n_folder = len(self.images)   # total images in the loaded folder
         n_run    = len(targets)       # images this run will annotate (the remaining ones)
 
@@ -5150,9 +7283,17 @@ class ManualWindow(QtWidgets.QWidget):
                     try:
                         det_boxes, _yoloe, used_det, retried = self._detect_with_retry(
                             image_path, prompt, det_thresh, mask_thresh, carried, ref_bundle)
-                        absolute_boxes, _ = self._combine_with_dedup(list(det_boxes), [], 0.5)
-                        save_boxes_yolo(absolute_boxes, image_path, boxes_dir)
-                        detected[image_path] = absolute_boxes
+                        det_cls = getattr(self, "_det_classes_aligned", None)
+                        if det_cls is not None:
+                            absolute_boxes, _, img_classes = self._combine_with_dedup(
+                                list(det_boxes), [], 0.5, det_classes=det_cls)
+                        else:
+                            absolute_boxes, _ = self._combine_with_dedup(list(det_boxes), [], 0.5)
+                            img_classes = None
+                        save_boxes_yolo(absolute_boxes, image_path, boxes_dir, classes=img_classes)
+                        # Stash classes with the boxes: the segment pass runs
+                        # later, after _det_classes_aligned has been overwritten.
+                        detected[image_path] = (absolute_boxes, img_classes)
                         _rt = f" (retried @ {used_det:.2f})" if retried else ""
                         print(f"[auto-annotate] {os.path.basename(image_path)} "
                               f"({_base + _j + 1}/{n_run} run, {n_folder} in folder): "
@@ -5182,11 +7323,12 @@ class ManualWindow(QtWidgets.QWidget):
                     if progress.wasCanceled():
                         canceled = True
                         break
-                    absolute_boxes = detected.get(image_path)
-                    if absolute_boxes is None:  # detect failed -> already logged
+                    _entry = detected.get(image_path)
+                    if _entry is None:  # detect failed -> already logged
                         done += 1
                         progress.setValue(min(done, len(targets)))
                         continue
+                    absolute_boxes, img_classes = _entry
                     stem = os.path.splitext(os.path.basename(image_path))[0]
                     progress.setLabelText(
                         f"Segmenting {done + 1} of {len(targets)}: "
@@ -5198,7 +7340,8 @@ class ManualWindow(QtWidgets.QWidget):
                         if absolute_boxes:
                             sam_results = self._run_segmenter(image_path, absolute_boxes)
                             if sam_results is not None:
-                                save_masks(sam_results, seg_dir, image_path)
+                                self._cls_sync_check("batch segmenter", absolute_boxes, img_classes)
+                                save_masks(sam_results, seg_dir, image_path, classes=img_classes)
                                 overlay_polys = result_clean_polys(sam_results[0])
                         # No mask this run (0 detections, or segmenter empty)?
                         # Clear any stale segments file so boxes/ and segments/
@@ -5206,7 +7349,8 @@ class ManualWindow(QtWidgets.QWidget):
                         # inconsistent (esp. the carried first/prompt image).
                         if not overlay_polys:
                             self._clear_segment_file(image_path, seg_dir)
-                        self._save_split_overlays(image_path, absolute_boxes, overlay_polys)
+                        self._save_split_overlays(image_path, absolute_boxes, overlay_polys,
+                                                  classes=img_classes)
                         processed += 1
                         print(f"[auto-annotate] {stem} ({processed}/{n_run} done, "
                               f"{n_folder} in folder): segment "
@@ -5245,9 +7389,15 @@ class ManualWindow(QtWidgets.QWidget):
                 try:
                     det_boxes, yoloe_seg_results, used_det, retried = self._detect_with_retry(
                         image_path, prompt, det_thresh, mask_thresh, carried, ref_bundle)
-                    absolute_boxes, _ = self._combine_with_dedup(
-                        list(det_boxes), [], 0.5)
-                    save_boxes_yolo(absolute_boxes, image_path, boxes_dir)
+                    det_cls = getattr(self, "_det_classes_aligned", None)
+                    if det_cls is not None:
+                        absolute_boxes, _, img_classes = self._combine_with_dedup(
+                            list(det_boxes), [], 0.5, det_classes=det_cls)
+                    else:
+                        absolute_boxes, _ = self._combine_with_dedup(
+                            list(det_boxes), [], 0.5)
+                        img_classes = None
+                    save_boxes_yolo(absolute_boxes, image_path, boxes_dir, classes=img_classes)
                     overlay_polys = None
                     if produce_masks and absolute_boxes:
                         if is_standalone:
@@ -5257,11 +7407,12 @@ class ManualWindow(QtWidgets.QWidget):
                             # so segments/ matches boxes/ (no giant leaf masks or dropped-
                             # duplicate detections re-appearing only in the seg view).
                             overlay_polys = list(self._oneshot_polys_aligned or [])
-                            save_polys_yolo(overlay_polys, seg_dir, image_path)
+                            save_polys_yolo(overlay_polys, seg_dir, image_path, classes=img_classes)
                         elif not is_standalone:
                             sam_results = self._run_segmenter(image_path, absolute_boxes)
                             if sam_results is not None:
-                                save_masks(sam_results, seg_dir, image_path)
+                                self._cls_sync_check("batch segmenter", absolute_boxes, img_classes)
+                                save_masks(sam_results, seg_dir, image_path, classes=img_classes)
                                 overlay_polys = result_clean_polys(sam_results[0])
                     # Mask run but no mask produced? Clear any stale segments
                     # file so boxes/ and segments/ stay in lockstep (bbox-only
@@ -5272,7 +7423,8 @@ class ManualWindow(QtWidgets.QWidget):
                     # always renders (bbox-only runs still produce a useful
                     # reference); the masks view only renders when polys
                     # exist.
-                    self._save_split_overlays(image_path, absolute_boxes, overlay_polys)
+                    self._save_split_overlays(image_path, absolute_boxes, overlay_polys,
+                                              classes=img_classes)
                     processed += 1
                     _rt = f" (retried @ {used_det:.2f})" if retried else ""
                     print(f"[auto-annotate] {stem} ({processed}/{n_run} done, "
@@ -5307,9 +7459,20 @@ class ManualWindow(QtWidgets.QWidget):
         progress.setValue(len(targets))
         progress.close()
 
+        elapsed = time.perf_counter() - run_started
+
         review_dir = self._finalize_review(review, self.output_folder)
         empties = [r for r in review if r.get("status") == "empty"]
         parts = [f"Processed: {processed}"]
+        # Total time, plus the per-image average: the average is what transfers
+        # to the next run at similar settings, which is the number to plan with.
+        timing = f"Time taken: {format_duration(elapsed)}"
+        if processed:
+            timing += f"  ({format_duration(elapsed / processed)} per image)"
+        parts.append(timing)
+        print(f"[auto-annotate] finished {processed} image(s) in "
+              f"{format_duration(elapsed)}"
+              + (f", {format_duration(elapsed / processed)} per image" if processed else ""))
         if canceled:
             parts.insert(0, "Run canceled before finishing.")
         if failed:

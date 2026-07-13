@@ -10,6 +10,7 @@ import cv2
 import torch
 from groundingdino.util.inference import load_model, load_image, predict
 
+from ..imageio import imread_unicode
 from .labels import save_masks
 from .sam import load_sam
 
@@ -44,12 +45,30 @@ def load_dino_model(model_size='swint'):
 # forward pass per image just to print raw scores, which DOUBLES inference time.
 DINO_SCORE_DIAGNOSTICS = False
 
-def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, maxarea=0.7, save_dir=None):
+def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, maxarea=0.7, save_dir=None,
+                        class_names=None, return_classes=False, return_scores=False):
     # Default label dir is anchored to BASE_DIR (not the working directory)
     # so the app and the optimizer agree on it no matter where it launched.
+    # `class_names` (optional) is the ordered class list parsed from the
+    # prompt; with `return_classes=True` the return value becomes
+    # (absolute_boxes, cls_ids) with cls_ids aligned to the boxes. The default
+    # single-value return is unchanged for existing callers.
+    # `return_scores=True` appends the per-box confidence scores, aligned the
+    # same way, so the caller can re-filter per class after a pass that ran at
+    # the loosest class threshold.
     if save_dir is None:
         save_dir = os.path.join(BASE_DIR, "DINO-labels")
         os.makedirs(save_dir, exist_ok=True)
+    # Read the image FIRST. load_image() raises on a corrupt/missing/unsupported
+    # file, which would kill the whole batch, so the skip-and-continue fallback
+    # has to be reachable before it runs. The decoded array is kept for the
+    # dimensions further down rather than decoding the same file a second time.
+    _img = imread_unicode(img_path)
+    if _img is None:
+        print(f"[DINO] {os.path.basename(img_path)}: cv2 could not read the image "
+              f"(corrupt/unsupported format); skipping it.")
+        empty = [[]] * (1 + int(return_classes) + int(return_scores))
+        return tuple(empty) if len(empty) > 1 else []
     image_source, image = load_image(img_path)
 
     # GroundingDINO expects a lowercase, period-terminated caption. Passing
@@ -82,7 +101,29 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
     # phrase must not nuke a valid box).
     prompt_tokens = set(re.findall(r'[a-z0-9]+', caption))
     multi_concept = len(prompt_tokens) > 1
+
+    # Per-class token sets for multi-class prompts: each kept box is assigned
+    # the class whose name tokens overlap its matched phrase the most (tie ->
+    # lowest class index; no overlap -> class 0). With class_names omitted or
+    # a single class, everything maps to 0, exactly the old behavior.
+    cls_tokens = None
+    if class_names:
+        cls_tokens = [set(re.findall(r'[a-z0-9]+', (n or '').strip().lower()))
+                      for n in class_names]
+
+    def _classify(ph_tokens):
+        if not cls_tokens:
+            return 0
+        best_j, best_overlap = 0, 0
+        for j, toks in enumerate(cls_tokens):
+            overlap = len(ph_tokens & toks)
+            if overlap > best_overlap:
+                best_j, best_overlap = j, overlap
+        return best_j
+
     keep_idx = []
+    keep_cls = []
+    keep_scores = []
     for i, ph in enumerate(obj_name):
         ph_tokens = set(re.findall(r'[a-z0-9]+', (ph or '').strip().lower()))
         if not ph_tokens:
@@ -90,6 +131,11 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
         if multi_concept and not (ph_tokens & prompt_tokens):
             continue
         keep_idx.append(i)
+        keep_cls.append(_classify(ph_tokens))
+        try:
+            keep_scores.append(float(accuracy[i]))
+        except (TypeError, ValueError, IndexError):
+            keep_scores.append(None)
     dropped = len(obj_name) - len(keep_idx)
     if dropped and AUTOANNOTATE_DEBUG:
         print(f"[DINO-FILTER] {os.path.basename(img_path)}: dropped {dropped} "
@@ -97,13 +143,14 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
     boxes = boxes[keep_idx] if keep_idx else boxes[0:0]
 
     #Convert boxes from YOLOv8 format to xyxy
-    _img = cv2.imread(img_path)
-    if _img is None:
-        print(f"[DINO] {os.path.basename(img_path)}: cv2 could not read the image "
-              f"(corrupt/unsupported format); skipping it.")
-        return []
     img_height, img_width = _img.shape[:2]
-    clean_boxes = clean_labels(boxes, maxarea)
+    # Area filter by kept INDEX (not clean_labels, which rebuilds the tensor
+    # without saying which rows survived) so cls_ids shrinks in lockstep.
+    box_list = boxes.tolist()
+    area_keep = [i for i, b in enumerate(box_list) if (b[2] * b[3]) < maxarea]
+    clean_boxes = torch.FloatTensor([box_list[i] for i in area_keep]) if area_keep else boxes[0:0]
+    cls_ids = [keep_cls[i] for i in area_keep] if keep_cls else []
+    det_scores = [keep_scores[i] for i in area_keep] if keep_scores else []
     absolute_boxes = [[(box[0]-(box[2]/2))*img_width,
                        (box[1]-(box[3]/2))*img_height,
                        (box[0]+(box[2]/2))*img_width,
@@ -135,6 +182,7 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
                 top = sorted(scores, reverse=True)[:5]
                 # Same phrase filter as the main pass, plus the rescue floor.
                 rescued = []
+                rescued_cls = []
                 for i, sc in enumerate(scores):
                     if sc < RESCUE_FLOOR:
                         continue
@@ -145,8 +193,14 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
                     if multi_concept and not (ph_tokens & prompt_tokens):
                         continue
                     rescued.append(i)
+                    rescued_cls.append(_classify(ph_tokens))
                 if rescue_on and rescued:
-                    clean_boxes = clean_labels(_b[rescued], maxarea)
+                    r_list = _b[rescued].tolist()
+                    r_keep = [i for i, b in enumerate(r_list) if (b[2] * b[3]) < maxarea]
+                    clean_boxes = (torch.FloatTensor([r_list[i] for i in r_keep])
+                                   if r_keep else _b[0:0])
+                    cls_ids = [rescued_cls[i] for i in r_keep]
+                    det_scores = [scores[rescued[i]] for i in r_keep]
                     absolute_boxes = [[(box[0]-(box[2]/2))*img_width,
                                        (box[1]-(box[3]/2))*img_height,
                                        (box[0]+(box[2]/2))*img_width,
@@ -173,11 +227,21 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
     save_labels = True
     if save_labels:
         clean_boxes = clean_boxes.tolist()
-        for x in clean_boxes:
-            x.insert(0,0)
+        for i, x in enumerate(clean_boxes):
+            x.insert(0, cls_ids[i] if i < len(cls_ids) else 0)
         with open(f'{save_dir}/{os.path.splitext(os.path.basename(img_path))[0]}.txt', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile, delimiter=' ')
             writer.writerows(clean_boxes)
+    if return_scores and len(det_scores) != len(absolute_boxes):
+        det_scores = [None] * len(absolute_boxes)
+    if return_classes:
+        if len(cls_ids) != len(absolute_boxes):
+            cls_ids = [0] * len(absolute_boxes)
+        if return_scores:
+            return absolute_boxes, cls_ids, det_scores
+        return absolute_boxes, cls_ids
+    if return_scores:
+        return absolute_boxes, det_scores
     return absolute_boxes
 
 def run_image(DINO, img_dir, output_dir, prompt, conf, box_threshold, save_dir):

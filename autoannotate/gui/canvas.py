@@ -2,7 +2,9 @@
 import cv2
 from PyQt5 import QtWidgets, QtGui, QtCore
 
+from . import session_state
 from .spatial import SpatialGrid
+from .style import class_color_qt
 
 class AnnotationCanvas(QtWidgets.QWidget):
     """
@@ -60,7 +62,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
         self._pan_x        = 0.0
         self._pan_y        = 0.0
         self._resize_mode  = False
-        self._pan_last     = None   # last mouse pos during a pan drag
         # Darken Tint: view-only dimming overlay (set via the Image Resize
         # dropdown). Pure paint-time effect, never baked or saved.
         self._dark_tint    = False
@@ -76,6 +77,10 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # boxes (source='prompt', never saved); 'annotation' => saved manual
         # rects (source='manual'). Set by ManualWindow.set_draw_subject().
         self.draw_subject = 'annotation'
+        # Class id stamped onto each new drawn rect so multi-class box prompts
+        # (and manual boxes) remember which class they are. ManualWindow keeps
+        # this in sync with its active-class picker via set_active_draw_cls().
+        self.active_draw_cls = 0
         # Interactive SAM mask drawing (seg view + SAM model only). Points are
         # stored in ABSOLUTE image coords as [x, y, 1] (all foreground);
         # _mask_preview_poly is the live SAM mask (normalized 0-1 [[x,y],...])
@@ -492,10 +497,12 @@ class AnnotationCanvas(QtWidgets.QWidget):
         return (float(ix), float(iy))
 
     def set_draw_subject(self, subject):
-        """Choose what a new drag creates: 'prompt' (input-only yellow prompt
-        box, source='prompt', never saved) or 'annotation' (saved manual rect,
-        source='manual'). Driven by ManualWindow._refresh_draw_subject()."""
-        self.draw_subject = 'prompt' if subject == 'prompt' else 'annotation'
+        """Choose what a new drag creates: 'prompt' (input-only class-colored
+        prompt box, source='prompt'), 'neg_prompt' (input-only RED negative
+        prompt box, source='neg_prompt') or 'annotation' (saved manual rect,
+        source='manual'). All input-only boxes are never saved. Driven by
+        ManualWindow._refresh_draw_subject()."""
+        self.draw_subject = subject if subject in ('prompt', 'neg_prompt') else 'annotation'
 
     def reclassify_user_rects(self, to_prompt):
         """Re-tag boxes the user already drew so they match the bucket new draws
@@ -639,28 +646,38 @@ class AnnotationCanvas(QtWidgets.QWidget):
         return self._bbox_iou(self._ann_bbox_norm_xyxy(a),
                               self._ann_bbox_norm_xyxy(b)) > self._DUP_BOX_IOU
 
-    def set_annotations(self, polys=None, rects=None, poly_sources=None, rect_sources=None):
+    def set_annotations(self, polys=None, rects=None, poly_sources=None, rect_sources=None,
+                        poly_cls=None, rect_cls=None):
         """Replace all annotations. `poly_sources[i]` / `rect_sources[i]` is
         'detector' or 'manual'; both default to 'detector' when omitted.
         The source decides outline color in edit mode and lets manual draws
-        survive across regenerate calls."""
+        survive across regenerate calls. `poly_cls[i]` / `rect_cls[i]` are
+        optional per-annotation class ids; when omitted the 'cls' key is left
+        absent and readers fall back to 0 as before."""
         anns = []
         if polys:
             for i, poly in enumerate(polys):
                 if len(poly) >= 3:
                     src_tag = (poly_sources[i] if poly_sources and i < len(poly_sources) else 'detector')
-                    anns.append({'type': 'poly', 'data': [list(p) for p in poly],
-                                 'deleted': False, 'source': src_tag})
+                    ann = {'type': 'poly', 'data': [list(p) for p in poly],
+                           'deleted': False, 'source': src_tag}
+                    if poly_cls is not None and i < len(poly_cls):
+                        ann['cls'] = int(poly_cls[i])
+                    anns.append(ann)
         if rects:
             for i, rect in enumerate(rects):
                 src_tag = (rect_sources[i] if rect_sources and i < len(rect_sources) else 'detector')
-                anns.append({'type': 'rect', 'data': list(rect),
-                             'deleted': False, 'source': src_tag})
-        # Input-only prompt boxes are NOT part of the replaceable annotation
-        # set -- carry the existing ones over so they survive every Regenerate /
-        # mode switch / detector run that rebuilds annotations.
+                ann = {'type': 'rect', 'data': list(rect),
+                       'deleted': False, 'source': src_tag}
+                if rect_cls is not None and i < len(rect_cls):
+                    ann['cls'] = int(rect_cls[i])
+                anns.append(ann)
+        # Input-only prompt boxes (positive AND negative) are NOT part of the
+        # replaceable annotation set -- carry the existing ones over so they
+        # survive every Regenerate / mode switch / detector run that rebuilds
+        # annotations.
         prompts = [dict(a) for a in self.annotations
-                   if a.get('source') == 'prompt' and not a.get('deleted')]
+                   if a.get('source') in ('prompt', 'neg_prompt') and not a.get('deleted')]
         # Semi-auto / auto-draw SAM masks (poly, semiauto=True) are sticky: the
         # user authored them point-by-point, so a segmenter re-run / mode switch
         # must NEVER re-segment or drop them. Carry the full dicts (data,
@@ -708,7 +725,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
 
     def load_annotation_state(self, state):
         prompts = [dict(a) for a in self.annotations
-                   if a.get('source') == 'prompt' and not a.get('deleted')]
+                   if a.get('source') in ('prompt', 'neg_prompt') and not a.get('deleted')]
         self.annotations = [dict(a) for a in state] + prompts
         self.selected_index = None
         self.selected_indices = set()
@@ -724,10 +741,11 @@ class AnnotationCanvas(QtWidgets.QWidget):
         return [a for a in self.annotations if not a['deleted']]
 
     def get_saveable_annotations(self):
-        """Active annotations minus input-only prompt boxes (source='prompt'),
-        which are never written to label files or baked into saved images."""
+        """Active annotations minus input-only prompt boxes (positive 'prompt'
+        and negative 'neg_prompt'), which are never written to label files or
+        baked into saved images."""
         return [a for a in self.annotations
-                if not a['deleted'] and a.get('source') != 'prompt']
+                if not a['deleted'] and a.get('source') not in ('prompt', 'neg_prompt')]
 
     _UNDO_MAX = 50
 
@@ -827,14 +845,54 @@ class AnnotationCanvas(QtWidgets.QWidget):
             out.append([x1, y1, x2, y2])
         return out
 
+    def set_active_draw_cls(self, cls):
+        """Set the class id stamped onto newly drawn rects (multi-class box
+        prompts / manual boxes). Driven by ManualWindow's active-class picker."""
+        self.active_draw_cls = int(cls or 0)
+
     def get_prompt_boxes_in_image_coords(self):
         """Input-only prompt boxes (source='prompt') used as detector prompts."""
         return self._drawn_boxes_image_coords('prompt')
+
+    def get_prompt_boxes_with_cls_in_image_coords(self):
+        """Prompt boxes as (boxes_xyxy, cls_ids), parallel lists, in image
+        coords. cls_ids come from each box's stored class so multi-class box
+        prompts feed the detector with a real per-box class array (default 0)."""
+        return self._input_boxes_with_cls('prompt')
+
+    def get_neg_prompt_boxes_in_image_coords(self):
+        """Input-only NEGATIVE prompt boxes (source='neg_prompt') in image
+        coords. One red type; used as appearance exemplars to suppress matches."""
+        return self._input_boxes_with_cls('neg_prompt')[0]
+
+    def _input_boxes_with_cls(self, source):
+        """Shared: (boxes_xyxy, cls_ids) for a given input-only rect source."""
+        if not self._orig_w:
+            return [], []
+        boxes, cls = [], []
+        for a in self.annotations:
+            if a.get('deleted') or a.get('source') != source or a.get('type') != 'rect':
+                continue
+            cxn, cyn, wn, hn = a['data']
+            x1 = (cxn - wn / 2) * self._orig_w
+            y1 = (cyn - hn / 2) * self._orig_h
+            x2 = (cxn + wn / 2) * self._orig_w
+            y2 = (cyn + hn / 2) * self._orig_h
+            boxes.append([x1, y1, x2, y2])
+            cls.append(int(a.get('cls', 0) or 0))
+        return boxes, cls
 
     def get_annotation_boxes_in_image_coords(self):
         """Drawn boxes saved as final annotations. Same set as prompts, a
         drawn box serves both roles."""
         return self._drawn_boxes_image_coords()
+
+    def get_boxes_with_cls_in_image_coords(self):
+        """Manually drawn boxes as (boxes_xyxy, cls_ids), parallel lists, in
+        image coords. The manual-draw counterpart of
+        get_prompt_boxes_with_cls_in_image_coords, so a hand-drawn box keeps the
+        class it was drawn as when it is segmented and saved."""
+        return self._input_boxes_with_cls('manual')
 
     def get_boxes_in_image_coords(self):
         """LEGACY alias for callers that haven't migrated."""
@@ -906,37 +964,49 @@ class AnnotationCanvas(QtWidgets.QWidget):
         """LEGACY: rect-only manual boxes. Prefer get_manual_anns_as_boxes_in_image_coords."""
         return [b for b, s in self.get_active_rects_with_sources() if s == 'manual']
 
-    def get_manual_anns_as_boxes_in_image_coords(self):
-        """Absolute xyxy of every non-deleted manual annotation, REGARDLESS of
+    def get_manual_anns_as_boxes_with_classes_in_image_coords(self):
+        """(xyxy, cls) for every non-deleted manual annotation, REGARDLESS of
         underlying type. For rect anns, the rect itself; for poly anns, the
         polygon's bounding box.
 
         This is the helper to use for carry-forward on regenerate, because in
         seg mode prior-iteration manual draws are stored as polygons (SAM's
         mask of the user's box), not as rects. The rect-only variant misses
-        those and silently drops the user's earlier draws."""
+        those and silently drops the user's earlier draws.
+
+        Each box carries the class it was DRAWN as. Callers must not re-tag them
+        with the currently-selected class: the user can draw class A, switch the
+        dropdown to class B, and regenerate, and their class-A boxes have to
+        stay class A.
+        """
         if not self._orig_w:
             return []
         out = []
         for ann in self.annotations:
             if ann['deleted'] or ann.get('source') != 'manual':
                 continue
+            cls = int(ann.get('cls', 0))
             if ann['type'] == 'rect':
                 cx, cy, w, h = ann['data']
-                out.append([
+                out.append(([
                     (cx - w / 2) * self._orig_w,
                     (cy - h / 2) * self._orig_h,
                     (cx + w / 2) * self._orig_w,
                     (cy + h / 2) * self._orig_h,
-                ])
+                ], cls))
             elif ann['type'] == 'poly':
                 xs = [p[0] for p in ann['data']]
                 ys = [p[1] for p in ann['data']]
-                out.append([
+                out.append(([
                     min(xs) * self._orig_w, min(ys) * self._orig_h,
                     max(xs) * self._orig_w, max(ys) * self._orig_h,
-                ])
+                ], cls))
         return out
+
+    def get_manual_anns_as_boxes_in_image_coords(self):
+        """Boxes only, same order as the with-classes variant it delegates to."""
+        return [b for b, _ in
+                self.get_manual_anns_as_boxes_with_classes_in_image_coords()]
 
     def get_active_polys_with_sources(self):
         """Returns (poly, source) tuples for non-deleted poly annotations."""
@@ -960,14 +1030,12 @@ class AnnotationCanvas(QtWidgets.QWidget):
 
     # Zoom / pan (Image Resize mode)
     def set_resize_mode(self, enabled):
-        """Enable scroll/pinch-to-zoom + drag-to-pan. The zoom/pan it produces
-        PERSISTS after the mode is turned off, so the user can draw/edit on the
-        zoomed view; only reset_view() (Save & Confirm / new image) returns to
-        fit."""
+        """Arm scroll-to-pan, pinch / Ctrl+wheel zoom. The left button keeps
+        DRAWING and editing even while the mode is on (every coordinate routes
+        through _get_scale_offset, so a zoomed draw lands exactly where it
+        looks). The zoom/pan PERSISTS after the mode is turned off; only
+        reset_view() (Save & Confirm / new image) returns to fit."""
         self._resize_mode = bool(enabled)
-        self._pan_last = None
-        self.setCursor(QtCore.Qt.OpenHandCursor if enabled
-                       else QtCore.Qt.ArrowCursor)
 
     def reset_view(self):
         """Return to fit-to-window (zoom 1.0, no pan)."""
@@ -1025,12 +1093,29 @@ class AnnotationCanvas(QtWidgets.QWidget):
         if not self._resize_mode or not self._orig_w:
             super().wheelEvent(event)
             return
-        dy = event.angleDelta().y()
-        if dy == 0:
+        # Scroll PANS and Ctrl/Cmd+scroll zooms (pinch also zooms, in event()),
+        # so the left button stays free for drawing on the zoomed view. The
+        # Trackpad/Mouse scheme decides how Shift and the axes read.
+        mods = event.modifiers()
+        pd = event.pixelDelta()
+        dx, dy = pd.x(), pd.y()
+        if dx == 0 and dy == 0:
+            ad = event.angleDelta()
+            dx, dy = ad.x() / 2.0, ad.y() / 2.0
+        action = session_state.classify_wheel(
+            session_state.input_scheme(), dx, dy,
+            ctrl=bool(mods & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier)),
+            shift=bool(mods & QtCore.Qt.ShiftModifier))
+        if action is None:
             return
-        factor = 1.0015 ** dy   # smooth, direction-aware
-        pos = event.pos()
-        self._zoom_at(factor, pos.x(), pos.y())
+        if action[0] == "zoom":
+            pos = event.pos()
+            self._zoom_at(1.0015 ** action[1], pos.x(), pos.y())
+        else:
+            self._pan_x += action[1]
+            self._pan_y += action[2]
+            self._clamp_view()
+            self.update()
         event.accept()
 
     def event(self, e):
@@ -1378,9 +1463,9 @@ class AnnotationCanvas(QtWidgets.QWidget):
         #               + commits only when the outline is CLOSED (click the
         #               first point again / double-click / Enter), Google-Draw
         #               curve-tool style.
-        # Right-click removes the nearest point. While Image Resize is on, drawing
-        # is suspended (the click pans instead) but the session is preserved.
-        if self.mask_draw_mode and self._orig_w and not self._resize_mode:
+        # Right-click removes the nearest point. Image Resize does not suspend
+        # this: panning is on the scroll wheel, so clicks stay meaningful.
+        if self.mask_draw_mode and self._orig_w:
             if event.button() == QtCore.Qt.RightButton:
                 hit = self._hit_mask_point(event.pos())
                 if hit is not None:
@@ -1414,7 +1499,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
             return
         # Edit-Semi-Auto-Segments: click to select a committed mask, then edit
         # either its SAM points (live re-run) or its polygon vertices (manual).
-        if self.semiauto_edit_mode and self._orig_w and not self._resize_mode \
+        if self.semiauto_edit_mode and self._orig_w \
                 and event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
             if self._semiauto_sel_idx is None:
                 if event.button() == QtCore.Qt.LeftButton:
@@ -1480,13 +1565,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
                     self._mask_points.append([p[0], p[1], 1])
                     self.mask_point_added.emit()
                     self.update()
-            return
-        # Image Resize mode: left-drag pans the (possibly zoomed) image and
-        # consumes the gesture before any draw/edit/marquee logic.
-        if self._resize_mode and event.button() == QtCore.Qt.LeftButton:
-            self._pan_last = event.pos()
-            self.setCursor(QtCore.Qt.ClosedHandCursor)
-            event.accept()
             return
         if event.button() == QtCore.Qt.LeftButton:
             # Edit mode gets first crack at the click. It only consumes the click
@@ -1622,7 +1700,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # first point). The double-click's second press already appended a point
         # at the same spot, so drop that duplicate before closing.
         if self.mask_draw_mode and self._mask_draw_kind == "semiauto" \
-                and event.button() == QtCore.Qt.LeftButton and not self._resize_mode:
+                and event.button() == QtCore.Qt.LeftButton:
             if len(self._mask_points) >= 2 and self._mask_points[-1] == self._mask_points[-2]:
                 self._mask_points.pop()
             if len(self._mask_points) >= 3:
@@ -1636,7 +1714,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
         if (self.semiauto_edit_mode
                 and self._semiauto_edit_target == "vertices"
                 and self._semiauto_sel_idx is not None
-                and not self._resize_mode
                 and event.button() == QtCore.Qt.LeftButton):
             hit_v = self._hit_vertex(event.pos())
             if hit_v is not None:
@@ -1657,7 +1734,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # Semi-auto drawing: track the cursor so paintEvent can draw a rubber-band
         # line from the last placed point to the cursor (Google-Draw style).
         if self.mask_draw_mode and self._mask_draw_kind == "semiauto" \
-                and self._mask_points and not self._resize_mode:
+                and self._mask_points:
             self._mask_cursor = event.pos()
             self.update()
             return
@@ -1685,7 +1762,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # Vertex-edit hover: show a "+" ghost on the outline where a click would
         # add a vertex (cleared when hovering directly over an existing vertex).
         if self.semiauto_edit_mode and self._semiauto_sel_idx is not None \
-                and self._semiauto_edit_target == "vertices" and not self._resize_mode:
+                and self._semiauto_edit_target == "vertices":
             ghost = None
             if self._hit_vertex(event.pos()) is None:
                 near = self._nearest_outline_point(event.pos())
@@ -1695,15 +1772,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
                 self._vertex_ghost = ghost
                 self.update()
             self._apply_hover_cursor(event.pos())
-            return
-        if self._resize_mode:
-            if self._pan_last is not None:
-                d = event.pos() - self._pan_last
-                self._pan_x += d.x()
-                self._pan_y += d.y()
-                self._pan_last = event.pos()
-                self._clamp_view()
-                self.update()
             return
         if self._resize_handle is not None:
             self._update_rect_from_resize(event.pos())
@@ -1737,11 +1805,6 @@ class AnnotationCanvas(QtWidgets.QWidget):
                 and event.button() == QtCore.Qt.LeftButton:
             self._vertex_drag_idx = None   # vertex edits are already live in ann['data']
             self.update()
-            return
-        if self._resize_mode and event.button() == QtCore.Qt.LeftButton:
-            self._pan_last = None
-            self.setCursor(QtCore.Qt.OpenHandCursor)
-            event.accept()
             return
         if self._resize_handle is not None and event.button() == QtCore.Qt.LeftButton:
             self._resize_handle  = None
@@ -1795,11 +1858,14 @@ class AnnotationCanvas(QtWidgets.QWidget):
                     cyn = (iy1 + iy2) / 2 / self._orig_h
                     wn  = (ix2 - ix1) / self._orig_w
                     hn  = (iy2 - iy1) / self._orig_h
+                    _subj = getattr(self, 'draw_subject', 'annotation')
+                    _src = _subj if _subj in ('prompt', 'neg_prompt') else 'manual'
                     self.annotations.append({
                         'type': 'rect',
                         'data': [cxn, cyn, wn, hn],
                         'deleted': False,
-                        'source': 'prompt' if self.draw_subject == 'prompt' else 'manual',
+                        'source': _src,
+                        'cls': int(getattr(self, 'active_draw_cls', 0) or 0),
                     })
                     added = True
             self._drag_start = None
@@ -1832,7 +1898,11 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # Backspace/Delete drops the last point. Enter: semi-auto CLOSES the
         # outline (>=3 points) to segment + commit; autodraw commits the live
         # single-point preview. Falls through to normal handling otherwise.
-        if self.mask_draw_mode and not self._resize_mode:
+        # Not gated on _resize_mode: drawing and editing stay live while zoomed
+        # (see set_resize_mode), so the keys that commit or cancel that drawing
+        # have to stay live with it, or a zoomed-in outline can be started and
+        # then neither closed nor escaped.
+        if self.mask_draw_mode:
             if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
                 if self._mask_draw_kind == "semiauto":
                     if len(self._mask_points) >= 3:
@@ -1853,8 +1923,7 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # Edit-Semi-Auto-Segments: Enter applies the edit to the selected mask;
         # Esc deselects (reverting any vertex edits); S opens per-mask settings;
         # Backspace drops the last SAM point and re-runs (points target only).
-        if self.semiauto_edit_mode and self._semiauto_sel_idx is not None \
-                and not self._resize_mode:
+        if self.semiauto_edit_mode and self._semiauto_sel_idx is not None:
             if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
                 self.semiauto_apply_requested.emit()
                 return
@@ -1944,11 +2013,23 @@ class AnnotationCanvas(QtWidgets.QWidget):
         # with source-aware coloring (green=manual, magenta=detector,
         # cyan=selected) plus resize handles and the delete-X badge.
         if not self.edit_mode:
-            drawn = self._drawn_boxes_image_coords('prompt')
-            if drawn:
-                painter.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0), 2))
-                painter.setBrush(QtCore.Qt.NoBrush)
-                for box in drawn:
+            painter.setBrush(QtCore.Qt.NoBrush)
+            # Positive prompt boxes: dashed, colored by their class so multi-class
+            # box prompts are distinguishable at a glance. The class count is
+            # capped by the palette (style.MAX_BOX_CLASSES), not by this widget.
+            pboxes, pcls = self.get_prompt_boxes_with_cls_in_image_coords()
+            for box, c in zip(pboxes, pcls):
+                wb = self._image_xyxy_to_widget(*box)
+                if wb is None:
+                    continue
+                wx1, wy1, wx2, wy2 = wb
+                painter.setPen(QtGui.QPen(class_color_qt(c), 2, QtCore.Qt.DashLine))
+                painter.drawRect(int(wx1), int(wy1), int(wx2 - wx1), int(wy2 - wy1))
+            # Negative prompt boxes: dashed red (one type, suppresses matches).
+            nboxes = self.get_neg_prompt_boxes_in_image_coords()
+            if nboxes:
+                painter.setPen(QtGui.QPen(QtGui.QColor(200, 60, 60), 2, QtCore.Qt.DashLine))
+                for box in nboxes:
                     wb = self._image_xyxy_to_widget(*box)
                     if wb is None:
                         continue
@@ -1993,17 +2074,21 @@ class AnnotationCanvas(QtWidgets.QWidget):
                 is_selected = (idx == self.selected_index
                                or idx in self.selected_indices)
                 is_primary  = (idx == self.selected_index)
-                # Selected ann = cyan; manual draws = green; detector output = magenta.
-                # Color encodes provenance so the user can tell at a glance which
-                # boxes the model produced vs. which they added by hand.
+                # Selected ann = cyan; manual draws = green; detector output =
+                # its class color (class 0 = the historical magenta). Color
+                # encodes provenance so the user can tell at a glance which
+                # boxes the model produced vs. which they added by hand; with
+                # multi-class prompts each extra class gets its own hue.
                 if is_selected:
                     painter.setPen(QtGui.QPen(QtGui.QColor(0, 220, 255), 3))
+                elif ann.get('source') == 'neg_prompt':
+                    painter.setPen(QtGui.QPen(QtGui.QColor(200, 60, 60), 2, QtCore.Qt.DashLine))
                 elif ann.get('source') == 'prompt':
-                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0), 2))
+                    painter.setPen(QtGui.QPen(class_color_qt(ann.get('cls', 0)), 2, QtCore.Qt.DashLine))
                 elif ann.get('source') == 'manual':
                     painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 100), 2))
                 else:
-                    painter.setPen(QtGui.QPen(QtGui.QColor(200, 0, 200), 2))
+                    painter.setPen(QtGui.QPen(class_color_qt(ann.get('cls', 0)), 2))
                 painter.setBrush(QtCore.Qt.NoBrush)
                 if ann['type'] == 'poly':
                     pts = self._to_label(ann['data'])

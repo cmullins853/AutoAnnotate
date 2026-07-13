@@ -9,8 +9,23 @@ run_app.py, or a future frozen executable.
 import os
 import platform as _platform
 
+from dotenv import load_dotenv
+
 # Silence the huggingface/tokenizers fork warning.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# This file lives at <repo>/autoannotate/config.py, so the repo root is one
+# directory up. The notebook-era cwd walk is gone: modules know where they are.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# .env is loaded HERE, before the device block below, and not further down where
+# it used to sit. load_dotenv does not overwrite a variable that already exists,
+# so the old order lost: the device block ran first, saw no AUTOANNOTATE_SD_DEVICE
+# (because .env had not been read yet), pinned it to "cpu" on macOS, and the
+# AUTOANNOTATE_SD_DEVICE=mps that the user had put in .env could never take
+# effect. .env is the documented place to configure this, so it has to be
+# readable before anything defaults it.
+load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
 # ---------------------------------------------------------------------------
 # PER-OS COMPUTE-DEVICE CONFIG  (review when moving to a new machine)
@@ -43,11 +58,42 @@ if "AUTOANNOTATE_SD_DEVICE" not in os.environ:
         os.environ["AUTOANNOTATE_SD_DEVICE"] = "cpu"
 # ---------------------------------------------------------------------------
 
-from dotenv import load_dotenv
+# Windows: register the CUDA runtime DLL directories. Since Python 3.8,
+# compiled extension modules (.pyd) no longer search PATH for their dependent
+# DLLs, only directories registered via os.add_dll_directory(). Without this,
+# `import groundingdino._C` fails with "DLL load failed" even when CUDA's bin
+# is on PATH, and DINO silently falls back to slow pure-Python deformable
+# attention. No-op on macOS/Linux and on Windows machines without CUDA_PATH.
+# add_dll_directory returns a handle that UNREGISTERS the directory when it is
+# closed, and it closes on garbage collection. Dropping it would remove the
+# search path again before groundingdino._C is ever imported, so the handles are
+# parked here for the lifetime of the process.
+_CUDA_DLL_HANDLES = []
 
-# This file lives at <repo>/autoannotate/config.py, so the repo root is one
-# directory up. The notebook-era cwd walk is gone: modules know where they are.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _platform.system() == "Windows":
+    _cuda_path = os.environ.get("CUDA_PATH", "")
+    if _cuda_path:
+        for _sub in ("bin", os.path.join("bin", "x64")):
+            _dll_dir = os.path.join(_cuda_path, _sub)
+            if os.path.isdir(_dll_dir):
+                try:
+                    _CUDA_DLL_HANDLES.append(os.add_dll_directory(_dll_dir))
+                except (OSError, AttributeError):
+                    pass
+
+    # Windows consoles default sys.stdout to the ANSI code page (cp1252), so a
+    # single print of a non-ASCII image filename raises UnicodeEncodeError and
+    # kills the run mid-batch. The app's own log lines are all ASCII; the
+    # filenames it interpolates are not under our control. errors="replace"
+    # degrades an unprintable character to '?' instead of aborting.
+    # No-op on macOS/Linux, which are already UTF-8.
+    import sys as _sys
+
+    for _stream in (_sys.stdout, _sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass   # not a real console (pytest capture, pythonw, a pipe)
 
 # Model weights (sam3.pt, sam2_t.pt, yoloe-11l-seg.pt, ...) and the default
 # label output dirs live in the historical "GUI and Pipeline" folder. Working
@@ -59,7 +105,22 @@ WEIGHTS_DIR = os.path.join(REPO_ROOT, "GUI and Pipeline")
 # continuity with where earlier versions of the app wrote them.
 BASE_DIR = WEIGHTS_DIR
 
-load_dotenv(os.path.join(REPO_ROOT, ".env"))
+# Per-user settings that must outlive a single run and follow the user rather
+# than the checkout (currently just the box-prompt class names). expanduser
+# resolves to ~/.autoannotate on macOS/Linux and %USERPROFILE%\.autoannotate on
+# Windows, so the same code path serves every OS.
+USER_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".autoannotate")
+
+
+def user_config_path(filename):
+    """Absolute path to `filename` inside USER_CONFIG_DIR, creating the
+    directory on first use. Returns the path even when creation fails so the
+    caller's own try/except decides whether a missing settings file matters."""
+    try:
+        os.makedirs(USER_CONFIG_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(USER_CONFIG_DIR, filename)
 
 # Master switch for the chatty [TAG] debug prints ([_get_model], [YOLOE-LOAD],
 # [DINO-FILTER], [ROUND-TRIP CHECK] OK). False keeps normal runs quiet; real
@@ -84,13 +145,52 @@ else:
 
 # Auto-derive GROUNDING_DINO_DIR: GroundingDINO sits at a fixed location under
 # the repo root, so a fresh clone needs no .env edit. A .env value still wins.
-GROUNDING_DINO_DIR = os.environ.get("GROUNDING_DINO_DIR")
-if not GROUNDING_DINO_DIR:
-    GROUNDING_DINO_DIR = os.path.join(REPO_ROOT, "autoannotate study", "GroundingDINO")
-if not os.path.isdir(GROUNDING_DINO_DIR):
+# The study folder is git-tracked as "autoannotate study" (with a space), but
+# zips/transfers sometimes mangle it into "autoannotate_study"; accept both so
+# neither checkout style bricks startup.
+_gd_candidates = []
+_gd_env = os.environ.get("GROUNDING_DINO_DIR")
+if _gd_env:
+    _gd_candidates.append(_gd_env)
+for _study in ("autoannotate study", "autoannotate_study"):
+    _gd_candidates.append(os.path.join(REPO_ROOT, _study, "GroundingDINO"))
+
+GROUNDING_DINO_DIR = None
+for _cand in _gd_candidates:
+    if os.path.isdir(_cand):
+        GROUNDING_DINO_DIR = _cand
+        break
+if GROUNDING_DINO_DIR is None:
     raise EnvironmentError(
-        f"GroundingDINO not found at {GROUNDING_DINO_DIR!r}. Set GROUNDING_DINO_DIR "
-        "in AutoAnnotate/.env to its absolute path.")
+        "GroundingDINO not found. Tried: "
+        + ", ".join(repr(c) for c in _gd_candidates)
+        + ". Set GROUNDING_DINO_DIR in AutoAnnotate/.env to its absolute path.")
+if _gd_env and GROUNDING_DINO_DIR != _gd_env:
+    print(f"[config] GROUNDING_DINO_DIR from .env is not a directory "
+          f"({_gd_env!r}); using {GROUNDING_DINO_DIR!r} instead.")
+
+# Default cap on detection area as a fraction of the image, shared by the GUI
+# (_max_area_frac) and documented in HOW_TO_RUN. Override per session with the
+# AUTOANNOTATE_MAX_AREA_FRAC env var (.env or shell).
+DEFAULT_MAX_AREA_FRAC = 0.5
+
+
+def effective_max_area_frac():
+    """The max-area fraction the app will actually use this session.
+
+    Single source of truth for parsing AUTOANNOTATE_MAX_AREA_FRAC: an unset,
+    unparseable, or out-of-range (0, 1] value falls back to
+    DEFAULT_MAX_AREA_FRAC. check_environment reports this rather than the raw
+    env string, so what it prints is what inference will really apply.
+    """
+    try:
+        val = float(os.environ.get("AUTOANNOTATE_MAX_AREA_FRAC",
+                                   str(DEFAULT_MAX_AREA_FRAC)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_AREA_FRAC
+    if not (0.0 < val <= 1.0):
+        return DEFAULT_MAX_AREA_FRAC
+    return val
 
 # Default image source directory. Subfolders here (Berry, Buds, Fescue,
 # Red_leaf) are the image categories.

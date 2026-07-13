@@ -1,13 +1,18 @@
-# AutoAnnotate — EXACT reproducible lockfile (pip freeze of the proven env).
+# AutoAnnotate - EXACT reproducible lockfile for macOS (Apple Silicon / MPS).
+#
+# PLATFORM: macOS, Python 3.13, CPU/MPS torch (no CUDA). This is one of THREE
+# requirements files; pick the one for your machine:
+#   - requirements.txt            generic floors, no upper pins (any OS)
+#   - requirements-macos.lock     THIS FILE: exact pins proven on macOS/MPS
+#   - requirements-windows.txt    Windows 11 + NVIDIA CUDA (pinned +cuXXX torch)
 #
 # This pins every package to the exact version the app is known to run on
-# (Python 3.13.12, captured 2026-06-16). Use this for a reproducible install;
-# use requirements.txt (floors, no upper pins) only if you intentionally want
-# newer resolutions.
+# (Python 3.13, captured 2026-06-16). Use it for a reproducible macOS install;
+# use requirements.txt only if you intentionally want newer resolutions.
 #
 #   python3.13 -m venv .venv
 #   .venv/bin/pip install --upgrade pip
-#   .venv/bin/pip install -r requirements.lock
+#   .venv/bin/pip install -r requirements-macos.lock
 #   .venv/bin/pip install -e "autoannotate study/GroundingDINO"   # see note below
 #
 # NOTE on GroundingDINO: it is installed as a LOCAL editable package from the
@@ -16,8 +21,9 @@
 # intentionally omitted here so the lock installs offline from the local tree
 # and does not depend on the GitHub remote being reachable or up to date.
 #
-# NOTE on Windows + NVIDIA: install torch/torchvision/torchaudio from the CUDA
-# wheel index FIRST, then run this file, or pip will pick the CPU build.
+# NOTE: this lock is macOS-only. On Windows + NVIDIA use requirements-windows.txt
+# (it installs the CUDA torch wheels); do NOT install this lock there or pip
+# will pick the CPU torch build and CUDA acceleration will not work.
 
 accelerate==1.13.0
 addict==2.4.0

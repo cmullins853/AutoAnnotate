@@ -40,6 +40,66 @@ compute device the app will use, and lists which weight files are
 present. Run it inside the activated venv (Step 1).
 
 --------------------------------------------------------
+STEP 0 - FRESH MACHINE PREREQUISITES (install these first)
+--------------------------------------------------------
+Everything below assumes tools a machine with no prior dev work will
+NOT have. None of them come from pip. On a machine that already has
+them, skip to STEP 1.
+
+a) Git - to clone the repository at all.
+     Windows:  https://git-scm.com/download/win  (installer defaults
+               are fine; GitHub Desktop also works if you prefer a GUI)
+     macOS:    xcode-select --install
+     Linux:    sudo apt install git
+
+b) Python 3.13 - the version every requirements file is proven on.
+     Windows:  https://www.python.org/downloads/  - in the installer
+               KEEP the "py launcher" option ticked; STEP 1's
+               `py -3.13` command needs it.
+     macOS:    https://www.python.org/downloads/ or
+               `brew install python@3.13`
+     Linux:    sudo apt install python3.13 python3.13-venv
+   Verify:   py -3.13 --version        (Windows)
+             python3.13 --version      (macOS/Linux)
+
+The rest of this step is WINDOWS/LINUX + NVIDIA GPU ONLY. A CPU-only
+machine (or a Mac) needs nothing else; go to STEP 1.
+
+c) NVIDIA driver + CUDA Toolkit. These are two different installs and
+   BOTH are needed:
+   - Driver (runs the models): https://www.nvidia.com/drivers
+     An outdated driver is the top cause of
+     torch.cuda.is_available() == False; a driver reinstall was
+     required on the validation machine.
+   - CUDA Toolkit (builds GroundingDINO):
+     https://developer.nvidia.com/cuda-downloads
+     The toolkit provides nvcc, which compiles GroundingDINO's CUDA
+     extension in STEP 4. The driver alone cannot build anything.
+   VERSION MATCH RULE: the toolkit version must match the +cuXXX pins
+   in requirements-windows.txt. The one combination actually validated
+   here is CUDA Toolkit 13.2 with torch==2.12.1+cu132, which is what
+   that file pins. Install that toolkit and the pins work as written.
+   Other toolkits need a torch build that exists for them, and not
+   every pairing does; do not just search-and-replace cu132. Look the
+   combination up in PyTorch's official install selector first:
+   https://pytorch.org/get-started/locally/
+   The Windows installer sets the CUDA_PATH environment variable;
+   leave it in place. The app reads it at startup to register the
+   CUDA DLL folder (see COMMON ERRORS, "DLL load failed").
+
+d) Visual Studio Build Tools (Windows only) - the C++ compiler that
+   nvcc drives during the GroundingDINO build:
+     https://visualstudio.microsoft.com/visual-studio-build-tools/
+   In the installer select the "Desktop development with C++"
+   workload (this includes MSVC v143 and the Windows SDK). The
+   validated machine used MSVC 14.51.
+
+With those in place, clone the repo and work from its root:
+
+  git clone <your fork or origin URL>/AutoAnnotate.git
+  cd AutoAnnotate
+
+--------------------------------------------------------
 STEP 1 - ONE-TIME SETUP: PYTHON ENVIRONMENT
 --------------------------------------------------------
 Make sure you are using the project's virtual environment.
@@ -47,26 +107,64 @@ Make sure you are using the project's virtual environment.
 From the repo root:
 
   source .venv/bin/activate          # Mac/Linux
-  .venv\Scripts\activate             # Windows
+  .venv\Scripts\activate             # Windows (cmd)
 
 If the venv doesn't exist yet, create it first:
 
-  python3 -m venv .venv
-  source .venv/bin/activate          # Mac/Linux  (.venv\Scripts\activate on Windows)
-  pip install -r requirements.txt
+  There is no one-size-fits-all requirements file. Pick the one for your OS:
+    - requirements-macos.lock    macOS / Apple Silicon (MPS): exact pins
+    - requirements-windows.txt   Windows 11 + NVIDIA CUDA: pinned CUDA torch
+    - requirements.txt           generic floors: Linux, or any OS (advanced)
 
-(python-dotenv is already in requirements.txt, so no separate install
-is needed.)
+  macOS:
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements-macos.lock
 
-REPRODUCIBLE INSTALL (recommended): instead of requirements.txt (which
-only pins floors), install the exact, proven-good version set from the
-lockfile:
+  Linux:
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+  The macOS lock is macOS-ONLY (it freezes CPU/MPS torch and wheels
+  built for Mac); do not use it on Linux. On Linux + NVIDIA, after the
+  install above, swap in the CUDA torch build the same way Windows
+  does:
+    pip uninstall -y torch torchvision torchaudio
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+  (match the cuXXX to your toolkit, see STEP 0c), then verify:
+    python -c "import torch; print(torch.cuda.is_available())"
 
-  pip install -r requirements.lock
+  Windows (PowerShell), validated on Windows 11 + Python 3.13:
+    py -3.13 -m venv .venv
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   (one-time; lets
+                                                           Activate.ps1 run)
+    .venv\Scripts\Activate.ps1
+    pip uninstall -y torch torchvision torchaudio   (clear any CPU build first)
+    pip install -r requirements-windows.txt
+  From cmd instead of PowerShell, activate with .venv\Scripts\activate.bat
+  and skip the Set-ExecutionPolicy step.
 
-requirements.lock is a full `pip freeze` of the environment the app is
-known to run on (Python 3.13). Note: GroundingDINO is NOT in the lock;
-install it in STEP 4.
+  WINDOWS + NVIDIA GPU: requirements-windows.txt already pins the CUDA
+  torch/torchvision wheels (+cuXXX) and adds the PyTorch CUDA index, so pip
+  installs the GPU build instead of the CPU one. The validated combo was
+  torch 2.12.1+cu132 on CUDA 13.2 / RTX 4060. If your driver needs a
+  different CUDA, change every cu132 in that file to match. Then verify:
+    python -c "import torch; print(torch.cuda.is_available())"
+  If that prints False, update your NVIDIA driver first (a driver
+  reinstall was required on the validation machine) and reinstall.
+
+  NOTE: transformers must stay below 5.x (the platform files pin
+  "transformers==4.50.3" / ">=4.40,<5"). transformers 5.x removed a BERT
+  method GroundingDINO needs and crashes at DINO model load.
+
+(python-dotenv is already in every requirements file, so no separate
+install is needed.)
+
+REPRODUCIBLE INSTALL: the platform files above ARE the reproducible path
+(requirements-macos.lock is a full `pip freeze`; requirements-windows.txt
+pins the CUDA torch stack). requirements.txt only pins floors and is for
+advanced users who want the newest resolutions. Note: GroundingDINO is NOT
+in any of them; install it in STEP 4.
 
 No Jupyter setup is needed. The app is plain Python scripts launched
 from the terminal (STEP 5); there is no notebook to run.
@@ -74,18 +172,28 @@ from the terminal (STEP 5); there is no notebook to run.
 --------------------------------------------------------
 STEP 2 - ONE-TIME SETUP: CONFIGURE .env
 --------------------------------------------------------
-The project root already contains a .env file. Open it and confirm
-the GROUNDING_DINO_DIR path is correct for your machine:
+.env is NOT in git (it is ignored), so a fresh clone has only
+.env.example. Create yours from it:
 
-  File: AutoAnnotate/.env
+  cp .env.example .env               # Mac/Linux
+  copy .env.example .env             # Windows
+
+This whole step is OPTIONAL: the app runs with no .env at all. Every
+value in it has a working default; you edit it only to override one:
 
   GROUNDING_DINO_DIR=/absolute/path/to/autoannotate study/GroundingDINO
 
-For this machine it is already set to:
-  /Users/bxavier/Documents/GitHub/AutoAnnotate/autoannotate study/GroundingDINO
+You normally do NOT need to set this: config.py auto-derives it from
+the repo root, and it accepts BOTH folder spellings ("autoannotate
+study" as git tracks it, and "autoannotate_study" as zips/transfers
+sometimes rename it). Set it only if GroundingDINO lives somewhere
+unusual.
 
-If you are on a different machine, copy .env.example to .env and
-fill in the correct path.
+NOTE (VS Code users): the editor warning about "python.terminal.useEnvFile"
+/ terminal environment injection is UNRELATED to the app. The app loads
+.env itself via python-dotenv at startup, no editor setting needed. To
+confirm your .env values took effect, run check_environment.py: it prints
+the effective AUTOANNOTATE_MAX_AREA_FRAC and AUTOANNOTATE_SD_DEVICE.
 
 HF_TOKEN in the .env is OPTIONAL and the running app never uses it.
 Every model the app loads is either public (SmolVLM, bert-base-uncased
@@ -113,13 +221,21 @@ a) GroundingDINO weights
      groundingdino_swint_ogc.pth
        -> https://github.com/IDEA-Research/GroundingDINO/releases
 
-     groundingdino_swinb_cogcoor.pth  (only if you use SwinB)
+     groundingdino_swinb_cogcoor.pth  (only if you use SwinB, ~938 MB)
        -> same releases page
+
+   Until groundingdino_swinb_cogcoor.pth is in place, the "DINO (SwinB)"
+   entries in the Detector dropdown auto-grey with a tooltip (same
+   mechanism as the SAM3 entries). SwinB "not working" on a fresh
+   machine is almost always just this missing weight.
 
 b) SAM 2 weights
    The code uses "sam2_t.pt" loaded by ultralytics SAM.
    Ultralytics auto-downloads sam2_t.pt on first run if you have
-   an internet connection. If it doesn't, download manually:
+   an internet connection. NOTE: it downloads into the CURRENT WORKING
+   DIRECTORY (the repo root if you launched from there); move the file
+   into "GUI and Pipeline/" afterwards so the app finds it on the next
+   run. If it doesn't auto-download, fetch manually:
      https://github.com/ultralytics/assets/releases
    and place sam2_t.pt in "GUI and Pipeline/".
 
@@ -160,6 +276,34 @@ torch must already be installed (it is, from STEP 1) before you run this.
 If you see CUDA/torch errors, make sure your PyTorch version
 matches your CUDA driver before installing.
 
+WINDOWS + CUDA BUILD PREREQUISITES (validated on Windows 11, CUDA 13.2,
+RTX 4060, VS Build Tools with MSVC 14.51):
+
+  1. Install Visual Studio Build Tools with the "Desktop development
+     with C++" workload (provides cl.exe / MSVC v143). nvcc drives
+     cl.exe during the build.
+  2. In the venv, install the build helpers first (wheel fixes
+     "invalid command 'bdist_wheel'"; ninja was required on the
+     validation machine):
+       pip install wheel setuptools ninja
+  3. Run the pip install command above from PowerShell with the
+     folder path quoted (the folder name contains a space).
+
+  The vendored setup.py now adds the MSVC conforming-preprocessor flag
+  (/Zc:preprocessor) automatically on Windows; CUDA >= 12.4/13 CCCL
+  headers require it. On an older checkout, set it manually before
+  building:  $env:CL = "/Zc:preprocessor"
+
+  The extension is built WITH CUDA only when torch can see the GPU
+  during the install. If torch.cuda.is_available() is False at build
+  time you get a CPU-only extension and DINO silently falls back to
+  slow pure-Python deformable attention. Fix torch first (STEP 1), or
+  force it with FORCE_CUDA=1 when CUDA is installed but not visible.
+
+  AFTER PULLING THESE FIXES on a machine that built GroundingDINO
+  earlier: re-run the pip install command above once so the extension
+  is rebuilt from the patched source.
+
 To uninstall later:  pip uninstall groundingdino
 
 --------------------------------------------------------
@@ -183,12 +327,21 @@ involved. The old launcher notebook (auto-annotate-gui.ipynb) has been
 retired to junk/.
 
 To verify the install (or a code change) beyond launching, run the
-headless regression suite from the repo root:
+headless regression suite from the repo root. The environment variable
+has to be set the way YOUR shell sets one:
 
-  QT_QPA_PLATFORM=offscreen python "GUI and Pipeline/test_semiauto_headless.py"
+  macOS / Linux (bash, zsh):
+    QT_QPA_PLATFORM=offscreen python "GUI and Pipeline/test_semiauto_headless.py"
 
-Expect "323/323 checks passed". For live-GUI verification, walk
-"GUI and Pipeline/MANUAL_TEST_CHECKLIST.md".
+  Windows PowerShell:
+    $env:QT_QPA_PLATFORM="offscreen"; python "GUI and Pipeline\test_semiauto_headless.py"
+
+  Windows cmd.exe:
+    set QT_QPA_PLATFORM=offscreen && python "GUI and Pipeline\test_semiauto_headless.py"
+
+Expect every check to pass, e.g. "520/520 checks passed" (the total
+grows as tests are added; what matters is passed == total). For
+live-GUI verification, walk "GUI and Pipeline/MANUAL_TEST_CHECKLIST.md".
 
 NOTE: The app opens a PyQt5 window. This requires a display.
   - On a local Mac/Windows machine: works out of the box.
@@ -249,6 +402,44 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
    boxes. The bucket re-evaluates whenever you change detector or
    prompt mode.
 
+   MULTI-CLASS PROMPTS (one model run, no re-running per class):
+   in Text mode the Prompts section holds one FIELD per class; click
+   "+ Add prompt" for another (up to 5 fields; the button greys out at
+   the cap). A single field can still be comma-separated when the names
+   are synonyms for one class. Every class is detected in a SINGLE
+   pass; each detection keeps its class id (0, 1, ... in field order)
+   all the way into the saved YOLO label files, and each class gets its
+   own outline color on screen (class 0 keeps the classic magenta).
+   Three key files are written with the labels: classes.txt (one bare
+   name per line, importable), class_colors.txt (the color key: one
+   commented column-header line, then one aligned row per class), and
+   class_legend.png next to the annotated_<model> review folders. Hover
+   the info dot beside the Prompts header for the live color legend; it
+   stays visible when the section is collapsed.
+
+   NEGATIVE PROMPTS ("+ Add negative" fields): things you do NOT want
+   annotated, e.g. positive "blueberry" with negative "leaf". Negatives
+   are detected in the SAME single pass; every negative hit is
+   discarded and any positive detection that overlaps a negative hit
+   is dropped too. Works with the text-prompt detectors (DINO,
+   YOLOE-seg text, SAM3 text). Empty negative fields change nothing
+   and never block a run.
+
+   BOX-MODE CLASSES: in Boxes mode the text fields hide and a
+   "Draw box as:" dropdown appears with up to 5 colored classes
+   (rename them and set the count via Classes...). Names last for the
+   APP SESSION: they survive moving between images and going back to
+   the main menu, but a fresh launch always starts from one unnamed
+   class; nothing is written to disk. Drawn prompt boxes carry the
+   class selected WHEN DRAWN, hand-drawn annotation boxes keep theirs
+   too, and "Draw Negative Box" draws red suppression boxes. SAM3 box
+   prompts run one pass per class under the hood (its predictor is
+   single-concept per call); the terminal prints a
+   "[SAM3 multi-class] N passes" line when that happens. Lowering the
+   class count below a class already drawn on the current image is
+   refused with a message naming the blocking class; delete those
+   boxes first.
+
 7. Check either "Bounding Box" or "Segmentation" to control the
    display mode.
 
@@ -257,6 +448,28 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
    - Mask threshold      : segmenter confidence cutoff (0-100);
                            ignored when the detector is one-shot
                            with "(none)" as the segmenter
+   - Max detection size  : drop any detection covering more than this
+                           fraction of the image (0.05-1.00)
+
+   PER-CLASS SETTINGS (appears only with 2+ classes): each class keeps
+   its OWN three values. A berry class wants a low max detection size,
+   a leaf class a high one, so one-size-fits-all sliders are wrong for
+   mixed-size classes. Pick a class in the Per-Class Settings section
+   and move its sliders; they apply immediately. The classic three
+   sliders become "Global sliders (all classes)": moving one no longer
+   applies live; an "Apply to All Classes" / "Revert" row appears, and
+   Apply (after a confirmation, since it overwrites every class's
+   individual values) is the only way it takes effect. Regenerate and
+   Auto Annotate Remaining REFUSE to run while a global change sits
+   unapplied. With one class none of this exists and the sliders behave
+   exactly as they always did.
+   Under the hood, single-pass detectors (DINO, YOLOE, SAM3 text) run
+   once at the loosest class threshold and each detection is then
+   re-checked against its own class's values; SAM3 box prompts already
+   run one pass per class, so each pass takes its class's confidence
+   directly. One limitation: DINO's text_threshold (driven by the Mask
+   slider) is a single-pass token filter and uses the loosest class's
+   value for every class.
 
 9. Click "Auto annotate" to run the selected pipeline on the current
    image and see results overlaid.
@@ -271,8 +484,22 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
     - Click an annotation to select it; press the red X badge to
       delete.
     - Rect annotations have corner/edge handles for resize.
+    - Image Resize can stay ON while you draw and edit: scrolling pans
+      the zoomed image and the left button keeps drawing. Zoom with a
+      trackpad pinch or Ctrl/Cmd+scroll. The Image Resize dropdown has
+      a Trackpad/Mouse input picker (trackpads pan on both axes with a
+      two-finger scroll; mice pan vertically with the wheel and
+      sideways with Shift+wheel). The same picker and bindings apply
+      in the side-by-side viewer.
 
-11. Click "Next Image" to step through the folder.
+11. Click "Next Image" to step through the folder. "Previous Image"
+    goes BACK one image WITHOUT re-running the model: the previous
+    image's saved annotations are reloaded from the label files exactly
+    as you left them, so anything you trimmed or edited stays edited
+    (a fresh model run would overwrite that work). Both buttons save
+    the current image first. Previous is unavailable on the first
+    image (nothing before it) and after the folder is finished (the
+    folder deselects on completion, as before).
 
 12. When happy with the prompt and slider settings, click
     "Auto Annotate Remaining" to batch-annotate the rest of the folder.
@@ -286,6 +513,12 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
       folder, turn on "Use First Image as Prompt" first (enabled only for
       the box-capable detectors: YOLOE-vis/-seg and SAM3; DINO is
       text-only so the toggle is greyed there).
+    - INCLUDE EARLIER IMAGES (recycle toggle): by default the batch only
+      covers the images from here forward; images you already stepped
+      past are omitted. Turn "Include Earlier Images" ON to append those
+      earlier images to the END of the run, so starting a batch halfway
+      through a folder still covers all of it. Their existing label
+      files are overwritten like any other batch target.
     - ZERO-detection retry: if an image gets no detections, the detector
       automatically RETRIES ONCE at a lower threshold (det + mask x 0.5,
       tunable via AUTOANNOTATE_RETRY_FACTOR). It is a single bounded retry,
@@ -343,12 +576,15 @@ AUTOANNOTATE_SD_DEVICE).
   AUTOANNOTATE_MAX_AREA_FRAC    Drop any single detection whose box covers
                                 more than this fraction of the image (a
                                 spurious whole-/large-image match). Applied to
-                                ALL detectors. Default: 0.9 (only near-whole-
-                                image). LOWER it to ~0.4-0.5 for small-object
-                                or texture folders (e.g. fescue/grass), where
-                                SAM3 box-exemplar can match a broad region
-                                whose box still sneaks under 0.9. Clamped to
-                                (0, 1].
+                                ALL detectors. Default: 0.5 (drops anything
+                                covering more than half the image; tuned for
+                                small-object fruit/berry folders). RAISE it
+                                to ~0.8-0.9 for genuinely large subjects, or
+                                LOWER it to ~0.3 for tiny-object / texture
+                                folders (e.g. fescue/grass). Clamped to
+                                (0, 1]. check_environment.py prints the
+                                effective value so you can confirm your .env
+                                took effect.
 
   AUTOANNOTATE_DINO_RESCUE      1 = on an otherwise-empty DINO image, keep
                                 the low-confidence candidates above a small
@@ -369,8 +605,10 @@ Not an env var -- a code flag (edit autoannotate/pipeline/dino.py):
 --------------------------------------------------------
 COMMON ERRORS & FIXES
 --------------------------------------------------------
-"GROUNDING_DINO_DIR is not set"
-  -> Open .env in the project root and set the path (Step 2).
+"GroundingDINO not found. Tried: ..."
+  -> Normally auto-derived; both "autoannotate study" and
+     "autoannotate_study" folder names are accepted. If the folder truly
+     lives elsewhere, set GROUNDING_DINO_DIR in .env (Step 2).
 
 "FileNotFoundError: groundingdino_swint_ogc.pth"
   -> Download the weights file (Step 3a) and place it in
@@ -378,6 +616,36 @@ COMMON ERRORS & FIXES
 
 "ModuleNotFoundError: No module named 'groundingdino'"
   -> Run: pip install -e "autoannotate study/GroundingDINO" (Step 4)
+
+"error: invalid command 'bdist_wheel'" (Windows, STEP 4 build)
+  -> pip install wheel setuptools, then re-run the STEP 4 install.
+
+"fatal error C1189: ... /Zc:preprocessor" (Windows, CUDA >= 12.4/13)
+  -> Update your checkout (setup.py now adds the flag automatically on
+     Windows), or set it manually before building:
+     $env:CL = "/Zc:preprocessor"
+
+".cu compile error: no suitable conversion from DeprecatedTypeProperties"
+  -> Fixed in the vendored source (value.type() -> value.scalar_type()).
+     Pull the latest checkout and re-run the STEP 4 install.
+
+"ImportError: DLL load failed while importing _C" (Windows)
+  -> Python 3.8+ ignores PATH for extension-module DLLs. Make sure the
+     CUDA_PATH environment variable is set (the NVIDIA installer sets it);
+     the app auto-registers CUDA_PATH\bin at startup. Symptom if broken:
+     DINO still runs, but slowly, on pure-Python deformable attention.
+
+"AttributeError: 'BertModel' object has no attribute 'get_head_mask'"
+  -> transformers 5.x is installed; GroundingDINO needs 4.x:
+     pip install "transformers>=4.40,<5"
+
+"DINO (SwinB) is greyed out in the Detector dropdown"
+  -> groundingdino_swinb_cogcoor.pth (~938 MB) is missing; see Step 3a.
+
+".env values seem ignored" / VS Code "python.terminal.useEnvFile" warning
+  -> The editor warning is unrelated: the app loads .env itself via
+     python-dotenv. Verify with check_environment.py, which prints the
+     effective AUTOANNOTATE_MAX_AREA_FRAC and AUTOANNOTATE_SD_DEVICE.
 
 "sam3.pt not found" or SAM3 entries greyed out
   -> Download sam3.pt (Step 3c) and place it in "GUI and Pipeline/".

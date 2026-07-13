@@ -38,14 +38,29 @@ def run_yoloe_text(model, image_path, names, conf=0.05, max_area_frac=0.9):
         # the CLIP text encoder crashes the YOLOE TorchScript with
         # "cannot reshape tensor of 0 elements into shape [0, 77, ...]".
         return [], None
-    # Ultralytics quirk: set_classes (yolo/model.py:316) checks
-    #   sorted(list(self.model.names.values())) != sorted(classes)
-    # which crashes if model.model.names is a list. Coerce the INNER
-    # model's names to a {idx: name} dict BEFORE calling set_classes.
+    # Ultralytics quirk: the OUTER YOLOE.set_classes (yolo/model.py:316) guards
+    # its work with
+    #   if sorted(list(self.model.names.values())) != sorted(classes):
+    # It compares names as SETS, so re-prompting with the same class names in a
+    # different ORDER looks like "no change" and the whole body is skipped: the
+    # model keeps its previous name order AND its previous embedding order. The
+    # detections then come back indexed against the OLD order, so reordering the
+    # prompt fields silently swaps every class id (wrong label, wrong colour,
+    # wrong per-class threshold). That same line also crashes when names is a
+    # list rather than a dict.
+    #
+    # The INNER YOLOEModel.set_classes (nn/tasks.py:1124) sets pe / nc / names
+    # unconditionally, so drive it directly and skip the guard entirely.
     _inner = getattr(model, "model", None)
     if _inner is not None and isinstance(getattr(_inner, "names", None), list):
         _inner.names = {i: n for i, n in enumerate(_inner.names)}
-    model.set_classes(names, model.get_text_pe(names))
+    if _inner is not None and hasattr(_inner, "set_classes"):
+        _inner.set_classes(names, model.get_text_pe(names))
+        # Outer wrapper's own bookkeeping, normally done by YOLOE.set_classes.
+        if getattr(model, "predictor", None) is not None:
+            model.predictor.model.names = _inner.names
+    else:
+        model.set_classes(names, model.get_text_pe(names))
     # Defensive: also coerce the outer wrapper in case downstream code
     # resets it back to a list.
     if isinstance(getattr(model, "names", None), list):

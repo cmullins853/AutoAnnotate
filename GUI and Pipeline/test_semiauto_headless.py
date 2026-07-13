@@ -22,6 +22,10 @@ cv2.cvtColor = lambda *a, **k: None
 cv2.COLOR_BGR2RGB = 4
 import numpy as _np
 cv2.imread = lambda *a, **k: _np.zeros((100, 100, 3), dtype=_np.uint8)
+# autoannotate.imageio resolves these at call time (never as default args, which
+# would blow up against this stub at import). Present so a real call path works.
+cv2.IMREAD_COLOR = 1
+cv2.IMREAD_GRAYSCALE = 0
 
 _gd = _stub("groundingdino"); _gdu = _stub("groundingdino.util")
 _gdi = _stub("groundingdino.util.inference")
@@ -104,6 +108,11 @@ G["save_masks"] = lambda *a, **k: None
 G["adjust_masks"] = lambda *a, **k: []
 G["overlay_with_borders"] = lambda img, *a, **k: img
 G["draw_boxes_on_image"] = lambda img, *a, **k: img
+# Image I/O goes through autoannotate.imageio (unicode-safe on Windows), not
+# cv2.imread/imwrite. Stub it the way cv2.imread used to be stubbed: decode
+# yields a blank image, encode succeeds without touching the disk.
+G["imread_unicode"] = lambda *a, **k: _np.zeros((100, 100, 3), dtype=_np.uint8)
+G["imwrite_unicode"] = lambda *a, **k: True
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 AnnotationCanvas = G["AnnotationCanvas"]
@@ -1537,11 +1546,11 @@ t37()
 def t38():
     w = mk_window()
     calls = {"n": 0}
-    orig = cv2.imread
+    orig = G.get("imread_unicode")
     def counting(p):
         calls["n"] += 1
         return np.zeros((8, 8, 3), dtype=np.uint8)
-    cv2.imread = counting
+    G["imread_unicode"] = counting
     try:
         a = w._imread_cached("a.jpg")
         b = w._imread_cached("a.jpg")
@@ -1552,11 +1561,12 @@ def t38():
         check("T38 caller mutation does not corrupt cache", int(c[0, 0, 0]) == 0, int(c[0, 0, 0]))
         w._imread_cached("b.jpg")
         check("T38 different path re-decodes", calls["n"] == 2, calls["n"])
-        cv2.imread = lambda p: None
+        G["imread_unicode"] = lambda p: None
         check("T38 unreadable -> None", w._imread_cached("z.jpg") is None)
         check("T38 unreadable None is cached (not retried)", w._imread_cached("z.jpg") is None)
     finally:
-        cv2.imread = orig
+        if orig is not None:
+            G["imread_unicode"] = orig
 
 t38()
 
@@ -1853,6 +1863,1358 @@ def t48():
                 G[h] = v
 
 t48()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T49: parse_prompt_classes splits comma-separated prompts into ordered class
+# names (ids in saved labels follow this order).
+# ══════════════════════════════════════════════════════════════════════════
+def t49():
+    p = G["parse_prompt_classes"]
+    check("T49 empty -> []", p("") == [])
+    check("T49 None -> []", p(None) == [])
+    check("T49 single", p("blueberry") == ["blueberry"])
+    check("T49 two classes", p("blueberry, leaf") == ["blueberry", "leaf"])
+    check("T49 messy commas/space", p(" a ,, b ") == ["a", "b"])
+
+t49()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T50: label writers accept per-item classes and default to class 0 exactly
+# as before (single-class back-compat).
+# ══════════════════════════════════════════════════════════════════════════
+def t50():
+    import tempfile, os as _os
+    from autoannotate.pipeline.labels import save_boxes_yolo as _sb, \
+        save_polys_yolo as _sp, save_classes_txt as _sc
+    d = tempfile.mkdtemp()
+    img = _os.path.join(d, "img.jpg")  # cv2.imread is stubbed to 100x100
+    _sb([[10, 10, 30, 30], [40, 40, 60, 60]], img, d)
+    first_cols = [l.split()[0] for l in open(_os.path.join(d, "img.txt"))]
+    check("T50 boxes default all class 0", first_cols == ["0", "0"], first_cols)
+    _sb([[10, 10, 30, 30], [40, 40, 60, 60]], img, d, classes=[0, 1])
+    first_cols = [l.split()[0] for l in open(_os.path.join(d, "img.txt"))]
+    check("T50 boxes classes column written", first_cols == ["0", "1"], first_cols)
+    tri = [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]
+    tri2 = [[0.5, 0.5], [0.7, 0.5], [0.6, 0.7]]
+    _sp([tri, None, tri2], d, img, classes=[2, 0, 1])
+    first_cols = [l.split()[0] for l in open(_os.path.join(d, "img.txt"))]
+    check("T50 polys skip degenerate but keep class alignment",
+          first_cols == ["2", "1"], first_cols)
+    _sc(["blueberry", "leaf"], d)
+    names = open(_os.path.join(d, "classes.txt")).read().splitlines()
+    check("T50 classes.txt one name per line", names == ["blueberry", "leaf"], names)
+
+t50()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T51: _nms_dedup keeps its 2-tuple return without classes (back-compat),
+# shrinks the class list in lockstep, and by default only ever suppresses a box
+# with another box of the SAME class -- two classes claiming one object is a
+# real disagreement and both rows are written.
+# ══════════════════════════════════════════════════════════════════════════
+def t51():
+    w = mk_window()
+    boxes = [[0, 0, 10, 10], [1, 1, 10, 10], [50, 50, 60, 60]]  # first two dup
+    out = w._nms_dedup(boxes)
+    check("T51 no classes -> 2-tuple", len(out) == 2 and out[1] is None, out)
+    check("T51 dup dropped", len(out[0]) == 2, out[0])
+
+    out = w._nms_dedup(boxes, None, classes=[0, 1, 2])
+    check("T51 with classes -> 3-tuple", len(out) == 3, len(out))
+    check("T51 cross-class overlap kept", out[2] == [0, 1, 2], out[2])
+    check("T51 cross-class boxes kept", len(out[0]) == 3, out[0])
+
+    # Same class on the overlapping pair -> the duplicate IS dropped.
+    out = w._nms_dedup(boxes, None, classes=[0, 0, 2])
+    check("T51 same-class dup dropped", out[2] == [0, 2], out[2])
+    check("T51 same-class boxes shrink", len(out[0]) == 2, out[0])
+
+    # cross_class=True restores the old suppress-everything behavior.
+    out = w._nms_dedup(boxes, None, classes=[0, 1, 2], cross_class=True)
+    check("T51 cross_class=True suppresses across classes", out[2] == [0, 2], out[2])
+
+    # polys shrink alongside classes, and only for same-class dups.
+    polys = [[[0, 0]], [[1, 1]], [[2, 2]]]
+    out = w._nms_dedup(boxes, polys, classes=[3, 3, 3])
+    check("T51 polys shrink in lockstep", out[1] == [[[0, 0]], [[2, 2]]], out[1])
+
+t51()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T52: suppress_negative_hits drops every negative detection and any positive
+# overlapping one; empty negatives are a no-op.
+# ══════════════════════════════════════════════════════════════════════════
+def t52():
+    from autoannotate.pipeline.postfilter import suppress_negative_hits as f
+    boxes = [[0, 0, 10, 10], [1, 1, 11, 11], [50, 50, 60, 60], [80, 80, 90, 90]]
+    cls   = [0, 1, 0, 1]   # n_pos=1 -> class 1 = negative
+    polys = ["p0", "p1", "p2", "p3"]
+    b, c, p = f(boxes, cls, polys, n_pos=1)
+    check("T52 negatives removed", all(v < 1 for v in c), c)
+    check("T52 overlapping positive dropped, distant kept",
+          b == [[50, 50, 60, 60]], b)
+    check("T52 polys aligned", p == ["p2"], p)
+    b, c, p = f([[0, 0, 10, 10]], [0], None, n_pos=1)
+    check("T52 no negatives -> no-op", b == [[0, 0, 10, 10]] and p is None, (b, p))
+    b, c, p = f([], [], None, n_pos=1)
+    check("T52 empty input -> empty", b == [] and c == [], (b, c))
+
+t52()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T53: _batch_targets. Recycle OFF == the old forward slice; ON appends the
+# earlier images AT THE END (order preserved), interacting correctly with the
+# carry checkbox via _batch_start_index.
+# ══════════════════════════════════════════════════════════════════════════
+def t53():
+    w = mk_window()
+    w.images = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    w.current_image_index = 2
+    w.carry_forward_checkbox = QtWidgets.QCheckBox()
+    w.recycle_checkbox = QtWidgets.QCheckBox()
+
+    w.carry_forward_checkbox.setChecked(False)
+    w.recycle_checkbox.setChecked(False)
+    check("T53 recycle OFF == old slice", w._batch_targets() == ["d.jpg"],
+          w._batch_targets())
+    w.recycle_checkbox.setChecked(True)
+    check("T53 recycle ON appends earlier at the end",
+          w._batch_targets() == ["d.jpg", "a.jpg", "b.jpg", "c.jpg"],
+          w._batch_targets())
+    w.carry_forward_checkbox.setChecked(True)
+    check("T53 recycle ON + carry ON: current not duplicated",
+          w._batch_targets() == ["c.jpg", "d.jpg", "a.jpg", "b.jpg"],
+          w._batch_targets())
+    delattr(w, "recycle_checkbox")
+    check("T53 no recycle widget -> old slice (headless-safe)",
+          w._batch_targets() == ["c.jpg", "d.jpg"], w._batch_targets())
+
+t53()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T54: _parse_saved_labels round-trips boxes + segments with class columns and
+# skips the box line that duplicates a polygon (label files carry a box per
+# polygon; loading both would double every mask).
+# ══════════════════════════════════════════════════════════════════════════
+def t54():
+    import tempfile, os as _os
+    f = G["_parse_saved_labels"]
+    d = tempfile.mkdtemp()
+    seg_path = _os.path.join(d, "seg.txt")
+    box_path = _os.path.join(d, "box.txt")
+    with open(seg_path, "w") as fh:
+        fh.write("1 0.1 0.1 0.3 0.1 0.2 0.3\n")     # triangle, class 1
+        fh.write("0 0.5\n")                          # malformed -> skipped
+    with open(box_path, "w") as fh:
+        fh.write("1 0.2 0.2 0.2 0.2\n")              # duplicates the poly bbox
+        fh.write("0 0.7 0.7 0.1 0.1\n")              # distinct box, class 0
+    rects, rect_cls, polys, poly_cls = f(box_path, seg_path)
+    check("T54 poly loaded with class", len(polys) == 1 and poly_cls == [1],
+          (len(polys), poly_cls))
+    check("T54 duplicate box of poly skipped", rects == [[0.7, 0.7, 0.1, 0.1]], rects)
+    check("T54 rect class kept", rect_cls == [0], rect_cls)
+    rects, rect_cls, polys, poly_cls = f(_os.path.join(d, "none.txt"), None)
+    check("T54 missing files -> all empty",
+          rects == [] and polys == [] and rect_cls == [] and poly_cls == [],
+          (rects, polys))
+
+t54()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T55: set_annotations stores per-annotation class ids only when passed;
+# omitted -> no 'cls' key (readers fall back to 0 exactly as before).
+# ══════════════════════════════════════════════════════════════════════════
+def t55():
+    c = AnnotationCanvas()
+    tri = [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]
+    c.set_annotations(polys=[tri], rects=[[0.6, 0.6, 0.2, 0.2]],
+                      poly_cls=[2], rect_cls=[1])
+    anns = c.get_active_annotations()
+    check("T55 poly cls stored", anns[0].get('cls') == 2, anns[0])
+    check("T55 rect cls stored", anns[1].get('cls') == 1, anns[1])
+    c.set_annotations(polys=[tri], rects=[[0.6, 0.6, 0.2, 0.2]])
+    anns = c.get_active_annotations()
+    check("T55 omitted -> no cls key",
+          all('cls' not in a for a in anns), anns)
+
+t55()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T56: _run_detector class side channel. Single-class prompt leaves
+# _det_classes_aligned None (guaranteed no-behavior-change fast path);
+# multi-class reads per-detection ids; a negative prompt runs ONE pass over
+# pos+neg and suppresses negatives and overlapping positives.
+# ══════════════════════════════════════════════════════════════════════════
+def t56():
+    import types as _types
+
+    class _Boxes:
+        def __init__(self, xyxy, cls=None):
+            self.xyxy = _types.SimpleNamespace(tolist=lambda: list(xyxy))
+            if cls is not None:
+                self.cls = _types.SimpleNamespace(tolist=lambda: list(cls))
+
+    class _Result:
+        def __init__(self, xyxy, cls=None):
+            self.boxes = _Boxes(xyxy, cls)
+            self.masks = object()
+            self.orig_shape = (100, 100)
+
+    tri_a = [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]
+    tri_b = [[0.5, 0.5], [0.7, 0.5], [0.6, 0.7]]
+
+    saved_yt = G.get("run_yoloe_text")
+    saved_rcp = G.get("result_clean_polys")
+    captured = {}
+
+    def fake_yoloe_text(model, image_path, prompt, **k):
+        captured["prompt"] = prompt
+        return None, [captured["result"]]
+
+    G["run_yoloe_text"] = fake_yoloe_text
+    G["result_clean_polys"] = lambda r: [tri_a, tri_b]
+
+    w = mk_window()
+    w.output_folder = "/tmp"
+    w.detector_choice = "YOLOE-seg (one-shot)"
+    w.segmenter_choice = "(none)"
+    w.prompt_mode = "text"
+    w._get_model = lambda key: object()
+    w.image_label = _types.SimpleNamespace(_orig_w=100, _orig_h=100,
+                                           annotations=[],
+                                           get_active_annotations=lambda: [])
+    try:
+        # Single class: side channel must stay None.
+        captured["result"] = _Result([[10, 10, 30, 30], [50, 50, 70, 70]], cls=[0, 0])
+        boxes, _ = w._run_detector("/tmp/x.jpg", "berry", 0.2, 0.2, None)
+        check("T56 single class -> 2 boxes", len(boxes) == 2, boxes)
+        check("T56 single class -> classes None", w._det_classes_aligned is None,
+              w._det_classes_aligned)
+
+        # Multi class: per-detection ids ride the side channel.
+        captured["result"] = _Result([[10, 10, 30, 30], [50, 50, 70, 70]], cls=[0, 1])
+        boxes, _ = w._run_detector("/tmp/x.jpg", "berry, leaf", 0.2, 0.2, None)
+        check("T56 multi class -> classes aligned",
+              w._det_classes_aligned == [0, 1], w._det_classes_aligned)
+
+        # Negative prompt: one pass over pos+neg, negatives suppressed.
+        w.neg_prompt_entry = _types.SimpleNamespace(text=lambda: "leaf")
+        captured["result"] = _Result([[10, 10, 30, 30], [50, 50, 70, 70]], cls=[0, 1])
+        boxes, _ = w._run_detector("/tmp/x.jpg", "berry", 0.2, 0.2, None)
+        check("T56 negative: combined one-pass prompt",
+              captured["prompt"] == "berry, leaf", captured["prompt"])
+        check("T56 negative hit dropped, positive kept",
+              len(boxes) == 1 and w._det_classes_aligned == [0],
+              (boxes, w._det_classes_aligned))
+
+        # Negative overlapping the positive suppresses the positive too.
+        captured["result"] = _Result([[10, 10, 30, 30], [12, 12, 32, 32]], cls=[0, 1])
+        boxes, _ = w._run_detector("/tmp/x.jpg", "berry", 0.2, 0.2, None)
+        check("T56 overlapping positive suppressed", len(boxes) == 0, boxes)
+    finally:
+        if saved_yt is not None:
+            G["run_yoloe_text"] = saved_yt
+        if saved_rcp is not None:
+            G["result_clean_polys"] = saved_rcp
+
+t56()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T57: SAM3 box exemplars are searched ONE CLASS PER PASS. ultralytics forces
+# nc=1 whenever bboxes are passed, so a single flat call blends two classes
+# into one concept and returns one class -- the bug that made a two-class run
+# write class 1 on every row. One distinct class must still cost exactly one
+# pass (the hot path), and each pass's detections carry its class.
+# ══════════════════════════════════════════════════════════════════════════
+def t57():
+    import types as _types
+
+    w = mk_window()
+    w.prompt_mode = "boxes"
+    w.active_class = 0
+    calls = []
+
+    def fake_partitioned(image_path, exemplars, conf, text, supplementary_exemplars=None):
+        calls.append({"exemplars": list(exemplars),
+                      "anchors": list(supplementary_exemplars or [])})
+        # One detection per exemplar, offset so nothing overlaps across passes.
+        n = len(exemplars) or 1
+        base = len(calls) * 100
+        boxes = [[base + i * 10, 0, base + i * 10 + 5, 5] for i in range(n)]
+        polys = [[[0.1, 0.1], [0.2, 0.1], [0.15, 0.2]] for _ in range(n)]
+        return boxes, polys, "results-sentinel"
+
+    w._run_sam3_boxes_partitioned = fake_partitioned
+
+    # Single class -> exactly one pass, results object passed straight through.
+    calls.clear()
+    boxes, polys, cls, results = w._run_sam3_boxes_multiclass(
+        "/tmp/x.jpg", [[0, 0, 5, 5], [9, 9, 14, 14]], [2, 2], 0.2, "")
+    check("T57 single class -> one pass", len(calls) == 1, len(calls))
+    check("T57 single class -> tagged with that class", cls == [2, 2], cls)
+    check("T57 single class -> results passed through",
+          results == "results-sentinel", results)
+
+    # Two classes -> two passes, each seeded with only its own exemplars.
+    calls.clear()
+    boxes, polys, cls, results = w._run_sam3_boxes_multiclass(
+        "/tmp/x.jpg",
+        [[0, 0, 5, 5], [9, 9, 14, 14], [20, 20, 25, 25]], [0, 1, 0], 0.2, "",
+        prior_anchors_by_cls={0: [[30, 30, 35, 35]], 1: [[40, 40, 45, 45]]})
+    check("T57 two classes -> two passes", len(calls) == 2, len(calls))
+    check("T57 pass 0 gets only class-0 exemplars",
+          calls[0]["exemplars"] == [[0, 0, 5, 5], [20, 20, 25, 25]], calls[0]["exemplars"])
+    check("T57 pass 1 gets only class-1 exemplars",
+          calls[1]["exemplars"] == [[9, 9, 14, 14]], calls[1]["exemplars"])
+    check("T57 pass 0 anchored on class-0 priors only",
+          calls[0]["anchors"] == [[30, 30, 35, 35]], calls[0]["anchors"])
+    check("T57 pass 1 anchored on class-1 priors only",
+          calls[1]["anchors"] == [[40, 40, 45, 45]], calls[1]["anchors"])
+    check("T57 detections carry their pass's class", cls == [0, 0, 1], cls)
+    check("T57 boxes and classes aligned", len(boxes) == len(cls) == 3, (boxes, cls))
+    check("T57 polys and classes aligned", len(polys) == len(cls), (polys, cls))
+    check("T57 multi-pass returns no single results object", results is None, results)
+
+    # No drawn exemplars: the prior anchors alone drive one pass per class.
+    calls.clear()
+    _b, _p, cls, _r = w._run_sam3_boxes_multiclass(
+        "/tmp/x.jpg", [], [], 0.2, "",
+        prior_anchors_by_cls={0: [[1, 1, 2, 2]], 3: [[5, 5, 6, 6]]})
+    check("T57 anchors alone -> one pass per anchor class", len(calls) == 2, len(calls))
+    check("T57 anchor-only classes tagged", sorted(set(cls)) == [0, 3], cls)
+
+t57()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T58: the SAM3 box branch of _run_detector routes through the multi-class
+# helper and publishes per-detection classes on the side channel.
+# ══════════════════════════════════════════════════════════════════════════
+def t58():
+    import types as _types
+
+    w = mk_window()
+    w.output_folder = "/tmp"
+    w.detector_choice = "SAM3 (one-shot)"
+    w.segmenter_choice = "(none)"
+    w.prompt_mode = "boxes"
+    w.active_class = 1
+    prompt_boxes = [[0, 0, 5, 5], [50, 50, 55, 55]]
+    w.image_label = _types.SimpleNamespace(
+        _orig_w=100, _orig_h=100, annotations=[],
+        get_active_annotations=lambda: [{}],
+        get_prompt_boxes_with_cls_in_image_coords=lambda: (prompt_boxes, [0, 1]))
+    w._boxes_from_seg_polys = lambda polys, path, fallback=None: list(fallback or [])
+
+    seen = {}
+
+    def fake_multiclass(image_path, exemplars, exemplar_cls, conf, text,
+                        prior_anchors_by_cls=None):
+        seen["cls"] = list(exemplar_cls)
+        seen["anchors"] = dict(prior_anchors_by_cls or {})
+        return ([[1, 1, 2, 2], [3, 3, 4, 4]],
+                [[[0.1, 0.1]], [[0.2, 0.2]]], [0, 1], None)
+
+    w._run_sam3_boxes_multiclass = fake_multiclass
+    boxes, _ = w._run_detector("/tmp/x.jpg", "", 0.2, 0.2, prompt_boxes)
+    check("T58 exemplar classes read from the drawn boxes", seen["cls"] == [0, 1], seen)
+    check("T58 side channel carries per-detection classes",
+          w._det_classes_aligned == [0, 1], w._det_classes_aligned)
+    check("T58 boxes returned", len(boxes) == 2, boxes)
+    check("T58 polys aligned with boxes",
+          len(w._oneshot_polys_aligned) == 2, w._oneshot_polys_aligned)
+
+    # All class 0 -> the None single-class fast path, unchanged behavior.
+    w._run_sam3_boxes_multiclass = lambda *a, **k: (
+        [[1, 1, 2, 2]], [[[0.1, 0.1]]], [0], None)
+    w._run_detector("/tmp/x.jpg", "", 0.2, 0.2, prompt_boxes)
+    check("T58 all-class-0 -> classes None", w._det_classes_aligned is None,
+          w._det_classes_aligned)
+
+t58()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T59: _prior_anchors_by_class groups prior detector output by class so a
+# class-1 search is never anchored on class-0 objects.
+# ══════════════════════════════════════════════════════════════════════════
+def t59():
+    import types as _types
+
+    w = mk_window()
+    anns = [
+        {"type": "rect", "data": [0.1, 0.1, 0.1, 0.1], "source": "detector", "cls": 0, "deleted": False},
+        {"type": "rect", "data": [0.5, 0.5, 0.1, 0.1], "source": "detector", "cls": 1, "deleted": False},
+        {"type": "poly", "data": [[0.7, 0.7], [0.9, 0.7], [0.8, 0.9]], "source": "restored", "cls": 1, "deleted": False},
+        {"type": "rect", "data": [0.2, 0.2, 0.1, 0.1], "source": "manual", "cls": 0, "deleted": False},
+        {"type": "rect", "data": [0.3, 0.3, 0.1, 0.1], "source": "detector", "cls": 0, "deleted": True},
+        {"type": "rect", "data": [0.4, 0.4, 0.1, 0.1], "source": "prompt", "cls": 1, "deleted": False},
+    ]
+    w.image_label = _types.SimpleNamespace(_orig_w=100, _orig_h=100, annotations=anns)
+    got = w._prior_anchors_by_class()
+    check("T59 grouped by class", sorted(got) == [0, 1], sorted(got))
+    check("T59 one class-0 anchor", len(got[0]) == 1, got[0])
+    check("T59 class-1 takes detector + restored", len(got[1]) == 2, got[1])
+    check("T59 manual/deleted/prompt anns excluded",
+          all(len(v) <= 2 for v in got.values()), got)
+
+    w.image_label = _types.SimpleNamespace(_orig_w=0, _orig_h=0, annotations=anns)
+    check("T59 no image size -> empty", w._prior_anchors_by_class() == {},
+          w._prior_anchors_by_class())
+
+t59()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T60: carry-forward carries the class. _collect_box_prompt_crops records a
+# class per crop; _ref_cls_array turns it into YOLOE's visual-prompt cls array;
+# _run_sam3_crop_composite composites one class per pass.
+# ══════════════════════════════════════════════════════════════════════════
+def t60():
+    import types as _types
+    import numpy as _np
+
+    w = mk_window()
+    w.images = ["/tmp/x.jpg"]
+    w.current_image_index = 0
+    # Second box is degenerate (sub-2px) and must drop its class with it.
+    boxes = [[0, 0, 10, 10], [1, 1, 2, 2], [20, 20, 40, 40]]
+    w.image_label = _types.SimpleNamespace(
+        get_prompt_boxes_with_cls_in_image_coords=lambda: (boxes, [0, 1, 2]))
+    w._imread_cached = lambda p: _np.zeros((100, 100, 3), dtype=_np.uint8)
+    ref = w._collect_box_prompt_crops()
+    check("T60 degenerate crop dropped", len(ref["crops"]) == 2, len(ref["crops"]))
+    check("T60 cls aligned with surviving crops", ref["cls"] == [0, 2], ref["cls"])
+    check("T60 boxes aligned with cls",
+          len(ref["boxes_xyxy"]) == len(ref["cls"]), ref)
+
+    arr = w._ref_cls_array(ref)
+    check("T60 ref cls array matches", list(arr) == [0, 2], list(arr))
+    check("T60 legacy bundle without cls -> zeros",
+          list(w._ref_cls_array({"boxes_xyxy": [[0, 0, 1, 1], [2, 2, 3, 3]]})) == [0, 0],
+          list(w._ref_cls_array({"boxes_xyxy": [[0, 0, 1, 1], [2, 2, 3, 3]]})))
+
+    # Crop-composite: one pass per class, each seeing only its own crops.
+    passes = []
+
+    def fake_single(image_path, sub_ref, conf):
+        passes.append(list(sub_ref["cls"]) if "cls" in sub_ref else None)
+        n = len(sub_ref["crops"])
+        base = len(passes) * 100
+        # Spread the boxes so nothing overlaps: same-class dedup is real and
+        # would otherwise collapse identical detections and mask the count.
+        return ([[base + i * 10, 0, base + i * 10 + 5, 5] for i in range(n)],
+                [[[0.1, 0.1], [0.2, 0.1], [0.15, 0.2]] for _ in range(n)],
+                "res")
+
+    w._run_sam3_crop_composite_single = fake_single
+    multi = {"image_path": "/tmp/x.jpg", "crops": ["a", "b", "c"],
+             "boxes_xyxy": [[0, 0, 1, 1], [2, 2, 3, 3], [4, 4, 5, 5]],
+             "cls": [0, 1, 0]}
+    b, p, c, r = w._run_sam3_crop_composite("/tmp/x.jpg", multi, 0.2)
+    check("T60 crop-composite one pass per class", len(passes) == 2, len(passes))
+    check("T60 crop-composite classes tagged", c == [0, 0, 1], c)
+    check("T60 crop-composite multi-pass results None", r is None, r)
+    check("T60 crop-composite boxes aligned", len(b) == len(c) == len(p), (b, c, p))
+
+    # Single class stays a single pass and returns the raw results object.
+    passes.clear()
+    single = {"image_path": "/tmp/x.jpg", "crops": ["a", "b"],
+              "boxes_xyxy": [[0, 0, 1, 1], [2, 2, 3, 3]], "cls": [3, 3]}
+    b, p, c, r = w._run_sam3_crop_composite("/tmp/x.jpg", single, 0.2)
+    check("T60 single-class carry -> one pass", len(passes) == 1, len(passes))
+    check("T60 single-class carry tagged", c == [3, 3], c)
+    check("T60 single-class carry keeps results", r == "res", r)
+
+    # The negative-box matcher consumes the SAME 4-tuple. It silently skipped
+    # suppression for a whole batch run when the composite grew its cls return
+    # and this caller kept unpacking 3 (ValueError swallowed by the guard).
+    w._run_sam3_crop_composite = lambda *a, **k: ([[1, 2, 3, 4]], [None], [0], None)
+    got = w._detect_neg_matches("/tmp/x.jpg", single, 0.2, "sam3_det")
+    check("T60 neg-box matcher unpacks the 4-tuple composite return",
+          got == [[1, 2, 3, 4]], got)
+
+t60()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T61: the carry ANCHOR (the frozen exemplar set reused on later images) keeps
+# a class per box, and _prompt_box_classes reads it instead of flattening every
+# carried box onto the active class.
+# ══════════════════════════════════════════════════════════════════════════
+def t61():
+    import types as _types
+
+    w = mk_window()
+    boxes = [[0, 0, 10, 10], [20, 20, 30, 30]]
+    w.image_label = _types.SimpleNamespace(
+        _orig_w=100, _orig_h=100,
+        get_prompt_boxes_with_cls_in_image_coords=lambda: (boxes, [0, 2]))
+    w._refresh_and_get_carry_anchor()
+    check("T61 anchor freezes classes", w._carry_anchor_cls == [0, 2], w._carry_anchor_cls)
+    check("T61 anchor cls list matches anchor length",
+          len(w._carry_anchor_cls_list()) == len(w._carry_anchor), w._carry_anchor)
+
+    # Later image: nothing drawn, so classes must come from the anchor.
+    w.active_class = 1
+    w.image_label = _types.SimpleNamespace(
+        _orig_w=100, _orig_h=100,
+        get_prompt_boxes_with_cls_in_image_coords=lambda: ([], []))
+    carried = w._carry_anchor_boxes_img()
+    check("T61 carried boxes recovered", len(carried) == 2, carried)
+    check("T61 carried classes survive, not flattened to active",
+          w._prompt_box_classes(carried) == [0, 2], w._prompt_box_classes(carried))
+
+    # An anchor with no recorded classes falls back to all-zeros, not a crash.
+    w._carry_anchor_cls = []
+    check("T61 legacy anchor -> zeros", w._carry_anchor_cls_list() == [0, 0],
+          w._carry_anchor_cls_list())
+
+t61()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T62: classes.txt must not shrink. _max_box_class_used is bounded by the
+# configured class count, not by whichever boxes happen to be drawn right now
+# (advancing to an undrawn image used to rewrite classes.txt down to one line).
+# ══════════════════════════════════════════════════════════════════════════
+def t62():
+    import types as _types
+
+    w = mk_window()
+    w.prompt_mode = "boxes"
+    w.active_class = 0
+    w.box_class_names = ["berry", "leaf", "stem"]
+    w.image_label = _types.SimpleNamespace(
+        get_prompt_boxes_with_cls_in_image_coords=lambda: ([], []))
+    check("T62 no drawn boxes -> count from the registry",
+          w._max_box_class_used() == 2, w._max_box_class_used())
+    check("T62 classes.txt keeps every configured name",
+          w._class_names_for_run("") == ["berry", "leaf", "stem"],
+          w._class_names_for_run(""))
+
+    # Text mode still names classes from the prompt terms.
+    w.prompt_mode = "text"
+    check("T62 text mode names from prompt",
+          w._class_names_for_run("berry, leaf") == ["berry", "leaf"],
+          w._class_names_for_run("berry, leaf"))
+    check("T62 empty prompt -> object fallback",
+          w._class_names_for_run("") == ["object"], w._class_names_for_run(""))
+
+    # A window built without the registry (headless) still gets a valid name.
+    w2 = mk_window()
+    w2.prompt_mode = "boxes"
+    w2.active_class = 0
+    w2.image_label = _types.SimpleNamespace(
+        get_prompt_boxes_with_cls_in_image_coords=lambda: ([], []))
+    check("T62 missing registry -> default single class",
+          w2._class_names_for_run("") == ["class_0"], w2._class_names_for_run(""))
+
+t62()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T63: box class names live in the in-process session store: they survive a
+# window teardown (back to the main menu and in again) but never an app
+# restart, and nothing is written to ~/.autoannotate.
+# ══════════════════════════════════════════════════════════════════════════
+def t63():
+    from autoannotate.gui import session_state
+    from autoannotate.palette import MAX_BOX_CLASSES, class_color_rgb
+
+    # Box prompts offer class ids 0..4. A deliberate product limit: each extra
+    # class costs one more SAM3 pass per image.
+    check("T63 box classes capped at 5", MAX_BOX_CLASSES == 5, MAX_BOX_CLASSES)
+    cols = [class_color_rgb(i) for i in range(MAX_BOX_CLASSES)]
+    check("T63 every class inside the cap has its own color",
+          len(set(cols)) == MAX_BOX_CLASSES, cols)
+
+    session_state.reset()
+    try:
+        w = mk_window()
+        check("T63 fresh session starts from one unnamed class",
+              w._load_box_class_names() == ["class_0"], w._load_box_class_names())
+
+        w._save_box_class_names(["berry", "leaf"])
+        check("T63 names stored in the session, not on disk",
+              session_state.STATE["box_class_names"] == ["berry", "leaf"],
+              session_state.STATE["box_class_names"])
+
+        # A second window in the same session (main menu round trip) sees them.
+        w2 = mk_window()
+        check("T63 names survive a window teardown",
+              w2._load_box_class_names() == ["berry", "leaf"],
+              w2._load_box_class_names())
+
+        # A store touched by a build with a higher cap must clamp on load, not
+        # resurrect classes the dialog can no longer show.
+        w2._save_box_class_names([f"n{i}" for i in range(9)])
+        check("T63 over-long stored list clamps to the cap",
+              len(w2._load_box_class_names()) == MAX_BOX_CLASSES,
+              w2._load_box_class_names())
+
+        # A malformed store falls back to the default rather than crashing.
+        session_state.STATE["box_class_names"] = ["", "  "]
+        check("T63 malformed store -> default",
+              w2._load_box_class_names() == ["class_0"], w2._load_box_class_names())
+
+        # An app restart = a fresh store: back to one unnamed class.
+        session_state.reset()
+        check("T63 app restart resets to one unnamed class",
+              mk_window()._load_box_class_names() == ["class_0"],
+              session_state.STATE["box_class_names"])
+
+        # Nothing box-class-related touches the disk anymore.
+        src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "manual_window.py"),
+                   encoding="utf-8").read()
+        check("T63 box_classes.json is gone from the code",
+              "box_classes.json" not in src and "BOX_CLASSES_FILE" not in src,
+              "manual_window still references the settings file")
+    finally:
+        session_state.reset()
+
+t63()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T64: the saved review images color each shape by class, and fall back to
+# class-0 magenta when no classes are supplied (single-class output unchanged).
+# ══════════════════════════════════════════════════════════════════════════
+def t64():
+    import types as _types
+    import numpy as _np
+    from autoannotate.palette import class_color_bgr as _bgr
+
+    w = mk_window()
+    drawn = []
+    saved_cv2 = G.get("cv2")
+
+    class _FakeCv2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 0
+        IMWRITE_JPEG_QUALITY = 1
+
+        @staticmethod
+        def rectangle(img, p1, p2, color, thickness):
+            drawn.append(("rect", color))
+
+        @staticmethod
+        def polylines(img, pts, closed, color, thickness):
+            drawn.append(("poly", color))
+
+    G["cv2"] = _FakeCv2
+    try:
+        w._imread_cached = lambda p: _np.zeros((100, 100, 3), dtype=_np.uint8)
+
+        drawn.clear()
+        w._render_overlay_image("/tmp/x.jpg",
+                                boxes=[[0, 0, 5, 5], [6, 6, 9, 9]],
+                                box_classes=[0, 1])
+        check("T64 boxes colored per class",
+              drawn == [("rect", _bgr(0)), ("rect", _bgr(1))], drawn)
+
+        drawn.clear()
+        tri = [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]
+        w._render_overlay_image("/tmp/x.jpg", polys=[tri, tri], poly_classes=[2, 0])
+        check("T64 polys colored per class",
+              drawn == [("poly", _bgr(2)), ("poly", _bgr(0))], drawn)
+
+        drawn.clear()
+        w._render_overlay_image("/tmp/x.jpg", boxes=[[0, 0, 5, 5]], polys=[tri])
+        check("T64 no classes -> class 0 magenta",
+              drawn == [("poly", (255, 0, 255)), ("rect", (255, 0, 255))], drawn)
+
+        # A class list shorter than the shape list must not raise.
+        drawn.clear()
+        w._render_overlay_image("/tmp/x.jpg",
+                                boxes=[[0, 0, 5, 5], [6, 6, 9, 9]], box_classes=[3])
+        check("T64 short class list pads with class 0",
+              drawn == [("rect", _bgr(3)), ("rect", _bgr(0))], drawn)
+    finally:
+        if saved_cv2 is not None:
+            G["cv2"] = saved_cv2
+
+t64()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T65: _save_split_overlays threads the class list into both renders, and
+# save_class_legend_image writes a standalone key BESIDE the review folders
+# rather than painting over any labelled image.
+# ══════════════════════════════════════════════════════════════════════════
+def t65():
+    import tempfile as _tf
+    import numpy as _np
+    from autoannotate.pipeline.overlay import save_class_legend_image
+
+    w = mk_window()
+    seen = []
+    w._render_overlay_image = lambda path, boxes=None, polys=None, box_classes=None, poly_classes=None: (
+        seen.append({"boxes": boxes, "polys": polys,
+                     "box_classes": box_classes, "poly_classes": poly_classes}) or "img")
+    w._save_annotated_image = lambda path, img, kind: seen[-1].update({"kind": kind})
+
+    tri = [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]
+    w._save_split_overlays("/tmp/x.jpg", [[0, 0, 5, 5]], [tri], classes=[1])
+    check("T65 two renders (boxes + masks)", len(seen) == 2, len(seen))
+    check("T65 boxes render gets box_classes",
+          seen[0]["box_classes"] == [1] and seen[0]["kind"] == "boxes", seen[0])
+    check("T65 masks render gets poly_classes",
+          seen[1]["poly_classes"] == [1] and seen[1]["kind"] == "masks", seen[1])
+
+    # No polys -> no masks render, as before.
+    seen.clear()
+    w._save_split_overlays("/tmp/x.jpg", [[0, 0, 5, 5]], [], classes=[0])
+    check("T65 no polys -> boxes render only", len(seen) == 1, len(seen))
+
+    # The legend is a real PNG, written where it cannot be mistaken for data.
+    with _tf.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "annotated_SAM3", "class_legend.png")
+        # cv2 is stubbed at module import, so drive the real one if present.
+        try:
+            import cv2 as _real_cv2
+        except Exception:
+            _real_cv2 = None
+        if _real_cv2 is not None and hasattr(_real_cv2, "imwrite"):
+            got = save_class_legend_image(["berry", "leaf"], out)
+            check("T65 legend written", got == out and os.path.exists(out), got)
+            check("T65 legend sits beside boxes/ and masks/, not inside",
+                  os.path.basename(os.path.dirname(out)) == "annotated_SAM3", out)
+        check("T65 no names -> no legend",
+              save_class_legend_image([], out) is None, "empty names")
+
+t65()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T66: a two-stage segmenter run keeps the class on every mask. save_masks is
+# handed the box classes, which segment_with_boxes guarantees are index-aligned
+# with the masks it returns.
+# ══════════════════════════════════════════════════════════════════════════
+def t66():
+    import types as _types
+    import numpy as _np
+
+    w = mk_window()
+    w.output_folder = "/tmp"
+    w.images = ["/tmp/x.jpg"]
+    w.current_image_index = 0
+    captured = {}
+    saved_sm = G.get("save_masks")
+    saved_ow = G.get("overlay_with_borders")
+    saved_am = G.get("adjust_masks")
+    try:
+        G["save_masks"] = lambda res, d, p, classes=None: captured.update({"classes": classes})
+        G["adjust_masks"] = lambda res: [object(), object()]
+        G["overlay_with_borders"] = lambda img, m, color, thickness=2: img
+
+        boxes = [[0, 0, 5, 5], [6, 6, 9, 9]]
+        w.image_label = _types.SimpleNamespace(
+            get_boxes_with_cls_in_image_coords=lambda: (boxes, [0, 2]))
+        w._run_segmenter = lambda p, b: ["results"]
+        w._imread_cached = lambda p: _np.zeros((10, 10, 3), dtype=_np.uint8)
+        w.show_result_image = lambda img: None
+        w._write_class_key = lambda names, folder=None: captured.update({"names": names})
+        w._positive_prompt_text = lambda: "berry, stem"
+        w.prompt_mode = "text"
+
+        w.run_with_manual_boxes()
+        check("T66 manual-box segments keep their classes",
+              captured["classes"] == [0, 2], captured.get("classes"))
+        check("T66 manual-box run writes the class key",
+              captured["names"] == ["berry", "stem"], captured.get("names"))
+
+        # All class 0 -> the None fast path, byte-identical to the old output.
+        captured.clear()
+        w.image_label = _types.SimpleNamespace(
+            get_boxes_with_cls_in_image_coords=lambda: (boxes, [0, 0]))
+        w.run_with_manual_boxes()
+        check("T66 all class 0 -> classes None", captured["classes"] is None,
+              captured.get("classes"))
+    finally:
+        for k, v in (("save_masks", saved_sm), ("overlay_with_borders", saved_ow),
+                     ("adjust_masks", saved_am)):
+            if v is not None:
+                G[k] = v
+
+t66()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T67: Auto Annotate Remaining reports how long the run took. format_duration
+# reads in the units a user plans with; the batch method must not shadow the
+# module-level `time` with a local import placed after the clock starts.
+# ══════════════════════════════════════════════════════════════════════════
+def t67():
+    import inspect
+    format_duration = G["format_duration"]
+
+    for secs, want in [(0, "0.0s"), (3.14, "3.1s"), (59.9, "59.9s"),
+                       (60, "1m 00s"), (187, "3m 07s"),
+                       (3600, "1h 00m 00s"), (4350, "1h 12m 30s")]:
+        check(f"T67 format_duration({secs}) == {want}",
+              format_duration(secs) == want, format_duration(secs))
+    check("T67 negative elapsed clamped", format_duration(-5) == "0.0s",
+          format_duration(-5))
+
+    src = inspect.getsource(ManualWindow.auto_annotate_remaining)
+    check("T67 clock started before the loop",
+          "run_started = time.perf_counter()" in src, "missing run_started")
+    check("T67 no local 'import time' shadowing the clock",
+          "import time" not in src, "a local import time raises UnboundLocalError")
+    check("T67 elapsed reported in the summary", "Time taken:" in src, "missing")
+
+t67()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T68: the side-by-side zoom/pan view. Zoom is inert until Image Resize is
+# armed, clamps to [1, 8], never strands a panned image off-screen, and its
+# whole state round-trips so the middle-arrow swap can carry it.
+# ══════════════════════════════════════════════════════════════════════════
+def t68():
+    from autoannotate.gui.zoompan import ZoomPanImageView, MIN_ZOOM, MAX_ZOOM
+
+    v = ZoomPanImageView()
+    v.resize(400, 300)
+    pm = QtGui.QPixmap(800, 600)
+    pm.fill(QtGui.QColor("red"))
+    v.set_pixmap(pm)
+    check("T68 starts at fit", v.view_state()["zoom"] == 1.0, v.view_state())
+    check("T68 fit scale is min(w/iw, h/ih)",
+          abs(v._get_scale_offset()[0] - 0.5) < 1e-9, v._get_scale_offset())
+
+    # Zoom toward the widget centre keeps the centre fixed -> no pan.
+    v.set_resize_mode(True)
+    v._zoom_at(2.0, 200, 150)
+    st = v.view_state()
+    check("T68 zoom applied", abs(st["zoom"] - 2.0) < 1e-9, st)
+    check("T68 centre zoom does not pan",
+          abs(st["pan_x"]) < 1e-9 and abs(st["pan_y"]) < 1e-9, st)
+
+    # Zoom toward a corner must pan to keep that corner under the cursor.
+    v.reset_view()
+    v._zoom_at(2.0, 0, 0)
+    check("T68 corner zoom pans", v.view_state()["pan_x"] != 0.0, v.view_state())
+
+    v.reset_view()
+    check("T68 reset returns to fit",
+          v.view_state()["zoom"] == 1.0 and v.view_state()["pan_x"] == 0.0, v.view_state())
+
+    v._zoom = 0.01; v._clamp_view()
+    check("T68 cannot zoom out past fit", v._zoom == MIN_ZOOM, v._zoom)
+    v._zoom = 999; v._clamp_view()
+    check("T68 zoom capped", v._zoom == MAX_ZOOM, v._zoom)
+    v._zoom = 1.0; v._pan_x = 500; v._pan_y = -400; v._clamp_view()
+    check("T68 pan forced to zero at fit", (v._pan_x, v._pan_y) == (0.0, 0.0),
+          (v._pan_x, v._pan_y))
+    v._zoom = 2.0; v._pan_x = 10 ** 9; v._clamp_view()
+    check("T68 pan clamped, image never stranded", v._pan_x <= 400, v._pan_x)
+
+    # Full state round-trip: what _swap_sides relies on.
+    v.set_resize_mode(True)
+    state = v.view_state()
+    other = ZoomPanImageView(); other.resize(400, 300); other.set_pixmap(pm)
+    other.apply_view_state(state)
+    check("T68 view state round-trips", other.view_state() == state,
+          (other.view_state(), state))
+    check("T68 partial state keeps current values",
+          (other.apply_view_state({"zoom": 3.0}) or other.view_state()["resize_mode"]) is True,
+          other.view_state())
+
+    # No image -> no crash, no transform.
+    empty = ZoomPanImageView(); empty.resize(100, 100)
+    empty.set_resize_mode(True)
+    empty._zoom_at(2.0, 10, 10)
+    check("T68 no image -> zoom is a no-op", empty.view_state()["zoom"] == 1.0,
+          empty.view_state())
+
+t68()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T69: the middle-arrow swap carries each side's zoom / pan with its image,
+# and the per-pane Image Resize buttons re-sync to the state that moved
+# under them.
+# ══════════════════════════════════════════════════════════════════════════
+def t69():
+    import tempfile as _tf
+    from autoannotate.gui.side_by_side import SideBySideWindow
+
+    w = SideBySideWindow.__new__(SideBySideWindow)
+    QtWidgets.QWidget.__init__(w)
+    w.model = w.processor = None
+    w._synth_pixmap = w._gt_pixmap = None
+    w.synth_images = w.gt_images = []
+    w.pairs = []
+    w.current_index = 0
+    w.titles = {"synth": "Synthetic Images", "gt": "Ground Truth"}
+    w._left, w._right = "gt", "synth"
+    w.view_states = {"synth": None, "gt": None}
+    w.init_ui()
+    w.resize(800, 600)
+
+    with _tf.TemporaryDirectory() as tmp:
+        # Real files on disk: _show_current reloads pixmaps from the pair paths,
+        # and a missing path legitimately clears the view.
+        paths = []
+        for i, color in enumerate(("blue", "green", "red", "yellow")):
+            pm = QtGui.QPixmap(80, 60)
+            pm.fill(QtGui.QColor(color))
+            p = os.path.join(tmp, f"img_{i}.png")
+            pm.save(p)
+            paths.append(p)
+        w.synth_images = [paths[0], paths[1]]
+        w.gt_images = [paths[2], paths[3]]
+        w.pairs = [(paths[0], paths[2]), (paths[1], paths[3])]
+        w.current_index = 0
+        w._show_current()
+        check("T69 both panes have an image",
+              w.left_view.has_image() and w.right_view.has_image(), "no image loaded")
+
+        # Zoom the LEFT pane, which is currently the 'gt' side.
+        w.left_resize_btn.setChecked(True)
+        w.left_view._zoom_at(3.0, 5, 5)
+        gt_state = w.left_view.view_state()
+        check("T69 left pane zoomed", gt_state["zoom"] > 1.0, gt_state)
+
+        w._swap_sides()
+        check("T69 logical sides swapped", (w._left, w._right) == ("synth", "gt"),
+              (w._left, w._right))
+        check("T69 gt view state followed gt to the right pane",
+              w.right_view.view_state() == gt_state,
+              (w.right_view.view_state(), gt_state))
+        check("T69 synth pane still at fit",
+              w.left_view.view_state()["zoom"] == 1.0, w.left_view.view_state())
+        check("T69 right Image Resize button re-checked",
+              w.right_resize_btn.isChecked(), w.right_resize_btn.text())
+        check("T69 right button text follows",
+              w.right_resize_btn.text() == "Image Resize: ON", w.right_resize_btn.text())
+        check("T69 left button unchecked",
+              not w.left_resize_btn.isChecked(), w.left_resize_btn.text())
+
+        # Swapping back restores the original placement.
+        w._swap_sides()
+        check("T69 swap back restores gt to the left",
+              w.left_view.view_state() == gt_state, w.left_view.view_state())
+
+        # Next must not throw away the zoom the user set: stepping through pairs
+        # at a zoom is the whole point of zooming.
+        z = w.left_view.view_state()["zoom"]
+        w.show_next()
+        check("T69 zoom survives Next",
+              abs(w.left_view.view_state()["zoom"] - z) < 1e-9, w.left_view.view_state())
+        check("T69 Next advanced the pair", w.current_index == 1, w.current_index)
+
+        # A missing pair member clears that pane back to the placeholder.
+        w.pairs = [(paths[0], None)]
+        w.current_index = 0
+        w._show_current()
+        gt_pane = w.left_view if w._left == "gt" else w.right_view
+        check("T69 unmatched side shows no image", not gt_pane.has_image(), "still has image")
+
+        # A new folder starts fresh.
+        w._reset_views()
+        check("T69 new folder resets both panes to fit",
+              w.left_view.view_state()["zoom"] == 1.0
+              and w.right_view.view_state()["zoom"] == 1.0,
+              (w.left_view.view_state(), w.right_view.view_state()))
+
+    w.close()
+
+t69()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T70: image I/O is unicode-safe, and NOTHING calls cv2.imread/imwrite directly.
+# On Windows those go through the ANSI API and fail silently on any path outside
+# the active code page -- including the default temp dir under a non-ASCII
+# username, which the SAM3 crop-composite carry writes to.
+# ══════════════════════════════════════════════════════════════════════════
+def t70():
+    import re as _re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg = os.path.join(repo, "autoannotate")
+    offenders = []
+    for root, dirs, files in os.walk(pkg):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for fn in files:
+            if not fn.endswith(".py") or fn == "imageio.py":
+                continue
+            path = os.path.join(root, fn)
+            with open(path, encoding="utf-8") as fh:
+                for i, line in enumerate(fh, 1):
+                    if _re.search(r"\bcv2\.(imread|imwrite)\s*\(", line):
+                        offenders.append(f"{os.path.relpath(path, repo)}:{i}")
+    check("T70 no raw cv2.imread/imwrite outside imageio.py",
+          not offenders, offenders)
+
+    # The real helpers (not the stubs) must round-trip a non-ASCII path. cv2 is
+    # stubbed in THIS process, so the probe runs in a clean interpreter against
+    # the genuine module. Skipped when real cv2 is not installed.
+    import subprocess as _sp
+    probe = (
+        "import os, sys, tempfile, numpy as np\n"
+        f"sys.path.insert(0, {repo!r})\n"
+        "from autoannotate.imageio import imread_unicode, imwrite_unicode\n"
+        "with tempfile.TemporaryDirectory() as t:\n"
+        "    p = os.path.join(t, 'b\\u00e4i\\u5b57', 'x.png')\n"
+        "    w = imwrite_unicode(p, np.zeros((4,4,3), dtype=np.uint8))\n"
+        "    r = imread_unicode(p) is not None\n"
+        "    bare = imwrite_unicode(os.path.join(t,'noext'), np.zeros((4,4,3), dtype=np.uint8))\n"
+        "    nofile = imread_unicode(os.path.join(t,'missing.png'))\n"
+        "print(int(w), int(r), int(bare), int(nofile is None))\n"
+    )
+    res = _sp.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    out = (res.stdout or "").strip().splitlines()
+    got = out[-1] if out else ""
+    if res.returncode != 0 and "ModuleNotFoundError" in (res.stderr or ""):
+        print("SKIP - T70 unicode round-trip (real cv2 not installed)")
+        return
+    check("T70 non-ASCII write+read round-trips", got.startswith("1 1"),
+          got or (res.stderr or "")[-300:])
+    check("T70 extension-less write refused, missing file -> None",
+          got.endswith("0 1"), got or (res.stderr or "")[-300:])
+
+t70()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T71: every third-party package the code imports is declared in BOTH install
+# files. Catches the classic "added a dependency, forgot requirements" break,
+# which shows up only on the other machine.
+# ══════════════════════════════════════════════════════════════════════════
+def t71():
+    import ast as _ast
+    import re as _re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg = os.path.join(repo, "autoannotate")
+
+    # import name -> the distribution that provides it
+    DIST = {"PIL": "pillow", "cv2": "opencv-python", "dotenv": "python-dotenv",
+            "huggingface_hub": "huggingface_hub", "PyQt5": "pyqt5",
+            "torch": "torch", "numpy": "numpy", "shapely": "shapely",
+            "ultralytics": "ultralytics", "transformers": "transformers",
+            "diffusers": "diffusers"}
+    # Vendored (installed from source, deliberately absent from requirements).
+    VENDORED = {"groundingdino"}
+    stdlib = set(sys.stdlib_module_names)
+
+    imported = set()
+    for root, dirs, files in os.walk(pkg):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            with open(os.path.join(root, fn), encoding="utf-8") as fh:
+                tree = _ast.parse(fh.read(), fn)
+            for n in _ast.walk(tree):
+                if isinstance(n, _ast.Import):
+                    imported.update(a.name.split(".")[0] for a in n.names)
+                elif isinstance(n, _ast.ImportFrom) and n.level == 0 and n.module:
+                    imported.add(n.module.split(".")[0])
+    third = {m for m in imported
+             if m not in stdlib and m != "autoannotate" and m not in VENDORED}
+
+    unmapped = sorted(m for m in third if m not in DIST)
+    check("T71 every third-party import has a known distribution", not unmapped,
+          unmapped)
+
+    def declared(path):
+        names = set()
+        for line in open(path, encoding="utf-8"):
+            line = line.split("#")[0].strip()
+            if not line or line.startswith("-"):
+                continue
+            m = _re.match(r"^([A-Za-z0-9_.\-]+)", line)
+            if m:
+                names.add(m.group(1).lower().replace("_", "-"))
+        return names
+
+    for fname in ("requirements.txt", "requirements-windows.txt", "requirements-macos.lock"):
+        path = os.path.join(repo, fname)
+        if not os.path.exists(path):
+            check(f"T71 {fname} exists", False, "missing")
+            continue
+        have = declared(path)
+        missing = sorted(DIST[m] for m in third
+                         if m in DIST and DIST[m].lower().replace("_", "-") not in have)
+        check(f"T71 {fname} declares every imported package", not missing, missing)
+
+t71()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T72: classes.txt stays a plain YOLO name list (importers read the WHOLE line
+# as the class name, so a trailing colour would rename every class). The colour
+# key lives in the sibling class_colors.txt.
+# ══════════════════════════════════════════════════════════════════════════
+def t72():
+    import tempfile as _tf
+
+    save_classes_txt = G["save_classes_txt"]
+    save_class_colors_txt = G["save_class_colors_txt"]
+    from autoannotate.palette import class_color_image_rgb, rgb_to_hex
+
+    with _tf.TemporaryDirectory() as d:
+        save_classes_txt(["berry", "leaf"], d)
+        lines = open(os.path.join(d, "classes.txt")).read().splitlines()
+        check("T72 classes.txt is one bare name per line", lines == ["berry", "leaf"], lines)
+        check("T72 classes.txt has no colour on any line",
+              all("#" not in ln for ln in lines), lines)
+        check("T72 classes.txt line index is the class id",
+              lines.index("leaf") == 1, lines)
+
+        path = save_class_colors_txt(["berry", "leaf"], d)
+        check("T72 class_colors.txt written beside classes.txt",
+              path == os.path.join(d, "class_colors.txt") and os.path.exists(path), path)
+        text = open(path, encoding="utf-8").read()
+        body = [ln for ln in text.splitlines() if ln and not ln.lstrip().startswith("#")]
+        check("T72 one colour row per class", len(body) == 2, body)
+        check("T72 row carries id, name, colour, hex and rgb",
+              body[0].split() == ["0", "berry", "magenta", "#FF00FF", "255,0,255"],
+              body[0].split())
+        check("T72 class 1 row correct",
+              body[1].split() == ["1", "leaf", "orange", "#FF8C00", "255,140,0"],
+              body[1].split())
+
+        # The hex must be the colour actually drawn into the review images, not
+        # the canvas magenta. Those two differ for class 0 alone.
+        check("T72 hex matches the saved-image colour",
+              rgb_to_hex(class_color_image_rgb(0)) == "#FF00FF",
+              rgb_to_hex(class_color_image_rgb(0)))
+
+        # The file is JUST the table: a single commented column-header line
+        # plus one row per class. The old explanatory comment block is gone on
+        # purpose (user request) and must not creep back.
+        all_lines = [ln for ln in text.splitlines() if ln.strip()]
+        check("T72 file is only the header line plus the rows",
+              len(all_lines) == 3, all_lines)
+        check("T72 header line names the columns",
+              all_lines[0].split() == ["#", "id", "name", "colour", "hex", "rgb"],
+              all_lines[0].split())
+
+        check("T72 empty names -> no file", save_class_colors_txt([], d) is None, "wrote one")
+
+t72()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T73: side-by-side viewer basics after the tint removal. The view transform
+# round-trips across a swap, old saved states that still carry a dark_tint
+# flag are tolerated, no tint machinery remains in the VIEWER (the annotation
+# window keeps its geometry-based tint on purpose), and the in-GUI baked box
+# overlay keeps taking RGB class colours (PIL draws in RGB space).
+# ══════════════════════════════════════════════════════════════════════════
+def t73():
+    import re as _re
+    from autoannotate.gui.zoompan import ZoomPanImageView
+
+    v = ZoomPanImageView()
+    v.resize(400, 300)
+    pm = QtGui.QPixmap(40, 30)
+    pm.fill(QtGui.QColor("blue"))
+    v.set_pixmap(pm)
+    v._zoom = 2.0
+    v._pan_x = 5.0
+    v.set_resize_mode(True)
+    state = v.view_state()
+    check("T73 view_state carries zoom/pan/resize only",
+          sorted(state) == ["pan_x", "pan_y", "resize_mode", "zoom"], state)
+
+    v2 = ZoomPanImageView()
+    v2.resize(400, 300)
+    v2.set_pixmap(pm)
+    v2.apply_view_state(state)
+    check("T73 view state round-trips across widgets",
+          v2._zoom == 2.0 and v2._resize_mode, v2.view_state())
+    # A state saved by the OLD build still carries dark_tint; it must be
+    # ignored, not crash the restore.
+    v2.apply_view_state({"zoom": 1.5, "dark_tint": True})
+    check("T73 stale dark_tint key tolerated", v2._zoom == 1.5, v2._zoom)
+    check("T73 no-image widget takes set_pixmap(None)",
+          ZoomPanImageView().set_pixmap(None) is None, "raised")
+
+    # The tint feature is REMOVED from the side-by-side viewer (user request:
+    # burned-in annotations made pixel recovery unreliable on leafy photos).
+    for mod in ("zoompan", "side_by_side"):
+        src_mod = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", mod + ".py"),
+                       encoding="utf-8").read()
+        check(f"T73 {mod}.py carries no tint machinery",
+              ("set_dark_tint" not in src_mod and "_tint_pixmap" not in src_mod
+               and "Darken Tint" not in src_mod), mod)
+    # ...while the ANNOTATION window keeps its tint: it has real geometry.
+    canvas_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "canvas.py"),
+                      encoding="utf-8").read()
+    check("T73 annotation canvas keeps its geometry-based tint",
+          "set_dark_tint" in canvas_src, "canvas tint removed")
+
+    # The in-GUI baked box overlay draws through PIL in RGB space; feeding it
+    # the BGR form flips class 1 orange into blue on screen. Guard the call
+    # sites the way T70 guards raw cv2.imread.
+    mw_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "manual_window.py"),
+                  encoding="utf-8").read()
+    bgr_fed = 0
+    for hit in _re.finditer(r"draw_boxes_on_image\(", mw_src):
+        colors_block = mw_src[max(0, hit.start() - 400):hit.start()]
+        colors_block = colors_block.split("colors = [")[-1]
+        if "class_color_bgr" in colors_block:
+            bgr_fed += 1
+    check("T73 baked GUI boxes take RGB class colours (PIL draws in RGB)",
+          bgr_fed == 0, f"{bgr_fed} call sites pass class_color_bgr")
+
+t73()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T74: per-class thresholds. With 2+ classes each class overrides the three
+# sliders (det conf / seg conf / max area). Single-pass detectors run at the
+# LOOSEST class value and re-filter each detection against its own class;
+# SAM3 box passes take each class's own confidence directly. A moved global
+# slider gates every run until applied to all classes or reverted. One class
+# = all of it degrades to the plain slider values.
+# ══════════════════════════════════════════════════════════════════════════
+def t74():
+    import tempfile as _tf
+    from PIL import Image as _PILImage
+    from autoannotate.gui import session_state
+
+    session_state.reset()
+    try:
+        w = mk_window()
+
+        # Single class: inactive, every helper degrades to the plain value.
+        check("T74 single class -> per-class inactive", not w._per_class_active(),
+              w._active_class_ids())
+        check("T74 det floor == global with one class",
+              w._det_thresh_floor(0.5) == 0.5, w._det_thresh_floor(0.5))
+        check("T74 headless settings refresh is a no-op",
+              w._refresh_class_settings_ui() is None, "raised")
+
+        # Two box classes with different overrides.
+        w.prompt_mode = "boxes"
+        w.box_class_names = ["berry", "leaf"]
+        w._save_box_class_names(w.box_class_names)
+        session_state.STATE["class_settings"] = {
+            0: {"det": 0.30, "max_area": 0.10},
+            1: {"det": 0.60, "max_area": 0.90},
+        }
+        check("T74 two classes -> active", w._per_class_active(),
+              w._active_class_ids())
+        check("T74 per-class det honored",
+              w._class_det_thresh(0, 0.5) == 0.30 and w._class_det_thresh(1, 0.5) == 0.60,
+              (w._class_det_thresh(0, 0.5), w._class_det_thresh(1, 0.5)))
+        check("T74 unset key falls back to the global value",
+              w._class_seg_thresh(0, 0.3) == 0.3, w._class_seg_thresh(0, 0.3))
+        check("T74 det floor is the loosest class",
+              w._det_thresh_floor(0.5) == 0.30, w._det_thresh_floor(0.5))
+        check("T74 max-area loosest is the biggest cap",
+              abs(w._max_area_frac_loosest() - 0.90) < 1e-9,
+              w._max_area_frac_loosest())
+
+        # SAM3 multi-class: each class's pass runs at ITS confidence.
+        seen = []
+        def fake_part(image_path, ex, conf, text_prompt, supplementary_exemplars=None):
+            seen.append(round(conf, 4))
+            return ([[len(seen) * 100, 0, len(seen) * 100 + 5, 5]],
+                    [[[0.1, 0.1], [0.2, 0.1], [0.15, 0.2]]], "r")
+        w._run_sam3_boxes_partitioned = fake_part
+        w._run_sam3_boxes_multiclass("/tmp/x.jpg", [[0, 0, 1, 1], [2, 2, 3, 3]],
+                                     [0, 1], 0.5, "")
+        check("T74 SAM3 passes use per-class confidences", seen == [0.30, 0.60], seen)
+
+        # Exact per-class area cut: same-size boxes live or die by their class.
+        with _tf.TemporaryDirectory() as tmp:
+            img_path = os.path.join(tmp, "a.png")
+            _PILImage.new("RGB", (100, 100)).save(img_path)
+            boxes = [[0, 0, 20, 20],    # cls 0: 4%  < 10% cap -> kept
+                     [0, 0, 40, 40],    # cls 0: 16% >= 10% cap -> dropped
+                     [10, 10, 50, 50]]  # cls 1: 16% < 90% cap -> kept
+            kb, kp, kc = w._cut_boxes_by_class_area(
+                img_path, boxes, [None, None, None], [0, 0, 1])
+            check("T74 per-class area cut keeps by each class's cap",
+                  kb == [[0, 0, 20, 20], [10, 10, 50, 50]] and kc == [0, 1],
+                  (kb, kc))
+            check("T74 area cut keeps polys aligned", len(kp) == len(kb), (kb, kp))
+
+        # Gate flow: a moved global slider blocks runs until reverted/applied.
+        check("T74 clean state does not gate", not w._global_sliders_blocked(),
+              getattr(w, "_global_dirty", None))
+        w.global_apply_row = QtWidgets.QWidget()
+        w._on_global_slider_moved()
+        check("T74 moved global slider gates the run", w._global_sliders_blocked(),
+              getattr(w, "_global_dirty", None))
+        w._revert_global_sliders()
+        check("T74 revert clears the gate", not w._global_sliders_blocked(),
+              getattr(w, "_global_dirty", None))
+
+        # Back to one class: the gate can never engage.
+        w.box_class_names = ["class_0"]
+        session_state.STATE["box_class_names"] = None
+        w._on_global_slider_moved()
+        check("T74 single class never gates", not w._global_sliders_blocked(),
+              getattr(w, "_global_dirty", None))
+    finally:
+        session_state.reset()
+
+t74()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T75: input schemes + drawing on the zoomed view. Scroll pans (per the
+# Trackpad/Mouse scheme) and Ctrl/Cmd+scroll zooms, so the left button draws
+# and edits even while Image Resize is on; every coordinate routes through
+# the zoom/pan transform, so a zoomed draw lands where it looks.
+# ══════════════════════════════════════════════════════════════════════════
+def t75():
+    import sys as _sys
+    from autoannotate.gui import session_state
+    from autoannotate.gui.session_state import classify_wheel, input_scheme
+
+    session_state.reset()
+    try:
+        expected = "trackpad" if _sys.platform == "darwin" else "mouse"
+        check("T75 platform default scheme", input_scheme() == expected,
+              (input_scheme(), _sys.platform))
+        session_state.STATE["input_scheme"] = "mouse"
+        check("T75 explicit scheme wins", input_scheme() == "mouse", input_scheme())
+
+        check("T75 plain scroll pans", classify_wheel("mouse", 0, -40) == ("pan", 0, -40),
+              classify_wheel("mouse", 0, -40))
+        check("T75 ctrl+scroll zooms in both schemes",
+              classify_wheel("mouse", 0, 30, ctrl=True) == ("zoom", 30)
+              and classify_wheel("trackpad", 0, 30, ctrl=True) == ("zoom", 30),
+              "mismatch")
+        check("T75 mouse shift+wheel pans sideways",
+              classify_wheel("mouse", 0, 25, shift=True) == ("pan", 25, 0),
+              classify_wheel("mouse", 0, 25, shift=True))
+        check("T75 trackpad supplies both axes itself",
+              classify_wheel("trackpad", 12, -7, shift=True) == ("pan", 12, -7),
+              classify_wheel("trackpad", 12, -7, shift=True))
+        check("T75 no delta -> no action", classify_wheel("mouse", 0, 0) is None,
+              classify_wheel("mouse", 0, 0))
+
+        # Drawing while zoomed: the widget-to-image mapping honors zoom + pan,
+        # and a left press in resize mode starts a DRAW drag, not a pan.
+        c = AnnotationCanvas()
+        c.resize(400, 300)
+        c._orig_w, c._orig_h = 400, 300
+        c.set_resize_mode(True)
+        c._zoom = 2.0
+        c._pan_x = -100.0
+        c._pan_y = -50.0
+        # scale = min(400/400, 300/300) * 2 = 2; offsets: (400-800)/2-100=-300,
+        # (300-600)/2-50=-200. Widget (100, 100) -> image (200, 150).
+        p = c._widget_point_to_image(QtCore.QPoint(100, 100))
+        check("T75 zoomed draw lands where it looks",
+              p is not None and abs(p[0] - 200) < 1e-6 and abs(p[1] - 150) < 1e-6, p)
+
+        c.draw_mode = True
+        ev = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                               QtCore.QPointF(100, 100), QtCore.Qt.LeftButton,
+                               QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+        c.mousePressEvent(ev)
+        check("T75 left press in resize mode starts a draw drag",
+              c._drag_start is not None, c._drag_start)
+
+        # The old left-drag pan is gone from the canvas (pan lives on the
+        # wheel now); the side-by-side panes keep it, having no drawing.
+        canvas_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "canvas.py"),
+                          encoding="utf-8").read()
+        check("T75 canvas has no left-drag pan left", "_pan_last" not in canvas_src,
+              "found _pan_last")
+        zp_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "zoompan.py"),
+                      encoding="utf-8").read()
+        check("T75 side-by-side keeps its left-drag pan", "_pan_last" in zp_src,
+              "missing _pan_last")
+    finally:
+        session_state.reset()
+
+t75()
 
 # ── summary ────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok, _ in _results if ok)

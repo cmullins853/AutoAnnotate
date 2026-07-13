@@ -35,8 +35,11 @@ def _mark_fail():
 def find_repo_root(start):
     d = os.path.abspath(start)
     for _ in range(6):
-        if (os.path.isdir(os.path.join(d, "autoannotate study"))
-                and os.path.exists(os.path.join(d, ".env.example"))):
+        # The study folder is tracked as "autoannotate study" but transfers
+        # sometimes mangle it into "autoannotate_study"; accept both.
+        has_study = any(os.path.isdir(os.path.join(d, s))
+                        for s in ("autoannotate study", "autoannotate_study"))
+        if has_study and os.path.exists(os.path.join(d, ".env.example")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -105,6 +108,43 @@ def main():
         except Exception:
             print(f"  {WARN} {mod:<14} not found -> {note}")
 
+    # ── per-user settings + image I/O ─────────────────────────────────────────
+    # The box-prompt class names persist to a per-user JSON file, and every
+    # image read/write goes through numpy so paths with non-ASCII characters
+    # work on Windows (OpenCV's own imread/imwrite use the ANSI API there and
+    # fail silently). Both are exercised here rather than trusted.
+    header("Per-user settings and image I/O")
+    try:
+        sys.path.insert(0, REPO_ROOT)
+        from autoannotate.config import USER_CONFIG_DIR, user_config_path
+        probe = user_config_path(".write_probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        print(f"  {OK} settings dir writable : {USER_CONFIG_DIR}")
+    except Exception as e:
+        print(f"  {WARN} settings dir not writable ({e.__class__.__name__}: {e})")
+        print( "       Box class names will not persist between runs.")
+
+    try:
+        import tempfile
+
+        import numpy as _np
+
+        from autoannotate.imageio import imread_unicode, imwrite_unicode
+        with tempfile.TemporaryDirectory() as _t:
+            _p = os.path.join(_t, "bäi字", "probe.png")
+            wrote = imwrite_unicode(_p, _np.zeros((4, 4, 3), dtype=_np.uint8))
+            read_back = imread_unicode(_p) is not None
+        if wrote and read_back:
+            print(f"  {OK} non-ASCII image paths : read + write OK")
+        else:
+            print(f"  {FAIL} non-ASCII image paths : write={wrote} read={read_back}")
+            _mark_fail()
+    except Exception as e:
+        print(f"  {FAIL} image I/O check failed ({e.__class__.__name__}: {e})")
+        _mark_fail()
+
     # ── compute device the app will use ───────────────────────────────────────
     header("Compute device")
     try:
@@ -136,13 +176,38 @@ def main():
         print(f"  Stable Diffusion will run on: {sd}")
         budget = os.environ.get("AUTOANNOTATE_MODEL_BUDGET_GB")
         print(f"  Model RAM budget : {budget + ' GB' if budget else '(unset -> unbounded cache)'}")
+        # Effective .env/shell tuning values, so users can verify their .env
+        # actually took effect (the app loads .env itself via python-dotenv;
+        # editor warnings about terminal env injection are unrelated).
+        # Report the value inference will ACTUALLY apply, not the raw string: an
+        # unparseable or out-of-range .env entry silently falls back, and printing
+        # it verbatim would tell the user their setting took effect when it did not.
+        maf_raw = os.environ.get("AUTOANNOTATE_MAX_AREA_FRAC")
+        from autoannotate.config import effective_max_area_frac
+        maf_eff = effective_max_area_frac()
+        if maf_raw is None:
+            maf_show = f"{maf_eff:.2f} (unset -> default)"
+        else:
+            try:
+                accepted = abs(float(maf_raw) - maf_eff) < 1e-9
+            except (TypeError, ValueError):
+                accepted = False
+            maf_show = (f"{maf_eff:.2f}" if accepted
+                        else f"{maf_eff:.2f} ({maf_raw!r} rejected -> default)")
+        print(f"  AUTOANNOTATE_MAX_AREA_FRAC : {maf_show}")
     except Exception as e:
         print(f"  {WARN} could not query torch devices: {e}")
 
     # ── weight files (advisory) ───────────────────────────────────────────────
     header("Weight files (advisory)")
-    gd_dir = os.environ.get("GROUNDING_DINO_DIR") or os.path.join(
-        REPO_ROOT, "autoannotate study", "GroundingDINO")
+    # Mirror config.py's resolution: env value first, then either study
+    # folder spelling (space-named as git tracks it, or underscore).
+    gd_candidates = []
+    if os.environ.get("GROUNDING_DINO_DIR"):
+        gd_candidates.append(os.environ["GROUNDING_DINO_DIR"])
+    for study in ("autoannotate study", "autoannotate_study"):
+        gd_candidates.append(os.path.join(REPO_ROOT, study, "GroundingDINO"))
+    gd_dir = next((c for c in gd_candidates if os.path.isdir(c)), gd_candidates[-2])
     weights = [
         (os.path.join(HERE, "sam2_t.pt"), "SAM2 tiny segmenter (auto-downloads on first run)"),
         (os.path.join(HERE, "sam3.pt"), "SAM3 detector/segmenter (gated; fetch from HF)"),

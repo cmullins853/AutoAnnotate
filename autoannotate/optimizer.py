@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .config import BASE_DIR
+from .imageio import imread_unicode
 from .pipeline.dino import run_dino_from_model
 
 def prompt_optimizer(prompts_file, gt_path, img_path, save_file, threshold, DINO):
@@ -117,7 +118,7 @@ def confidence_optimizer(prompt, DINO, gt_path, img_path, threshold):
     best_iou = 0
     best_conf = 0
 
-    image = cv2.imread(img_path)
+    image = imread_unicode(img_path)
     shape = image.shape
 
     # Step 1: Precision 1 sweep (coarse) from 0.0 to 0.9 in steps of 0.1

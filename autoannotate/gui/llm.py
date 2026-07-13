@@ -144,7 +144,11 @@ def generate_prompts(image_path, manual_entry, model=None, processor=None):
         ]
         prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
         inputs = processor(text=prompt, images=raw_image, return_tensors="pt").to(model.device)
-        output = model.generate(**inputs, temperature=0.7, top_p=0.9, max_new_tokens=512)
+        # do_sample=True or generate() runs GREEDY and silently ignores both
+        # temperature and top_p, which is the opposite of the varied,
+        # non-duplicate suggestions the prompt above asks for.
+        output = model.generate(**inputs, do_sample=True, temperature=0.7,
+                                top_p=0.9, max_new_tokens=512)
         response = processor.decode(output[0], skip_special_tokens=True)
         return extract_descriptions(response)
     except Exception as e:

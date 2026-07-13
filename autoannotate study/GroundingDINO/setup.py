@@ -39,7 +39,13 @@ def get_extensions():
     extra_compile_args = {"cxx": get_macos_sdk_flags()}
     define_macros = []
 
-    if CUDA_HOME is not None and torch.cuda.is_available():
+    if sys.platform == "win32":
+        # CUDA >= 12.4 / 13 ships CCCL headers that require MSVC's conforming
+        # preprocessor; without this flag cl.exe fails with C1189.
+        extra_compile_args["cxx"] = extra_compile_args["cxx"] + ["/Zc:preprocessor"]
+
+    force_cuda = os.environ.get("FORCE_CUDA", "0") == "1"
+    if CUDA_HOME is not None and (torch.cuda.is_available() or force_cuda):
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
@@ -49,8 +55,13 @@ def get_extensions():
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
         ]
+        if sys.platform == "win32":
+            extra_compile_args["nvcc"] += ["-Xcompiler", "/Zc:preprocessor"]
     else:
-        print("Warning: CUDA not available. Building CPU-only version.")
+        print("Warning: CUDA not available at build time. Building CPU-only "
+              "version. If this machine has an NVIDIA GPU, install a CUDA "
+              "build of torch first (or set FORCE_CUDA=1), otherwise DINO "
+              "falls back to slow pure-Python deformable attention.")
 
     include_dirs = [extensions_dir]
     ext_modules = [

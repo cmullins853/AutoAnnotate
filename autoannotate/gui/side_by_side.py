@@ -4,7 +4,9 @@ from pathlib import Path
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-from .style import BTN_BLUE, BTN_GREY, BTN_PURPLE, btn_qss, lock_during
+from .style import (BTN_BLUE, BTN_GREY, BTN_PURPLE, add_input_scheme_actions,
+                    btn_qss, lock_during, tool_toggle_qss)
+from .zoompan import ZoomPanImageView
 
 class SideBySideWindow(QtWidgets.QWidget):
     """
@@ -36,6 +38,10 @@ class SideBySideWindow(QtWidgets.QWidget):
         # this bulletproof; the physical widgets never move.
         self.titles = {"synth": "Synthetic Images", "gt": "Ground Truth"}
         self._left, self._right = "gt", "synth"
+        # Zoom / pan belong to the LOGICAL side, not the physical slot, so a
+        # swap carries each side's view with its image. Physical widgets are
+        # the live copy; these dicts hold the side that is off-slot.
+        self.view_states = {"synth": None, "gt": None}
         self.init_ui()
 
     def init_ui(self):
@@ -115,20 +121,24 @@ class SideBySideWindow(QtWidgets.QWidget):
             folder_btn.setFixedHeight(btn_h)
             folder_btn.setToolTip("Choose the folder of images to show on this side.")
             col.addWidget(folder_btn)
-            view = QtWidgets.QLabel("No folder selected")
+            view = ZoomPanImageView()
+            view.set_placeholder("No folder selected")
             view.setStyleSheet(panel_style)
-            view.setAlignment(QtCore.Qt.AlignCenter)
             view.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
             view.setMinimumSize(200, 200)
             col.addWidget(view, 1)
+            resize_btn = self._make_resize_button(view, font, btn_h)
+            col.addWidget(resize_btn)
             name = QtWidgets.QLabel("")
             name.setStyleSheet(f"color: #ccc; font-size: {font}px;")
             name.setAlignment(QtCore.Qt.AlignCenter)
             col.addWidget(name)
-            return col, folder_btn, view, name
+            return col, folder_btn, view, resize_btn, name
 
-        left_col, self.left_folder_btn, self.left_view, self.left_name = _make_col()
-        right_col, self.right_folder_btn, self.right_view, self.right_name = _make_col()
+        (left_col, self.left_folder_btn, self.left_view,
+         self.left_resize_btn, self.left_name) = _make_col()
+        (right_col, self.right_folder_btn, self.right_view,
+         self.right_resize_btn, self.right_name) = _make_col()
         self.left_folder_btn.clicked.connect(lambda: self._select_folder_side(self._left))
         self.right_folder_btn.clicked.connect(lambda: self._select_folder_side(self._right))
         cols.addLayout(left_col, 1)
@@ -168,6 +178,59 @@ class SideBySideWindow(QtWidgets.QWidget):
 
         self.setLayout(outer)
 
+    def _make_resize_button(self, view, font, btn_h):
+        """The per-pane Image Resize toggle + dropdown, matching the annotation
+        window's: the toggle arms scroll/pinch zoom and drag pan, the dropdown
+        holds Original Size. Each pane gets its own, so you can zoom into a
+        synthetic image while its source stays fit to the panel.
+
+        The actions are bound to `view`, the PHYSICAL widget. _swap_sides moves
+        the view STATE between the two widgets rather than the widgets
+        themselves, so these bindings stay valid forever."""
+        btn = QtWidgets.QToolButton()
+        btn.setText("Image Resize: OFF")
+        btn.setStyleSheet(tool_toggle_qss(BTN_BLUE, font))
+        btn.setFixedHeight(int(btn_h * 0.8))
+        btn.setCheckable(True)
+        btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        btn.setToolTip(
+            "Zoom (scroll / pinch) and pan (drag) this image. Your zoom stays "
+            "after you turn this off, and follows the image when you swap sides; "
+            "the dropdown's Original Size returns it to a fit.")
+
+        def _toggled(on):
+            btn.setText(f"Image Resize: {'ON' if on else 'OFF'}")
+            view.set_resize_mode(on)
+
+        btn.toggled.connect(_toggled)
+
+        menu = QtWidgets.QMenu()
+        menu.setToolTipsVisible(True)
+        original_size_act = QtWidgets.QAction("Original Size", self)
+        original_size_act.setToolTip("Reset this side's zoom/pan to the original (fit) size.")
+        original_size_act.triggered.connect(view.reset_view)
+        menu.addAction(original_size_act)
+        # Trackpad/Mouse input scheme, shared with the annotation window.
+        add_input_scheme_actions(menu, self)
+
+        btn.setMenu(menu)
+        btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+        return btn
+
+    def _sync_resize_controls(self):
+        """Make each pane's toggle agree with the view state the pane is
+        actually showing. Called after a swap, when the two views have
+        exchanged states behind the buttons' backs."""
+        for phys in ("left", "right"):
+            view = getattr(self, f"{phys}_view")
+            btn = getattr(self, f"{phys}_resize_btn")
+            state = view.view_state()
+            btn.blockSignals(True)
+            btn.setChecked(state["resize_mode"])
+            btn.setText(f"Image Resize: {'ON' if state['resize_mode'] else 'OFF'}")
+            btn.blockSignals(False)
+
     # Folder loading
     def _pick_folder(self, caption):
         dialog = QtWidgets.QFileDialog(self, caption, "")
@@ -195,6 +258,7 @@ class SideBySideWindow(QtWidgets.QWidget):
         if folder:
             self.synth_images = self._list_images(folder)
             self._build_pairs()
+            self._reset_views()
             self._show_current()
 
     def select_gt_folder(self):
@@ -202,7 +266,15 @@ class SideBySideWindow(QtWidgets.QWidget):
         if folder:
             self.gt_images = self._list_images(folder)
             self._build_pairs()
+            self._reset_views()
             self._show_current()
+
+    def _reset_views(self):
+        """Back to fit on both panes. A freshly opened folder has nothing to do
+        with the zoom the user left on the last one."""
+        for phys in ("left", "right"):
+            getattr(self, f"{phys}_view").reset_view()
+        self.view_states = {"synth": None, "gt": None}
 
     # Side mapping / swap (<->)
     def _select_folder_side(self, side):
@@ -228,10 +300,17 @@ class SideBySideWindow(QtWidgets.QWidget):
 
     def _swap_sides(self):
         """Swap which logical side is shown on the left vs right. Titles, folder
-        buttons, images and filenames all move together. Pure state toggle +
-        re-render; no widgets are reparented, so it can be hit repeatedly with
-        or without folders loaded."""
+        buttons, images, filenames AND each side's zoom/pan/tint all move
+        together. Pure state toggle + re-render; no widgets are reparented, so
+        it can be hit repeatedly with or without folders loaded."""
+        # Harvest the live view state off the physical widgets BEFORE the
+        # mapping flips, so each logical side keeps the view it was showing.
+        self.view_states[self._left] = self.left_view.view_state()
+        self.view_states[self._right] = self.right_view.view_state()
         self._left, self._right = self._right, self._left
+        self.left_view.apply_view_state(self.view_states[self._left])
+        self.right_view.apply_view_state(self.view_states[self._right])
+        self._sync_resize_controls()
         self._apply_sides()
         self._show_current()
 
@@ -244,27 +323,37 @@ class SideBySideWindow(QtWidgets.QWidget):
         synth, gt = self.synth_images, self.gt_images
         pairs = []
         if synth and gt:
-            used_gt = set()
-            matched_any = False
+            # One ground truth backs MANY synthetic images: the batch flow makes
+            # several variations of a single original (berry_01_var1, _var2, ...)
+            # and all of them belong beside berry_01. `matched_gt` therefore only
+            # records what got used, it never makes a ground truth unavailable.
+            # Consuming each ground truth once (the old behaviour) left every
+            # variation after the first with a blank right-hand pane.
+            matched_gt = set()
+
+            def _best_gt(s_stem):
+                """Most specific ground truth for this synth stem, or None.
+                Exact stem wins; otherwise the LONGEST prefix match, so
+                'berry_01_var1' prefers 'berry_01' over a shorter 'berry'."""
+                exact = [g for g in gt if Path(g).stem == s_stem]
+                if exact:
+                    return exact[0]
+                pref = [g for g in gt if s_stem.startswith(Path(g).stem)]
+                if pref:
+                    return max(pref, key=lambda g: len(Path(g).stem))
+                rev = [g for g in gt if Path(g).stem.startswith(s_stem)]
+                if rev:
+                    return max(rev, key=lambda g: len(Path(g).stem))
+                return None
+
             for s in synth:
-                s_stem = Path(s).stem
-                match = None
-                for g in gt:
-                    if g in used_gt:
-                        continue
-                    g_stem = Path(g).stem
-                    if (s_stem == g_stem or s_stem.startswith(g_stem)
-                            or g_stem.startswith(s_stem)):
-                        match = g
-                        break
+                match = _best_gt(Path(s).stem)
                 if match is not None:
-                    used_gt.add(match)
-                    matched_any = True
-                    pairs.append((s, match))
-                else:
-                    pairs.append((s, None))
+                    matched_gt.add(match)
+                pairs.append((s, match))
+            matched_any = bool(matched_gt)
             for g in gt:
-                if g not in used_gt:
+                if g not in matched_gt:
                     pairs.append((None, g))
             if not matched_any:
                 # No filename correspondence -- pair by position instead.
@@ -330,8 +419,9 @@ class SideBySideWindow(QtWidgets.QWidget):
         self._render()
 
     def _render(self):
-        """Scale each logical side's stored pixmap into its current physical
-        view, preserving aspect. The _left / _right mapping decides placement."""
+        """Hand each logical side's stored pixmap to its current physical view.
+        The view scales it itself, through its own zoom/pan transform, so the
+        _left / _right mapping only decides placement."""
         # showFullScreen() can fire a resize event before init_ui has built
         # the view widgets; bail out until they exist.
         if not hasattr(self, "left_view"):
@@ -341,14 +431,13 @@ class SideBySideWindow(QtWidgets.QWidget):
             view = getattr(self, f"{phys}_view")
             pixmap = pmaps[logical]
             if pixmap is None:
-                view.setText("No image" if self.pairs else "No folder selected")
-                view.setPixmap(QtGui.QPixmap())
+                view.set_pixmap(None)
+                view.set_placeholder("No image" if self.pairs else "No folder selected")
             else:
-                view.setPixmap(pixmap.scaled(
-                    view.size(),
-                    QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation,
-                ))
+                # keep_view: stepping through pairs at a zoom is the point of
+                # zooming, so Prev/Next must not throw the zoom away. Original
+                # Size (or a new folder) is how you get back to a fit.
+                view.set_pixmap(pixmap, keep_view=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -6,25 +6,91 @@ import cv2
 import numpy as np
 from shapely.geometry import Polygon
 
-def save_boxes_yolo(boxes_xyxy, image_path, save_dir):
+from ..imageio import imread_unicode
+from ..palette import (class_color_image_rgb,
+                       class_color_name, rgb_to_hex)
+
+def _validate_class_ids(classes, n_items, fn_name, item_name):
+    """Coerce `classes` to a list of ints aligned with `n_items`, or None.
+
+    Both label writers truncate their output file the moment they open it, so a
+    length mismatch or an unconvertible id has to be caught here, before the
+    open: raising halfway through the write leaves the previous labels destroyed
+    and the new ones incomplete. Returns None when `classes` is None (the
+    all-zeros default).
+    """
+    if classes is None:
+        return None
+    classes = list(classes)
+    if len(classes) != n_items:
+        raise ValueError(
+            f'{fn_name}: {n_items} {item_name} but {len(classes)} classes')
+    try:
+        ids = [int(c) for c in classes]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{fn_name}: class ids must be integers, got {classes!r}') from exc
+    # A YOLO class id indexes into classes.txt, so it cannot be negative: -1 is
+    # the "no class" sentinel some detectors return, and exporting it produces a
+    # label file no importer can read.
+    bad = [c for c in ids if c < 0]
+    if bad:
+        raise ValueError(f'{fn_name}: class ids must be >= 0, got {bad!r}')
+    return ids
+
+
+def _atomic_write_lines(path, lines):
+    """Write `lines` to `path` via a temp file + os.replace.
+
+    The label writers used to open the destination in 'w' (which truncates) and
+    format rows as they went, so anything that raised part-way through the loop,
+    a malformed box, a non-numeric coordinate, left the previous labels gone and
+    the new ones half-written. Every row is now rendered up front and the real
+    file is only swapped in once the whole set is on disk: the label file is
+    always either the complete old one or the complete new one.
+    """
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        f.writelines(lines)
+    os.replace(tmp, path)
+
+
+def save_boxes_yolo(boxes_xyxy, image_path, save_dir, classes=None):
     """Overwrite the YOLO label file with the given absolute xyxy boxes (post-edit truth).
-    Use this from the GUI after the user has finalized edits so the saved file matches the screen."""
-    img = cv2.imread(image_path)
+    Use this from the GUI after the user has finalized edits so the saved file matches the screen.
+    `classes` is an optional per-box class-id list aligned with boxes_xyxy; omitted = all 0."""
+    boxes_xyxy = list(boxes_xyxy)
+    class_ids = _validate_class_ids(classes, len(boxes_xyxy), 'save_boxes_yolo', 'boxes')
+    img = imread_unicode(image_path)
+    if img is None:
+        raise ValueError(f'save_boxes_yolo: cannot read image {image_path}')
     h, w = img.shape[:2]
     stem = os.path.splitext(os.path.basename(image_path))[0]
     os.makedirs(save_dir, exist_ok=True)
-    with open(f'{save_dir}/{stem}.txt', 'w') as f:
-        for x1, y1, x2, y2 in boxes_xyxy:
-            cx = (x1 + x2) / 2 / w
-            cy = (y1 + y2) / 2 / h
-            bw = (x2 - x1) / w
-            bh = (y2 - y1) / h
-            f.write(f'0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n')
+    # Render every row BEFORE touching the file: a malformed box (wrong arity,
+    # non-numeric) raises here, with the previous labels still intact on disk.
+    lines = []
+    for i, box in enumerate(boxes_xyxy):
+        try:
+            x1, y1, x2, y2 = (float(v) for v in box)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'save_boxes_yolo: box {i} is not 4 numbers: {box!r}') from exc
+        cx = (x1 + x2) / 2 / w
+        cy = (y1 + y2) / 2 / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        cls = class_ids[i] if class_ids is not None else 0
+        lines.append(f'{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n')
+    _atomic_write_lines(f'{save_dir}/{stem}.txt', lines)
 
 def verify_boxes_round_trip(boxes_xyxy, image_path, save_dir, tol_px=1.5):
     """Read back the saved YOLO file and confirm every box matches `boxes_xyxy` within `tol_px`.
     Returns (ok: bool, max_err_px: float). Used by the output fact-check audit."""
-    img = cv2.imread(image_path)
+    img = imread_unicode(image_path)
+    if img is None:
+        # An unreadable image is a FAILED verification, not a crash: this runs
+        # inside the audit pass, which must survive one bad file.
+        return False, float('inf')
     h, w = img.shape[:2]
     stem = os.path.splitext(os.path.basename(image_path))[0]
     path = f'{save_dir}/{stem}.txt'
@@ -80,7 +146,7 @@ def result_clean_polys(result):
         polys.append([[float(p[0][0]) / mw, float(p[0][1]) / mh] for p in c])
     return polys
 
-def save_masks(sam_results, output_dir, image_path):
+def save_masks(sam_results, output_dir, image_path, classes=None):
     # Use single-largest-contour polygons (not masks.xyn) so a multi-blob
     # mask isn't written as one polygon with a stray connecting line.
     # Name the file after the REAL image (image_path), never sam_results[0].path
@@ -90,23 +156,108 @@ def save_masks(sam_results, output_dir, image_path):
     if not sam_results:
         return
     segments = result_clean_polys(sam_results[0])
-    save_polys_yolo(segments, output_dir, image_path)
+    save_polys_yolo(segments, output_dir, image_path, classes=classes)
 
-def save_polys_yolo(segments, output_dir, image_path):
-    # Shared YOLO-seg polygon writer: one '0 x y x y ...' line per polygon,
+def save_polys_yolo(segments, output_dir, image_path, classes=None):
+    # Shared YOLO-seg polygon writer: one 'cls x y x y ...' line per polygon,
     # named after the REAL image (mirrors save_boxes_yolo). save_masks feeds
     # it polys derived from a SAM results object; the one-shot detector paths
     # (YOLOE-seg / SAM3 standalone) feed their already max-area + NMS filtered,
     # box-aligned polys directly, so segments/ matches boxes/ instead of
     # re-deriving every raw detection (giant leaf masks, dropped dup boxes).
+    # `classes` is aligned with `segments` BEFORE any skipping, so degenerate
+    # entries (None / tiny) drop their class id in lockstep; omitted = all 0.
+    segments = list(segments)
+    # Same pre-write contract as save_boxes_yolo: validate, render every row, and
+    # only then swap the file in, so a bad polygon cannot destroy the previous
+    # segments and leave a half-written one behind.
+    class_ids = _validate_class_ids(classes, len(segments), 'save_polys_yolo', 'segments')
     stem = os.path.splitext(os.path.basename(image_path))[0]
-    with open(f"{Path(output_dir) / stem}.txt", "w") as f:
-        for s in segments:
-            if not s or len(s) < 3:
-                continue
-            if Polygon(s).area > 0.001:  # 0.05 was too large for small objects like blueberries
-                flat = " ".join(str(v) for pt in s for v in pt)
-                f.write("0 " + flat + "\n")
+    # save_boxes_yolo creates its save_dir; this one did not, so a first-ever run
+    # into a fresh segments/ folder died with FileNotFoundError.
+    os.makedirs(output_dir, exist_ok=True)
+    lines = []
+    for i, s in enumerate(segments):
+        if not s or len(s) < 3:
+            continue
+        if Polygon(s).area > 0.001:  # 0.05 was too large for small objects like blueberries
+            flat = " ".join(str(v) for pt in s for v in pt)
+            cls = class_ids[i] if class_ids is not None else 0
+            lines.append(f"{cls} " + flat + "\n")
+    _atomic_write_lines(f"{Path(output_dir) / stem}.txt", lines)
+
+def _validate_class_names(names, fn_name):
+    """Reject class names carrying a newline before anything is written.
+
+    classes.txt is positional: line N IS class id N. A name containing a newline
+    would occupy two lines and silently shift the id of every class after it, so
+    the labels would import against the wrong names. The class-colour table has
+    the same one-row-per-class contract. Cheaper to refuse than to write a file
+    that is quietly wrong.
+    """
+    for i, n in enumerate(names or []):
+        if "\n" in str(n) or "\r" in str(n):
+            raise ValueError(
+                f'{fn_name}: class name {i} ({n!r}) contains a newline; '
+                f'one class per line is what makes the class id meaningful')
+
+
+def save_classes_txt(names, output_dir):
+    """Write classes.txt (one class name per line, index order) into the
+    output folder so the saved YOLO label ids stay interpretable. Skipped
+    when `names` is empty.
+
+    Nothing but the class name goes on a line. YOLO/Roboflow/labelImg importers
+    read the WHOLE line as the name, so a trailing color or id would silently
+    rename every class on import. The colors live in save_class_colors_txt."""
+    if not names:
+        return
+    _validate_class_names(names, 'save_classes_txt')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "classes.txt"), "w", encoding="utf-8") as f:
+        for n in names:
+            f.write(f"{n}\n")
+
+
+def save_class_colors_txt(names, output_dir):
+    """Write class_colors.txt: which colour each class id is drawn in.
+
+    A sibling of classes.txt, not a replacement. classes.txt has to stay a plain
+    importable name list, so the colour key lives here, in plain text, next to
+    the labels it explains.
+
+    The quoted colours are the ones in the annotated_<model> review images that
+    sit beside this file (class_color_image_rgb), which is also what the legend
+    image uses. The file is just the aligned table, one row per class under a
+    single commented column-header line; the user asked for the explanatory
+    comment block to go, so keep it out. (Canvas-only provenance colours, the
+    manual green and negative red, are documented in class_legend.png instead;
+    they never appear in a saved review image.)
+
+    Returns the path written, or None when `names` is empty.
+    """
+    if not names:
+        return None
+    _validate_class_names(names, 'save_class_colors_txt')
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "class_colors.txt")
+    rows = []
+    for i, n in enumerate(names):
+        rgb = class_color_image_rgb(i)
+        rows.append((str(i), n, class_color_name(i), rgb_to_hex(rgb),
+                     ",".join(str(v) for v in rgb)))
+
+    head = ("id", "name", "colour", "hex", "rgb")
+    widths = [max(len(r[c]) for r in (head,) + tuple(rows)) for c in range(len(head))]
+
+    def _line(cells):
+        return "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)).rstrip()
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# " + _line(head) + "\n")
+        for r in rows:
+            f.write("  " + _line(r) + "\n")
+    return path
 
 def _mask_to_polys(result, min_area_frac=0.04):
     """Interactive-SAM extraction: return a LIST of crop-normalized polygons,

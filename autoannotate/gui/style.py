@@ -22,6 +22,55 @@ TGL_DRAW_ON  = "#ff8c00"
 TGL_EDIT_ON  = "#8b30d0"
 TGL_MULTI_ON = "#0a7a8a"
 
+# Multi-class outline colors come from autoannotate.palette so the canvas, the
+# baked overlays and the saved legend image can never drift apart. Re-exported
+# here because the GUI has always imported them from style.
+from ..palette import (MAX_BOX_CLASSES, class_color_bgr, class_color_rgb,  # noqa: F401
+                       class_color_image_rgb, MANUAL_RGB, NEGATIVE_RGB)
+
+
+def class_color_qt(idx):
+    """QColor for a class index (canvas outlines, combo swatches)."""
+    return QtGui.QColor(*class_color_rgb(idx))
+
+
+def add_input_scheme_actions(menu, parent):
+    """Append the Trackpad/Mouse input-scheme picker to an Image Resize menu.
+
+    One shared session flag drives every view (the annotation canvas and both
+    side-by-side panes): trackpads pan with a two-finger scroll and zoom by
+    pinching, mice pan with the wheel (Shift for sideways) and zoom with
+    Ctrl/Cmd + wheel. The menu re-reads the flag on show, so the different
+    windows' menus can never disagree."""
+    from . import session_state
+
+    menu.addSeparator()
+    group = QtWidgets.QActionGroup(parent)
+    group.setExclusive(True)
+    acts = {}
+    for scheme, label, tip in (
+            ("trackpad", "Trackpad input",
+             "Two-finger scroll pans, pinch zooms. Left-drag draws."),
+            ("mouse", "Mouse input",
+             "Wheel pans, Shift+wheel pans sideways, Ctrl/Cmd+wheel zooms. "
+             "Left-drag draws.")):
+        act = QtWidgets.QAction(label, parent)
+        act.setCheckable(True)
+        act.setToolTip(tip)
+        act.triggered.connect(
+            lambda _checked=False, s=scheme:
+            session_state.STATE.__setitem__("input_scheme", s))
+        group.addAction(act)
+        menu.addAction(act)
+        acts[scheme] = act
+
+    def _sync():
+        acts[session_state.input_scheme()].setChecked(True)
+
+    menu.aboutToShow.connect(_sync)
+    _sync()
+    return acts
+
 # Domain-agnostic Stable Diffusion defaults (edit per scene in the popup).
 _SD_DEFAULT_PROMPT = ("a natural outdoor scene, photorealistic, sharp focus, "
                       "natural daylight, depth of field, high detail")
@@ -77,6 +126,22 @@ def btn_qss(base, font_px=None, radius=6):
     return (
         f"QPushButton {{ background-color: {base}; color: white; {fs}"
         f"border: none; border-radius: {radius}px; padding: 6px 14px; }}"
+        f"QPushButton:hover {{ background-color: {_shade(base, 1.18)}; }}"
+        f"QPushButton:pressed {{ background-color: {BTN_DISABLED_BG}; }}"
+        f"QPushButton:disabled {{ background-color: {BTN_DISABLED_BG}; "
+        f"color: {BTN_DISABLED_FG}; }}"
+    )
+
+
+def chip_btn_qss(base, font_px=None, radius=6):
+    """Compact square QPushButton for a single glyph (e.g. the remove 'x' next
+    to a prompt field). Same hover/press/disabled behavior as btn_qss but with
+    no horizontal padding, so the glyph is centered and never clipped when the
+    button is pinned to a small square on either platform."""
+    fs = f"font-size: {font_px}px; " if font_px else ""
+    return (
+        f"QPushButton {{ background-color: {base}; color: white; {fs}"
+        f"border: none; border-radius: {radius}px; padding: 0px; }}"
         f"QPushButton:hover {{ background-color: {_shade(base, 1.18)}; }}"
         f"QPushButton:pressed {{ background-color: {BTN_DISABLED_BG}; }}"
         f"QPushButton:disabled {{ background-color: {BTN_DISABLED_BG}; "

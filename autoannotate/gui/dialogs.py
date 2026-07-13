@@ -1,10 +1,11 @@
-"""Small dialogs and widgets: info badge, SD prompts, semi-auto settings, variation viewers."""
+"""Small dialogs and widgets: info badge, box classes, SD prompts, semi-auto settings, variation viewers."""
 import os
 
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-from .style import BTN_GAP, BTN_GREEN, BTN_RED, btn_qss
+from .style import (BTN_GAP, BTN_GREEN, BTN_RED, MAX_BOX_CLASSES, btn_qss,
+                    class_color_qt)
 
 class InfoBadge(QtWidgets.QLabel):
     """Small 'i' badge that pops up a legend while the cursor is over it
@@ -57,6 +58,99 @@ class InfoBadge(QtWidgets.QLabel):
     def hideEvent(self, e):
         self._hide_popup()
         super().hideEvent(e)
+
+
+class BoxClassesDialog(QtWidgets.QDialog):
+    """Editor for how many box-prompt classes exist and what each is called.
+
+    The names become classes.txt and the legend image, so they are what anyone
+    auditing the labelled folder later reads. Each row is prefixed with the
+    color that class draws in, on the canvas and in the saved review images.
+    The count is capped at MAX_BOX_CLASSES, the point past which the palette
+    would reuse a hue and two classes would look alike.
+    """
+    def __init__(self, parent, names, extra_note=""):
+        super().__init__(parent)
+        self.setWindowTitle("Box Classes")
+        self.setStyleSheet(
+            "QDialog { background-color: #3a3a3a; }"
+            "QLabel { color: white; }"
+            "QSpinBox, QLineEdit { background-color: #444; color: white; }")
+        self.resize(460, 420)
+        lay = QtWidgets.QVBoxLayout(self)
+
+        lay.addWidget(QtWidgets.QLabel(
+            "How many kinds of box do you want to draw? Name each one so the "
+            "saved labels are readable."))
+        if extra_note:
+            note = QtWidgets.QLabel(extra_note)
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #cccccc; font-size: 11px;")
+            lay.addWidget(note)
+
+        count_row = QtWidgets.QHBoxLayout()
+        count_row.addWidget(QtWidgets.QLabel("Number of classes:"))
+        self.count_spin = QtWidgets.QSpinBox()
+        self.count_spin.setRange(1, MAX_BOX_CLASSES)
+        self.count_spin.setValue(max(1, min(len(names) or 1, MAX_BOX_CLASSES)))
+        self.count_spin.valueChanged.connect(self._sync_rows)
+        count_row.addWidget(self.count_spin)
+        count_row.addStretch(1)
+        lay.addLayout(count_row)
+
+        self._rows_host = QtWidgets.QWidget()
+        # The scroll area and its viewport sit outside the QDialog stylesheet's
+        # reach, so they keep the platform's light default and leave the white
+        # row labels unreadable. Paint them to match the dialog.
+        self._rows_host.setStyleSheet("background-color: #3a3a3a;")
+        self._rows = QtWidgets.QVBoxLayout(self._rows_host)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.setSpacing(BTN_GAP // 2)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background-color: #3a3a3a; border: none; }")
+        scroll.setWidget(self._rows_host)
+        lay.addWidget(scroll, 1)
+
+        self._edits = []
+        # Build every possible row up front and show only the first N: keeps a
+        # name the user typed if they lower the count and raise it again.
+        for i in range(MAX_BOX_CLASSES):
+            row = QtWidgets.QWidget()
+            hb = QtWidgets.QHBoxLayout(row)
+            hb.setContentsMargins(0, 0, 0, 0)
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(18, 18)
+            swatch.setStyleSheet(
+                f"background-color: {class_color_qt(i).name()}; border: 1px solid #888;")
+            hb.addWidget(swatch)
+            hb.addWidget(QtWidgets.QLabel(f"Class {i}:"))
+            edit = QtWidgets.QLineEdit(names[i] if i < len(names) else f"class_{i}")
+            edit.setPlaceholderText(f"class_{i}")
+            hb.addWidget(edit, 1)
+            self._rows.addWidget(row)
+            self._edits.append((row, edit))
+        self._rows.addStretch(1)
+        self._sync_rows(self.count_spin.value())
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _sync_rows(self, count):
+        for i, (row, _edit) in enumerate(self._edits):
+            row.setVisible(i < count)
+
+    def names(self):
+        """The edited class names, index == class id. An emptied field falls
+        back to class_<i> so classes.txt never carries a blank line."""
+        out = []
+        for i in range(self.count_spin.value()):
+            text = self._edits[i][1].text().strip()
+            out.append(text or f"class_{i}")
+        return out
 
 
 class SDPromptDialog(QtWidgets.QDialog):
@@ -289,6 +383,11 @@ class VariationPreviewDialog(QtWidgets.QDialog):
         self.accept()
 
     def _regen(self):
+        # KNOWN LIMITATION: regenerate_cb is a full SD inpaint and runs HERE, on
+        # the GUI thread, so the window is frozen for its duration (Windows will
+        # label it "Not Responding"). The button is disabled first, so the run
+        # cannot be double-fired, and it is only ever a wait, never a wrong
+        # result. Moving it to a QThread worker is the real fix.
         if self.regenerate_cb is None:
             return
         self.regen_btn.setEnabled(False)
@@ -300,7 +399,13 @@ class VariationPreviewDialog(QtWidgets.QDialog):
                 self.variation = new_var
                 self._render()
         except Exception as e:
+            # A print goes nowhere a GUI user will ever look: the button just
+            # springs back and the image does not change, which reads as a
+            # silent no-op rather than a failure.
             print(f"[VariationPreviewDialog] regenerate failed: {e}")
+            QtWidgets.QMessageBox.warning(
+                self, "Regenerate failed",
+                f"The variation could not be regenerated.\n\n{e}")
         finally:
             self.regen_btn.setEnabled(True)
             self.regen_btn.setText("Regenerate")
@@ -420,15 +525,47 @@ class BatchVariationViewer(QtWidgets.QDialog):
         self._refresh()
 
     def _delete(self):
+        """Delete the current image AND its label together, or delete neither.
+
+        Removing them one at a time leaves an orphan whenever the second unlink
+        fails (label with no image, or an image whose label is still counted in
+        the dataset), and the old code popped the entry from the list either
+        way, so the user could not even retry. Each file is first RENAMED aside
+        (reversible); only once every rename has succeeded are they unlinked for
+        real. A failure part-way restores whatever was already renamed and
+        leaves the entry in place.
+        """
         if not self.paths:
             return
         path = self.paths[self.idx]
         label_path = self._label_path_for(path)
-        for p in (path, label_path):
+        targets = [p for p in (path, label_path) if p and os.path.exists(p)]
+
+        staged = []          # (original, staged_aside) pairs
+        try:
+            for p in targets:
+                aside = p + ".deleting"
+                os.replace(p, aside)
+                staged.append((p, aside))
+        except OSError as e:
+            for original, aside in reversed(staged):
+                try:
+                    os.replace(aside, original)   # put it back
+                except OSError:
+                    pass
+            QtWidgets.QMessageBox.warning(
+                self, "Could not delete",
+                f"Nothing was deleted.\n\n{e}")
+            return
+
+        for _, aside in staged:
             try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError as e:
-                print(f"[BatchVariationViewer] could not delete {p}: {e}")
+                os.remove(aside)
+            except OSError:
+                # Staged aside but not unlinked: the pair is already consistent
+                # from the dataset's point of view, so this is a stray temp file
+                # rather than the orphan the staging exists to prevent.
+                print(f"[BatchVariationViewer] left behind temp file {aside}")
+
         self.paths.pop(self.idx)
         self._refresh()

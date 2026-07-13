@@ -1,15 +1,22 @@
-# AutoAnnotate runtime dependencies.
+# AutoAnnotate runtime dependencies - GENERIC FLOORS (any OS).
 #
-# Floors are picked to match what the project was actually developed against
-# (see `pip freeze` in autoannotate study/GroundingDINO/venv). No upper pins —
-# they tend to over-constrain Windows wheel resolution.
+# There is no one-size-fits-all install. Pick the file for your machine:
+#   - requirements.txt            THIS FILE: generic floors, no upper pins.
+#                                 Use only if you intentionally want the newest
+#                                 resolutions and will sort out torch yourself.
+#   - requirements-macos.lock     macOS / Apple Silicon (MPS): exact proven pins.
+#   - requirements-windows.txt    Windows 11 + NVIDIA CUDA: pinned CUDA torch
+#                                 wheels so the right GPU build is installed.
 #
-# Windows + NVIDIA users: install torch / torchvision from the CUDA wheel
-# index BEFORE running `pip install -r requirements.txt`, e.g.:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# Otherwise pip will pick the CPU build and CUDA acceleration won't work.
+# Floors here match what the project was developed against. Upper pins are
+# avoided where possible (they over-constrain wheel resolution); the only
+# exception is transformers, where 5.x breaks GroundingDINO.
 #
-# GroundingDINO is intentionally NOT listed here — it ships with its own
+# Windows + NVIDIA users: DO NOT use this file directly. Use
+# requirements-windows.txt, which installs the CUDA torch/torchvision wheels;
+# otherwise pip picks the CPU build and CUDA acceleration will not work.
+#
+# GroundingDINO is intentionally NOT listed here - it ships with its own
 # setup.py under autoannotate study/GroundingDINO/. Install it after this
 # file with: pip install -e "autoannotate study/GroundingDINO"
 
@@ -21,6 +28,13 @@ numpy>=1.24
 # ── Detection / segmentation models ──────────────────────────────────────
 # SAM3 requires >=8.3.237 (added in that release). YOLOE-11 stride=14 fix
 # is also in this range.
+#
+# SAM3 box exemplars are SINGLE-CONCEPT per call on every version in this
+# range: SAM3SemanticPredictor._inference_features forces `nc = 1` the moment
+# `bboxes` is passed, and its `labels` array is a positive/negative exemplar
+# flag, not a class id. Verified against 8.4.33 (macOS) and 8.4.90 (Windows).
+# Multi-class box prompts therefore run one pass per class; see
+# ManualWindow._run_sam3_boxes_multiclass. Do not "optimize" that into one call.
 ultralytics>=8.3.237
 
 # ── Vision / image I/O ───────────────────────────────────────────────────
@@ -29,7 +43,9 @@ Pillow>=10.0
 shapely>=2.0
 
 # ── LLM-prompt path (SmolVLM / Florence / Gemma in AutomatedWindow) ──────
-transformers>=4.40
+# <5 is required: transformers 5.x removed BertModel.get_head_mask, which
+# GroundingDINO's BERT wrapper calls (crashes at DINO model load otherwise).
+transformers>=4.40,<5
 accelerate>=0.30
 huggingface_hub>=0.20
 

@@ -1,0 +1,8 @@
+{
+    // Inject variables from the project .env into VS Code integrated terminals.
+    // Without this, the Python extension shows a recurring toast every time the
+    // .env file is saved ("An environment file is configured but terminal
+    // environment injection is disabled"). Enabling it also means running the
+    // app in the VS Code terminal picks up the same config the app reads.
+    "python.terminal.useEnvFile": true
+}

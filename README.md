@@ -14,9 +14,14 @@ Key functionalities include:
 ## Getting Started
 
 ### Prerequisites:
-- Install required Python libraries from `requirements.txt`.
+- Install the Python libraries. There is no single cross-platform file; pick the
+  one for your machine:
+  - macOS / Apple Silicon: `pip install -r requirements-macos.lock`
+  - Windows + NVIDIA (CUDA): `pip install -r requirements-windows.txt`
+  - Any OS, newest resolutions (advanced): `pip install -r requirements.txt`
 ```bash
-pip install -r requirements.txt
+# macOS example
+pip install -r requirements-macos.lock
 ```
 - **Software Dependencies:**
   - Grounding DINO configuration and weight files.
@@ -28,10 +33,15 @@ The authoritative, step-by-step setup guide is
 the virtual environment, the `.env` file, where to put the model weight files, and
 how to launch the app on macOS, Linux, and Windows. In short:
 
+0. On a fresh machine, install the prerequisites first (Git, Python 3.13; on
+   Windows/Linux + NVIDIA also the GPU driver, the CUDA Toolkit that matches the
+   `+cuXXX` torch pins, and Visual Studio Build Tools). STEP 0 of HOW_TO_RUN.txt
+   lists each one with its download source.
 1. Clone the repository and create a virtual environment with Python 3.13.
-2. `pip install -r requirements.txt`, or for an exact reproducible
-   install, `pip install -r requirements.lock` (a full `pip freeze` of the
-   proven environment).
+2. Install dependencies with the file for your platform:
+   `requirements-macos.lock` (macOS/MPS, exact `pip freeze`; macOS only),
+   `requirements-windows.txt` (Windows + NVIDIA CUDA), or `requirements.txt`
+   (generic floors: Linux, or any OS).
 3. Install GroundingDINO as a package (the `--no-build-isolation` flag is
    **required** because its `setup.py` imports torch at build time, so torch from
    step 2 must already be installed):
@@ -41,6 +51,26 @@ how to launch the app on macOS, Linux, and Windows. In short:
    clone needs no `.env` path edit.
 5. Launch the app from a terminal at the repo root with `python run_app.py`
    (or `python -m autoannotate`). No Jupyter or IDE is required.
+
+### Windows with an NVIDIA GPU (CUDA):
+Windows setup is fully documented in HOW_TO_RUN.txt (STEP 1 for the PowerShell
+venv and the CUDA torch install, STEP 4 for the GroundingDINO build). The short
+version, validated on Windows 11 with an RTX 4060:
+
+1. Create the venv with `py -3.13 -m venv .venv` and activate with
+   `.venv\Scripts\Activate.ps1` (run
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once first).
+2. Use `requirements-windows.txt`: it pins the CUDA torch/torchvision wheels
+   (`+cuXXX`) and adds the PyTorch CUDA index, so pip installs the GPU build
+   instead of the CPU one. Clear any CPU torch first with `pip uninstall -y
+   torch torchvision torchaudio`. Change every `cu132` in that file to match
+   your driver if needed. Verify with `torch.cuda.is_available()`; update the
+   NVIDIA driver if it prints `False`.
+3. Building GroundingDINO needs Visual Studio Build Tools (C++ workload) and
+   `pip install wheel setuptools ninja`. The vendored `setup.py` adds the MSVC
+   `/Zc:preprocessor` flag automatically for CUDA 12.4+/13 toolkits.
+4. `transformers` must stay below 5.x (pinned in `requirements-windows.txt`);
+   transformers 5 breaks GroundingDINO's BERT wrapper.
 
 The app runs on macOS, Windows, and Linux. The only per-OS setting is the Stable
 Diffusion compute device (`AUTOANNOTATE_SD_DEVICE`), configured in a commented

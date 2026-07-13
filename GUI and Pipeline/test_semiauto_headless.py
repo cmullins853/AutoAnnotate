@@ -3216,6 +3216,254 @@ def t75():
 
 t75()
 
+# ══════════════════════════════════════════════════════════════════════════
+# T76: regressions from the CodeRabbit review pass. Every check here maps to a
+# bug that shipped in a green suite, so each one exists to keep that specific
+# bug from coming back, not to describe the feature in general.
+# ══════════════════════════════════════════════════════════════════════════
+def t76_labels():
+    import tempfile, os as _os
+    from autoannotate.pipeline.labels import (save_boxes_yolo, save_polys_yolo,
+                                              save_classes_txt,
+                                              verify_boxes_round_trip)
+    d = tempfile.mkdtemp()
+    img = _os.path.join(d, "img.jpg")          # imread_unicode is stubbed 100x100
+    lab = _os.path.join(d, "labels")
+    save_boxes_yolo([[10, 10, 30, 30]], img, lab, classes=[2])
+    label_file = _os.path.join(lab, "img.txt")
+    good = open(label_file).read()
+
+    # The label file is opened 'w' (truncating), so anything that can fail has
+    # to fail BEFORE the write. Each of these used to truncate, then raise,
+    # leaving the user's labels destroyed and half-rewritten.
+    for name, boxes, cls in [
+        ("misaligned classes", [[10, 10, 30, 30]], [1, 2]),
+        ("non-int class id",   [[10, 10, 30, 30]], [None]),
+        ("negative class id",  [[10, 10, 30, 30]], [-1]),
+        ("malformed box",      [[1, 2, 3]],        None),
+        ("non-numeric coord",  [["a", "b", "c", "d"]], None),
+    ]:
+        try:
+            save_boxes_yolo(boxes, img, lab, classes=cls)
+            check(f"T76 save_boxes_yolo rejects {name}", False, "no error raised")
+        except ValueError:
+            check(f"T76 save_boxes_yolo rejects {name}", True)
+        check(f"T76 prior labels survive {name}", open(label_file).read() == good)
+    check("T76 atomic write leaves no .tmp litter",
+          not any(f.endswith(".tmp") for f in _os.listdir(lab)), _os.listdir(lab))
+
+    try:
+        save_polys_yolo([[[0.1, 0.1], [0.4, 0.1], [0.4, 0.4]]] * 2, lab, img, classes=[1])
+        check("T76 save_polys_yolo rejects misaligned classes", False, "no error")
+    except ValueError:
+        check("T76 save_polys_yolo rejects misaligned classes", True)
+
+    # save_boxes_yolo made its dir; save_polys_yolo did not, so the first run
+    # into a fresh segments/ folder died with FileNotFoundError.
+    fresh = _os.path.join(d, "never_made", "segments")
+    save_polys_yolo([[[0.1, 0.1], [0.4, 0.1], [0.4, 0.4]]], fresh, img, classes=[1])
+    check("T76 save_polys_yolo creates its output dir",
+          _os.path.exists(_os.path.join(fresh, "img.txt")))
+
+    # classes.txt is positional: line N IS class id N, so an embedded newline
+    # would shift the id of every class after it.
+    try:
+        save_classes_txt(["berry", "leaf\nstem"], d)
+        check("T76 save_classes_txt rejects newline in a name", False, "no error")
+    except ValueError:
+        check("T76 save_classes_txt rejects newline in a name", True)
+
+    orig = G.get("imread_unicode")
+    G["imread_unicode"] = lambda *a, **k: None
+    try:
+        ok, err = verify_boxes_round_trip([[1, 1, 2, 2]], img, lab)
+        check("T76 verify_boxes_round_trip fails (not crashes) on bad image",
+              ok is False and err == float("inf"), (ok, err))
+    finally:
+        G["imread_unicode"] = orig
+
+t76_labels()
+
+
+def t76_postfilter():
+    from autoannotate.pipeline.postfilter import suppress_negative_hits
+    # classes[i] < n_pos marks a positive. With n_pos == 0 EVERY detection is a
+    # negative, so passing them through would bake the negatives in as output.
+    b, c, p = suppress_negative_hits([[0, 0, 9, 9], [5, 5, 9, 9]], [0, 1], None, n_pos=0)
+    check("T76 n_pos=0 drops every detection", b == [] and c == [], (b, c))
+    # Normal case still filters: class 1 is negative, and the positive it
+    # overlaps goes with it; the far-away positive survives.
+    b, c, _ = suppress_negative_hits(
+        [[0, 0, 10, 10], [0, 0, 10, 10], [50, 50, 60, 60]], [0, 1, 0], None, n_pos=1)
+    check("T76 negative suppresses the positive it overlaps",
+          b == [[50, 50, 60, 60]] and c == [0], (b, c))
+
+t76_postfilter()
+
+
+def t76_input_only():
+    from autoannotate.gui.manual_window import is_input_only
+    # Ten sites used to test `!= 'prompt'` only, so red negative boxes were
+    # baked, segmented, rendered and SAVED as if the user had annotated them.
+    check("T76 is_input_only covers prompt and neg_prompt",
+          [is_input_only(s) for s in ("prompt", "neg_prompt", "manual", "detector")]
+          == [True, True, False, False])
+    mw_src = open(os.path.join(_REPO_ROOT, "autoannotate", "gui", "manual_window.py"),
+                  encoding="utf-8").read()
+    check("T76 no bare source != 'prompt' test left in manual_window",
+          "source') != 'prompt'" not in mw_src)
+
+t76_input_only()
+
+
+def t76_dedup_and_classes():
+    w = mk_window()
+    def ann(cls, src):
+        return {'type': 'rect', 'data': [0.5, 0.5, 0.2, 0.2],
+                'deleted': False, 'source': src, 'cls': cls}
+    # Same-class-only, matching the policy _nms_dedup already documented: two
+    # classes claiming one object is a real disagreement, so both rows survive
+    # and the reviewer decides.
+    out = w._dedup_anns([ann(0, 'detector'), ann(1, 'detector')])
+    check("T76 _dedup_anns keeps overlapping DIFFERENT classes", len(out) == 2,
+          [a['cls'] for a in out])
+    out = w._dedup_anns([ann(0, 'detector'), ann(0, 'detector')])
+    check("T76 _dedup_anns dedups the SAME class", len(out) == 1)
+    out = w._dedup_anns([ann(0, 'detector'), ann(0, 'manual')])
+    check("T76 _dedup_anns manual still wins within a class",
+          len(out) == 1 and out[0]['source'] == 'manual')
+    out = w._dedup_anns([ann(0, 'detector'), ann(1, 'detector')], cross_class=True)
+    check("T76 _dedup_anns cross_class=True still suppresses", len(out) == 1)
+
+    # manual_cls was a SCALAR, so boxes drawn as different classes all collapsed
+    # onto whatever class the dropdown happened to be showing.
+    det = [[0, 0, 10, 10]]
+    man = [[100, 100, 110, 110], [200, 200, 210, 210]]
+    _, _, cls = w._combine_with_dedup(det, man, 0.5, det_classes=[0], manual_classes=[2, 3])
+    check("T76 _combine_with_dedup keeps per-box manual classes", cls == [0, 2, 3], cls)
+    _, _, cls = w._combine_with_dedup(det, man, 0.5, manual_classes=[2, 3])
+    check("T76 manual_classes alone still returns classes", cls == [0, 2, 3], cls)
+    legacy = w._combine_with_dedup(det, man, 0.5)
+    check("T76 _combine_with_dedup 2-tuple back-compat", len(legacy) == 2, len(legacy))
+
+t76_dedup_and_classes()
+
+
+def t76_parse_saved_labels():
+    import tempfile, os as _os
+    from autoannotate.gui.manual_window import _parse_saved_labels
+    d = tempfile.mkdtemp()
+    bp, sp = _os.path.join(d, "b.txt"), _os.path.join(d, "s.txt")
+    # A box line is written for every polygon and carries the SAME class, so a
+    # box only shadows a polygon of its own class. Matching across classes
+    # deleted a genuine class-1 box that merely overlapped a class-0 mask.
+    open(sp, "w").write("0 0.1 0.1 0.3 0.1 0.3 0.3 0.1 0.3\n")
+    open(bp, "w").write("0 0.2 0.2 0.2 0.2\n1 0.2 0.2 0.2 0.2\n")
+    rects, rect_cls, polys, poly_cls = _parse_saved_labels(bp, sp)
+    check("T76 saved box of the poly's own class is dropped as a dup",
+          rect_cls == [1], rect_cls)
+    check("T76 overlapping box of a DIFFERENT class survives",
+          len(rects) == 1 and len(polys) == 1, (rects, polys))
+
+t76_parse_saved_labels()
+
+
+def t76_side_by_side_pairs():
+    from pathlib import Path as _P
+    w = SideBySideWindow.__new__(SideBySideWindow)
+    # The batch flow makes SEVERAL variations of one original. Consuming each
+    # ground truth once left every variation after the first with a blank pane.
+    w.synth_images = ["o/berry_01_var1.png", "o/berry_01_var2.png", "o/berry_01_var3.png"]
+    w.gt_images = ["g/berry_01.png", "g/berry_99.png"]
+    w._build_pairs()
+    gts = [_P(g).name if g else None for _, g in w.pairs if _ is not None]
+    check("T76 one ground truth backs every variation",
+          gts == ["berry_01.png"] * 3, gts)
+    check("T76 unmatched ground truth still listed",
+          (None, "g/berry_99.png") in w.pairs, w.pairs)
+    # Longest prefix wins, so berry_01_var1 prefers berry_01 over berry.
+    w2 = SideBySideWindow.__new__(SideBySideWindow)
+    w2.synth_images = ["o/berry_01_var1.png"]
+    w2.gt_images = ["g/berry.png", "g/berry_01.png"]
+    w2._build_pairs()
+    check("T76 most specific ground truth wins",
+          w2.pairs[0][1] == "g/berry_01.png", w2.pairs)
+    # No name correspondence at all: positional fallback still applies.
+    w3 = SideBySideWindow.__new__(SideBySideWindow)
+    w3.synth_images = ["o/a.png", "o/b.png"]
+    w3.gt_images = ["g/x.png", "g/y.png"]
+    w3._build_pairs()
+    check("T76 positional fallback survives",
+          w3.pairs == [("o/a.png", "g/x.png"), ("o/b.png", "g/y.png")], w3.pairs)
+
+t76_side_by_side_pairs()
+
+
+def t76_yoloe_class_order():
+    from autoannotate.pipeline import yoloe as _y
+    # Ultralytics' OUTER set_classes guards on sorted(names) != sorted(classes),
+    # so re-prompting the SAME classes in a NEW ORDER read as "no change": the
+    # model kept its old name AND embedding order and every class id came back
+    # swapped. run_yoloe_text must drive the inner setter, which is unconditional.
+    class Inner:
+        def __init__(self):
+            self.names = {0: "berry", 1: "leaf"}
+            self.pe = None
+        def set_classes(self, names, emb):
+            self.names = {i: n for i, n in enumerate(names)}
+            self.pe = emb
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+            self.predictor = None
+        def get_text_pe(self, names):
+            return ("emb", tuple(names))
+        def set_classes(self, names, emb=None):     # the guard that loses
+            if sorted(list(self.model.names.values())) != sorted(names):
+                self.model.set_classes(names, emb)
+        def predict(self, *a, **k):
+            return []
+    m = Outer()
+    _y.run_yoloe_text(m, "img.jpg", ["leaf", "berry"])   # same names, NEW order
+    check("T76 YOLOE reseeds names in the prompted order",
+          m.model.names == {0: "leaf", 1: "berry"}, m.model.names)
+    check("T76 YOLOE reseeds embeddings with the reorder",
+          m.model.pe == ("emb", ("leaf", "berry")), m.model.pe)
+
+t76_yoloe_class_order()
+
+
+def t76_config_env():
+    from autoannotate.config import effective_max_area_frac
+    import autoannotate.config as _cfg
+    # check_environment used to print the RAW env string, so a garbage .env value
+    # looked like it had taken effect when inference had already fallen back.
+    prev = os.environ.get("AUTOANNOTATE_MAX_AREA_FRAC")
+    try:
+        for raw, want in [("0.8", 0.8), ("abc", _cfg.DEFAULT_MAX_AREA_FRAC),
+                          ("5.0", _cfg.DEFAULT_MAX_AREA_FRAC),
+                          ("-1", _cfg.DEFAULT_MAX_AREA_FRAC)]:
+            os.environ["AUTOANNOTATE_MAX_AREA_FRAC"] = raw
+            got = effective_max_area_frac()
+            check(f"T76 max_area_frac {raw!r} -> {want}", got == want, got)
+        os.environ.pop("AUTOANNOTATE_MAX_AREA_FRAC", None)
+        check("T76 max_area_frac unset -> default",
+              effective_max_area_frac() == _cfg.DEFAULT_MAX_AREA_FRAC)
+    finally:
+        os.environ.pop("AUTOANNOTATE_MAX_AREA_FRAC", None)
+        if prev is not None:
+            os.environ["AUTOANNOTATE_MAX_AREA_FRAC"] = prev
+    # .env has to be read BEFORE the device block defaults it, or the value a
+    # user put in .env can never win (load_dotenv does not overwrite).
+    cfg_src = open(os.path.join(_REPO_ROOT, "autoannotate", "config.py"),
+                   encoding="utf-8").read()
+    check("T76 .env loads before the SD device default",
+          cfg_src.index("load_dotenv(") < cfg_src.index('"AUTOANNOTATE_SD_DEVICE" not in os.environ'))
+    check("T76 CUDA dll handles are retained", "_CUDA_DLL_HANDLES" in cfg_src)
+
+t76_config_env()
+
+
 # ── summary ────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok, _ in _results if ok)
 total = len(_results)

@@ -15,7 +15,8 @@ install once so the CUDA extension is rebuilt from the patched source:
 
 - [ ] Fresh venv on Python 3.13: `py -3.13 -m venv .venv` then `.\.venv\Scripts\Activate.ps1`.
 - [ ] `pip uninstall -y torch torchvision torchaudio` (clear any CPU build).
-- [ ] `pip install -r requirements-windows.txt` completes with no resolver errors.
+- [ ] `pip install -r requirements-windows11-cuda.txt` completes with no resolver errors.
+- [ ] `pip install wheel setuptools ninja` installs the GroundingDINO build helpers.
 - [ ] Confirm the GPU wheels were installed, not CPU:
       `python -c "import torch; print(torch.__version__)"` shows a `+cu132` build.
 - [ ] `python -c "import torch; print(torch.cuda.is_available())"` prints `True`.
@@ -23,6 +24,11 @@ install once so the CUDA extension is rebuilt from the patched source:
       prints the CUDA version and your GPU name.
 - [ ] Installing did NOT pull a second/CPU torch afterward (re-check `torch.__version__`
       still shows `+cu132` once ultralytics/diffusers finished installing).
+
+For the separate Windows 10 CPU-only machine, use
+`requirements-windows10-cpu.txt`, confirm `torch==2.6.0+cpu`,
+`torchvision==0.21.0+cpu`, and confirm `torch.cuda.is_available()` is `False`.
+Do not install `requirements-windows11-cuda.txt` or any `cuXXX` wheel there.
 
 ## 2. GroundingDINO build (the torch-adaptation fixes)
 
@@ -39,6 +45,9 @@ install once so the CUDA extension is rebuilt from the patched source:
 - [ ] `python "GUI and Pipeline/check_environment.py"` runs and reports: CUDA
       available, torch CUDA version, GPU name, GroundingDINO path found, weights
       present, effective max-area value, and the Stable Diffusion device.
+- [ ] It reports `GroundingDINO _C extension : [ OK ] importable`. If this is a
+      warning on the CUDA machine, rebuild the editable GroundingDINO install
+      before testing SwinT or SwinB performance.
 
 ## 4. App launch and GPU usage
 
@@ -83,6 +92,39 @@ install once so the CUDA extension is rebuilt from the patched source:
       all N images (not N-1).
 - [ ] "Include Earlier Images" ON while starting mid-folder: earlier images are
       appended and the whole folder is covered, with the current image not duplicated.
+
+## 8b. Review Side by Side (post-batch)
+
+- [ ] "Review Side by Side (post)" On, two-stage pipeline (e.g. DINO + SAM2):
+      after both end-of-run popups the "Which annotated images" prompt appears,
+      because the run saved BOTH boxes and masks. It must ask regardless of which
+      of the Bounding Box / Segmentation checkboxes is ticked; those two untick
+      each other and no longer decide this.
+- [ ] Each answer opens the matching folder (`output/annotated_<model>/boxes` or
+      `.../masks`), paired by filename. Cancel, on the left edge, opens nothing.
+- [ ] A run that saved only ONE kind (bbox-only pipeline) opens it with no
+      prompt.
+- [ ] Prev/Next steps both panes together, the swap arrow moves titles + folder
+      buttons + images together, and per-pane zoom works.
+- [ ] Back, Esc AND the window's close button each return to the MAIN MENU, at
+      full screen size. A quarter-size window here is the bug this replaced.
+- [ ] Toggle Off: the run ends exactly as before, with no viewer.
+- [ ] Cancel a run partway with the toggle On: the viewer still opens on what
+      finished.
+
+## 8c. CUDA memory over a long batch
+
+- [ ] `nvidia-smi` during a long two-stage run (YOLOE or DINO -> SAM3): VRAM
+      plateaus instead of climbing image after image.
+- [ ] The last images of the run complete rather than failing with "CUDA out of
+      memory" the way they did before.
+- [ ] If an out-of-memory does happen, the console prints
+      `[oom] ... freeing every cached model and retrying once` and the image
+      completes on the retry.
+- [ ] An image that fails anyway is reported with the AUTOANNOTATE_MODEL_BUDGET_GB
+      / AUTOANNOTATE_BATCH_CHUNK hint, in the popup and in review_report.csv.
+- [ ] `AUTOANNOTATE_MODEL_BUDGET_GB=0` restores the old unbounded behavior
+      (useful to confirm the derived budget is what changed things).
 
 ## 9. VS Code .env toast
 

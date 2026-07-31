@@ -22,6 +22,7 @@ from ..pipeline.overlay import (adjust_masks, draw_boxes_on_image, overlay_with_
 from ..pipeline.postfilter import suppress_by_neg_boxes, suppress_negative_hits
 from ..pipeline.sam import (load_sam, run_sam3_boxes, run_sam3_text,
                             segment_with_boxes)
+from ..pipeline import sd as sd_module
 from ..pipeline.sd import _SD_STRENGTH, generate_variation
 from ..pipeline.yoloe import load_yoloe, run_yoloe_text, run_yoloe_vis
 from . import session_state
@@ -288,12 +289,30 @@ class ManualWindow(QtWidgets.QWidget):
 
         lbl_style      = f"color: white; font-size: {font}px;"
 
+        # Back and the manual share a row: the manual is worth having HERE and
+        # not only on the main menu, because everything it documents is in this
+        # window and walking back out to read it loses your place.
+        nav_help_row = QtWidgets.QHBoxLayout()
+        nav_help_row.setSpacing(BTN_GAP)
+
         back_btn = QtWidgets.QPushButton("Back")
         back_btn.setStyleSheet(btn_qss(BTN_GREY, font))
         back_btn.setFixedHeight(btn_h)
         back_btn.setToolTip("Return to the main menu.")
         back_btn.clicked.connect(self.go_back)
-        left_layout.addWidget(back_btn)
+        nav_help_row.addWidget(back_btn)
+
+        self.user_manual_btn = QtWidgets.QPushButton("User Manual")
+        self.user_manual_btn.setStyleSheet(btn_qss(BTN_GREEN, font))
+        self.user_manual_btn.setFixedHeight(btn_h)
+        self.user_manual_btn.setToolTip(
+            "Step-by-step instructions for this window: prompts, box "
+            "annotation, carrying prompts forward, editing, synthetic images "
+            "and the keyboard shortcuts.")
+        self.user_manual_btn.clicked.connect(self.open_user_manual)
+        nav_help_row.addWidget(self.user_manual_btn)
+
+        left_layout.addLayout(nav_help_row)
 
         folder_btn = QtWidgets.QPushButton("Select Image Folder")
         folder_btn.setStyleSheet(btn_qss(BTN_BLUE, font))
@@ -897,6 +916,28 @@ class ManualWindow(QtWidgets.QWidget):
             "like any other batch target."
         )
         bottom_layout.addWidget(self.recycle_checkbox)
+
+        # Review Side by Side: when ON, finishing Auto Annotate Remaining drops
+        # straight into the side-by-side viewer with the input folder and this
+        # run's annotated overlays already loaded, instead of making the user
+        # walk back out to the main menu and pick both folders by hand. Purple
+        # matches the side-by-side entry in the main menu and the viewer's own
+        # folder buttons.
+        self.review_sbs_checkbox = QtWidgets.QPushButton("Review Side by Side (post): Off")
+        self.review_sbs_checkbox.setCheckable(True)
+        self.review_sbs_checkbox.setChecked(False)
+        self.review_sbs_checkbox.setStyleSheet(toggle_qss(BTN_PURPLE, font))
+        self.review_sbs_checkbox.setFixedHeight(btn_h)
+        self.review_sbs_checkbox.toggled.connect(self._on_review_sbs_toggled)
+        self.review_sbs_checkbox.setToolTip(
+            "When On, Auto Annotate Remaining opens the side-by-side viewer as "
+            "soon as it finishes, with the original images on one side and this "
+            "run's annotated images on the other. If the run saved both bounding "
+            "boxes and segmentation you are asked which to review; if it saved "
+            "only one, that one opens. Closing the viewer returns you to the "
+            "main menu, so the folder you just finished is done."
+        )
+        bottom_layout.addWidget(self.review_sbs_checkbox)
         self._refresh_carry_checkbox_enabled()
         self._refresh_auto_annotate_enabled()
 
@@ -1248,7 +1289,8 @@ class ManualWindow(QtWidgets.QWidget):
             "How much Stable Diffusion regenerates the background. Low = "
             "keep the original scene (most realistic, least varied); high "
             "= fully repaint from the prompt (more varied, risks unnatural "
-            "fills). 0.40-0.70 is the realistic sweet spot.")
+            "fills). 0.1 to 0.2 is the sweet spot in testing; the default "
+            "is 0.20.")
         sd_layout.addWidget(sd_strength_label)
         self.sd_strength_label = sd_strength_label
 
@@ -1838,15 +1880,50 @@ class ManualWindow(QtWidgets.QWidget):
         caller that still reads window.DINO. Loads on first access."""
         return self._get_model("dino_swint")
 
+    # Fraction of total VRAM the derived CUDA budget hands to model WEIGHTS.
+    # The rest is headroom for activations, workspaces and the allocator's own
+    # pooling, none of which MODEL_FOOTPRINT_GB accounts for.
+    CUDA_BUDGET_FRACTION = 0.55
+
     def _model_budget_gb(self):
-        """Soft resident-RAM budget (GB) for detection/segmentation models, read
-        from AUTOANNOTATE_MODEL_BUDGET_GB. 0 / unset = unbounded: never evict
-        (exactly the legacy behavior). Set e.g. 4.5 on an 8GB machine to stop
-        SAM3 co-residing with other heavy models (see DESIGN_two_stage_yoloe_sam3.md)."""
+        """Soft resident-RAM budget (GB) for detection/segmentation models.
+
+        AUTOANNOTATE_MODEL_BUDGET_GB wins when set, including an explicit 0
+        meaning unbounded (never evict). When it is UNSET and CUDA is present,
+        the budget is derived from the card's total VRAM so a default install
+        stops DINO + YOLOE + SAM3 co-residing on the GPU -- that unbounded
+        co-residency is what ran an 8GB card out of memory in the last few
+        images of a batch. CPU and MPS keep the unbounded legacy default; the
+        8GB Mac configures this explicitly (see
+        DESIGN_two_stage_yoloe_sam3.md)."""
+        raw = os.environ.get("AUTOANNOTATE_MODEL_BUDGET_GB")
+        if raw is not None and raw.strip() != "":
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+        return self._cuda_budget_gb()
+
+    def _cuda_budget_gb(self):
+        """VRAM-derived budget for the default (env-unset) case, or 0 off CUDA.
+        Probed once and cached: get_device_properties initialises a CUDA context
+        and the answer cannot change mid-session."""
+        cached = getattr(self, "_cuda_budget_cache", None)
+        if cached is not None:
+            return cached
+        budget = 0.0
         try:
-            return float(os.environ.get("AUTOANNOTATE_MODEL_BUDGET_GB", "0") or 0)
-        except (TypeError, ValueError):
-            return 0.0
+            if torch.cuda.is_available():
+                total = torch.cuda.get_device_properties(0).total_memory
+                budget = round((total / (1024 ** 3)) * self.CUDA_BUDGET_FRACTION, 2)
+        except Exception:
+            budget = 0.0
+        self._cuda_budget_cache = budget
+        if budget and AUTOANNOTATE_DEBUG:
+            print(f"[model-cache] CUDA model budget {budget:.1f}GB "
+                  f"(AUTOANNOTATE_MODEL_BUDGET_GB unset; set it to override, "
+                  f"0 for unbounded)")
+        return budget
 
     def _resident_gb(self, extra_key=None):
         keys = set(self._model_cache)
@@ -1861,25 +1938,95 @@ class ManualWindow(QtWidgets.QWidget):
             total += self.MODEL_FOOTPRINT_GB.get("sam3", 3.3)
         return total
 
+    def _pinned_model_keys(self):
+        """Models the CURRENT pipeline must keep, or an empty set when nothing is
+        pinned.
+
+        Pinning is on only for the duration of a batch run. Auto Annotate
+        Remaining loads a detector and a segmenter and then alternates between
+        them for hundreds of images; letting the budget evict one to fit the
+        other turns every chunk boundary into two multi-GB reloads, which is pure
+        added wall-clock for a set of models the run is going to ask for again
+        immediately. Offloading belongs to a detector/segmenter SWITCH (see
+        _offload_unused_models), where the dropped model genuinely is not coming
+        back.
+
+        Interactive work is deliberately NOT pinned: there the user is switching
+        models around and the budget's whole job is to stop the leftovers piling
+        up.
+
+        The pin is dropped for the rest of the run by the first real
+        out-of-memory (see _run_with_oom_retry), because at that point the card
+        has proved it cannot hold both and reloading beats failing.
+
+        Gated on _busy as well as the pin flag: if a run ever exits by a path
+        that skips its cleanup, the pin expires with the busy state instead of
+        silently exempting the pipeline from the budget for the rest of the
+        session."""
+        if not (getattr(self, "_pin_pipeline_models", False)
+                and getattr(self, "_busy", False)):
+            return set()
+        try:
+            det_key, seg_key, _ = self._detector_keys_for_pipeline()
+        except Exception:
+            return set()
+        return {k for k in (det_key, seg_key) if k}
+
     def _evict_for(self, key):
         """Evict least-recently-used cached models until `key` fits the budget.
-        Never evicts `key`. No-op when the budget is 0/unset, so default
-        behavior is unchanged."""
+        Never evicts `key`, and never evicts the running pipeline's own models
+        during a batch (see _pinned_model_keys). No-op when the budget is
+        0/unset, so default behavior is unchanged."""
         budget = self._model_budget_gb()
         if budget <= 0:
             return
         lru = getattr(self, "_model_lru", {})
+        pinned = self._pinned_model_keys()
         while self._resident_gb(key) > budget:
-            victims = [k for k in self._model_cache if k != key]
+            # A pinned model is still a legitimate target for the SWITCH path;
+            # it is only off limits here, mid-run. Anything the pipeline does not
+            # use is evicted as usual: that is a one-time reclaim of a leftover,
+            # not churn, and it is exactly what makes room for the pinned pair.
+            victims = [k for k in self._model_cache if k != key and k not in pinned]
             if not victims:
                 break
             victim = min(victims, key=lambda k: lru.get(k, 0))
             if AUTOANNOTATE_DEBUG:
                 print(f"[model-cache] evict {victim} to fit {key} "
                       f"(resident {self._resident_gb():.1f}GB > budget {budget:.1f}GB)")
+            self._warn_pipeline_over_budget(victim, key, budget)
             self._model_cache.pop(victim, None)
             lru.pop(victim, None)
             self._release_inference_memory(force=True)
+
+    def _warn_pipeline_over_budget(self, victim, key, budget):
+        """Say ONCE when eviction has started churning the live pipeline itself.
+
+        Dropping a model the current pipeline does not use is the budget doing
+        its job. Dropping one it needs again on the very next call is not:
+        detect and segment then reload each other's weights on every image, and
+        all the user sees is a run that got slow for no stated reason. SAM3
+        detector plus SAM3 segmenter is the combination that hits it, 3.3GB
+        apiece against the VRAM-derived budget on an 8GB card. Not gated on
+        AUTOANNOTATE_DEBUG: it is the only signal that the pipeline does not fit,
+        and it names the knob that turns the behaviour off."""
+        try:
+            det_key, seg_key, _ = self._detector_keys_for_pipeline()
+        except Exception:
+            return
+        pipeline = {k for k in (det_key, seg_key) if k}
+        if victim not in pipeline or key not in pipeline:
+            return
+        stamp = (det_key, seg_key, budget)
+        if getattr(self, "_over_budget_warned", None) == stamp:
+            return
+        self._over_budget_warned = stamp
+        need = sum(self.MODEL_FOOTPRINT_GB.get(k, 0.5) for k in pipeline)
+        print(f"[model-cache] {self._model_tag()} wants {need:.1f}GB of weights "
+              f"against a {budget:.1f}GB budget, so its models reload between "
+              f"detect and segment on every image. Raise "
+              f"AUTOANNOTATE_MODEL_BUDGET_GB (or set it to 0 for unbounded) if "
+              f"the card has the room, or pick a lighter pipeline.")
 
     def _offload_unused_models(self):
         """After a detector/segmenter switch, free every cached model the NEW
@@ -2276,6 +2423,13 @@ class ManualWindow(QtWidgets.QWidget):
         self.recycle_checkbox.setText(
             "Include Earlier Images: ON" if on else "Include Earlier Images: OFF")
 
+    def _on_review_sbs_toggled(self, on):
+        """Review Side by Side toggled: label text only; the color follows
+        :checked, same as the two toggles above it."""
+        self.review_sbs_checkbox.setText(
+            "Review Side by Side (post): On" if on
+            else "Review Side by Side (post): Off")
+
     def _refresh_carry_checkbox_enabled(self):
         """The carry toggle drives BOX-exemplar carry (this image's drawn boxes
         -> every remaining image). DINO is text-only with no box path, so its
@@ -2315,6 +2469,67 @@ class ManualWindow(QtWidgets.QWidget):
         # yoloe_seg / sam3_det are one-shot detectors that can run from
         # either a drawn box exemplar or a text prompt.
         return has_boxes or has_text
+
+    def _dead_pipeline_reason(self, batch=True):
+        """Why the CURRENT settings cannot detect anything, or None if they can.
+
+        `batch` selects the scope. The SAM3-plus-segmenter case is dead for any
+        run at all, so it is checked either way. The rest are specific to Auto
+        Annotate Remaining, which reaches the detector through the carry path;
+        an interactive Regenerate hands it the drawn boxes directly and is
+        unaffected by the carry toggle.
+
+        _auto_annotate_available answers "is there enough input"; this answers
+        the different question "will the input actually reach the detector". The
+        two came apart in ways that cost whole folders:
+
+          * YOLOE-vis carries its exemplars ONLY when the carry toggle is on
+            (auto_annotate_remaining builds `carried`/`ref_bundle` behind
+            isChecked()), so with it off the detector reaches
+            `if not prompt_boxes_img: return [], None` on every image. The button
+            stayed enabled the whole time, because a drawn box satisfies
+            _auto_annotate_available.
+          * The SAM3 branch of _run_detector_positive is gated on `is_standalone`.
+            Pick SAM3 as the detector AND a segmenter, and nothing matches, so
+            the function falls through to `return [], None`. _on_detector_changed
+            sets the segmenter to "(none)" but leaves the dropdown live, so this
+            is two clicks away.
+
+        Both used to fail silently, image after image. Reported as text naming
+        the control to change rather than a boolean, because "it will not work"
+        without "here is the switch" is the thing that wasted the time."""
+        det_key, seg_key, _ = self._detector_keys_for_pipeline()
+        carry_on = (hasattr(self, "carry_forward_checkbox")
+                    and self.carry_forward_checkbox.isChecked())
+        boxes_mode = getattr(self, "prompt_mode", "text") == "boxes"
+        has_text = bool(self._positive_prompt_text().strip())
+
+        if det_key == "sam3_det" and seg_key is not None:
+            return ("SAM3 (one-shot) produces its own masks and returns nothing "
+                    "when a separate segmenter is also selected.\n\n"
+                    "Set Segmenter to \"(none)\".")
+        if not batch:
+            return None
+        if det_key == "yoloe_vis" and not carry_on:
+            return ("YOLOE-vis detects from the boxes you draw, and those are "
+                    "only passed to the other images when prompts are carried "
+                    "forward. As it stands every image would come back empty."
+                    "\n\nTurn on \"Use First Image as Prompt\".")
+        if det_key in ("yoloe_seg", "sam3_det") and not boxes_mode and not has_text:
+            return ("In Text mode this detector needs a text prompt, and there "
+                    "is none. Boxes you have drawn are green manual annotations "
+                    "in this mode, not prompts, so they will not be used."
+                    "\n\nEnter a text prompt, or switch to Boxes mode and draw "
+                    "a prompt box.")
+        if carry_on and self._detector_uses_box_exemplars():
+            anchor = (self.image_label.get_prompt_boxes_in_image_coords()
+                      or getattr(self, "_carry_anchor", None))
+            if not anchor:
+                return ("Carrying prompts forward needs at least one yellow "
+                        "prompt box to carry, and there is none on this image."
+                        "\n\nDraw a prompt box, or turn off \"Use First Image "
+                        "as Prompt\".")
+        return None
 
     def _refresh_auto_annotate_enabled(self):
         """Grey out Auto Annotate Remaining + Select Multiple + the SD
@@ -2987,9 +3202,13 @@ class ManualWindow(QtWidgets.QWidget):
     def _run_detector(self, image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=None):
         """Run the detector, then apply red-negative-box suppression (a no-op
         when no negative boxes are drawn). Single choke point so Regenerate,
-        Next Image, and Auto Annotate Remaining all inherit both."""
-        boxes, results = self._run_detector_positive(
-            image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=ref)
+        Next Image, and Auto Annotate Remaining all inherit both -- including
+        the out-of-memory retry, since every detector call in the app lands
+        here and _run_detector_positive re-fetches its model per call."""
+        boxes, results = self._run_with_oom_retry(
+            "detector",
+            lambda: self._run_detector_positive(
+                image_path, prompt, det_thresh, mask_thresh, prompt_boxes_img, ref=ref))
         boxes = self._apply_neg_box_suppression(image_path, boxes, det_thresh)
         return boxes, results
 
@@ -3927,14 +4146,19 @@ class ManualWindow(QtWidgets.QWidget):
             return None
         if not boxes:
             return None
-        sam = self._get_model(seg_key)
         # segment_with_boxes (not a raw sam() call): it guarantees one mask per
         # prompt box, index-aligned, with each mask clipped near its box. The
         # raw call let ultralytics conf-drop weak masks (shifting every later
         # mask onto the wrong box) and let SAM3 concept-spill giant masks far
         # beyond the boxed object.
+        #
+        # _get_model is INSIDE the lambda, not hoisted: an out-of-memory retry
+        # purges the cache first, so the second attempt has to reload the
+        # segmenter rather than reuse a handle to a model that is already gone.
         try:
-            return segment_with_boxes(sam, image_path, boxes)
+            return self._run_with_oom_retry(
+                "segmenter",
+                lambda: segment_with_boxes(self._get_model(seg_key), image_path, boxes))
         finally:
             # Release after EVERY segmenter run (SAM2/SAM3), regardless of which
             # operation invoked it -- per-image predict, batch, mode switch, or the
@@ -4241,6 +4465,162 @@ class ManualWindow(QtWidgets.QWidget):
                                                    poly_classes=classes)
             self._save_annotated_image(image_path, mask_only, 'masks')
 
+    # Post-batch side-by-side review
+    #
+    # Overlay kinds in PREFERENCE order: when the run has to pick for itself
+    # (neither checkbox ticked, or the ticked one produced nothing), masks win
+    # -- a mask is the harder output to eyeball, so it is the one worth opening.
+    _REVIEW_KINDS = ("masks", "boxes")
+
+    @staticmethod
+    def _dir_has_images(folder):
+        """True when `folder` holds at least one image the viewer can show.
+        A missing folder is simply empty, not an error: a bbox-only run never
+        creates annotated_<tag>/masks at all."""
+        try:
+            return any(f.lower().endswith(('.png', '.jpg', '.jpeg'))
+                       for f in os.listdir(folder))
+        except OSError:
+            return False
+
+    def _build_review_kind_dialog(self):
+        """Build the "which overlay" chooser. Returns (dialog, buttons), where
+        buttons maps a return value to its QPushButton: None for Cancel.
+
+        A hand-laid QDialog rather than a QMessageBox, because button POSITION
+        matters here and QMessageBox does not let you control it. It hands its
+        buttons to the platform's layout policy, which sorts them by role and
+        put the opt-out between the two real choices, exactly where a
+        mis-click lands. An explicit QHBoxLayout puts Cancel hard against the
+        left edge, away from the choices, and does so identically on macOS,
+        Windows and Linux instead of three different orders.
+
+        Split out from _ask_review_overlay_kind so tests can inspect the layout
+        without a modal exec_ to escape from."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Review Side by Side")
+        dlg.setStyleSheet("QDialog { background-color: white; } "
+                          "QLabel { color: black; font-size: 24px; }")
+        font = max(13, QtWidgets.QApplication.primaryScreen().geometry().height() // 58)
+
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.setSpacing(BTN_GAP * 2)
+        label = QtWidgets.QLabel(
+            "This run saved both bounding boxes and segmentation.\n\n"
+            "Which do you want to review side by side?", dlg)
+        label.setWordWrap(True)
+        lay.addWidget(label)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(BTN_GAP)
+        cancel_btn = QtWidgets.QPushButton("Cancel", dlg)
+        cancel_btn.setStyleSheet(btn_qss(BTN_GREY, font))
+        cancel_btn.setToolTip("Do not open the viewer. The run is already saved.")
+        bbox_btn = QtWidgets.QPushButton("Bounding Boxes", dlg)
+        bbox_btn.setStyleSheet(btn_qss(BTN_PURPLE, font))
+        seg_btn = QtWidgets.QPushButton("Segmentation", dlg)
+        seg_btn.setStyleSheet(btn_qss(BTN_PURPLE, font))
+        for b in (cancel_btn, bbox_btn, seg_btn):
+            b.setFixedHeight(max(40, font * 2))
+        # Cancel on the left edge, the two choices together on the right, with
+        # the whole width between them.
+        row.addWidget(cancel_btn)
+        row.addStretch()
+        row.addWidget(bbox_btn)
+        row.addWidget(seg_btn)
+        lay.addLayout(row)
+
+        return dlg, {"boxes": bbox_btn, "masks": seg_btn, None: cancel_btn}
+
+    def _ask_review_overlay_kind(self):
+        """The run wrote both kinds of overlay, so only the user knows which one
+        they want to look at: ask. Returns 'boxes', 'masks', or None to open
+        nothing. Factored out so tests can stub it."""
+        dlg, buttons = self._build_review_kind_dialog()
+        chosen = {"kind": None}
+        for kind, btn in buttons.items():
+            if kind is None:
+                btn.clicked.connect(dlg.reject)
+            else:
+                btn.clicked.connect(
+                    lambda _=False, k=kind: (chosen.update(kind=k), dlg.accept()))
+        # Esc and the window close both reject, so every way out that is not an
+        # explicit choice means "open nothing".
+        dlg.exec_()
+        return chosen["kind"]
+
+    def _review_overlay_dir(self, output_folder, model_tag):
+        """Absolute path of the annotated_<tag> subfolder the post-batch viewer
+        should open, or None to open nothing.
+
+        Driven by what the run actually WROTE, not by the Bounding Box /
+        Segmentation checkboxes. Those two describe the on-screen view and untick
+        each other (_on_box_checked / _on_mask_checked), so reading them here got
+        this exactly backwards: a two-stage run saves boxes AND masks regardless
+        of which one is ticked, and the old code took the ticked one as an answer
+        to a question the user was never asked.
+
+        Both kinds present is the only case with a real choice in it, so that is
+        the only case that asks. One kind opens without a prompt, because there
+        is nothing to choose between."""
+        ann_root = os.path.join(output_folder, f'annotated_{model_tag}')
+        populated = [k for k in self._REVIEW_KINDS
+                     if self._dir_has_images(os.path.join(ann_root, k))]
+        if not populated:
+            return None
+        if len(populated) == 1:
+            return os.path.join(ann_root, populated[0])
+        kind = self._ask_review_overlay_kind()
+        if kind is None:      # Cancel
+            return None
+        if kind not in populated:
+            kind = populated[0]
+        return os.path.join(ann_root, kind)
+
+    def _open_review_side_by_side(self, input_folder, output_folder, model_tag):
+        """Open the side-by-side viewer on this run's results: the original
+        images against the annotated overlays.
+
+        A ONE-WAY handoff. Leaving the viewer goes to the main menu, and this
+        window is destroyed on the way out rather than hidden, because the run
+        has finished the folder and _finish_folder has already cleared
+        self.images and self.output_folder. Every path the viewer needs is
+        therefore passed in rather than read off self.
+
+        Destroyed, not hidden, for the same reason the splash is: this window is
+        fullscreen, on macOS a fullscreen window owns a Space, and a hidden one
+        leaves the app able to jump to an empty Space."""
+        if not output_folder:
+            return
+        ann_root = os.path.join(output_folder, f'annotated_{model_tag}')
+        if not any(self._dir_has_images(os.path.join(ann_root, k))
+                   for k in self._REVIEW_KINDS):
+            self._styled_message(
+                "This run did not save any annotated images, so there is "
+                "nothing to review side by side.", "Review Side by Side").exec_()
+            return
+        overlay_dir = self._review_overlay_dir(output_folder, model_tag)
+        if overlay_dir is None:   # asked, and the user chose to skip
+            return
+        kind_label = ("Segmentation" if os.path.basename(overlay_dir) == "masks"
+                      else "Bounding Boxes")
+        from .side_by_side import SideBySideWindow
+        from .splash import hand_off
+        review_window = SideBySideWindow(
+            self.model, self.processor,
+            synth_folder=overlay_dir,
+            gt_folder=(input_folder if input_folder and os.path.isdir(input_folder)
+                       else None),
+            titles={"synth": f"Auto Annotated ({kind_label})",
+                    "gt": "Original Images"},
+            folder_labels={"synth": "Open Annotated Folder",
+                           "gt": "Open Original Images Folder"})
+        # hand_off owns the viewer and destroys this window. Destroying self is
+        # safe here specifically: this is the last statement of
+        # auto_annotate_remaining, so nothing touches self afterwards, and
+        # deleteLater is queued until the current event-loop pass finishes.
+        hand_off(review_window, self)
+
     # Predictions
     def keyPressEvent(self, event):
         # Detect Enter key
@@ -4283,6 +4663,16 @@ class ManualWindow(QtWidgets.QWidget):
             message_box.setStyleSheet("QLabel { color: black; font-size: 24px; } QMessageBox { background-color: white; }")
             message_box.setText("Please draw at least one prompt box (yellow) before running the model.")
             message_box.exec_()
+            return
+        # A detector/segmenter pairing that cannot return anything is worth
+        # catching here too, not just in the batch: SAM3 with a segmenter falls
+        # through _run_detector_positive and produces nothing on a plain
+        # Regenerate as well.
+        _dead = self._dead_pipeline_reason(batch=False)
+        if _dead:
+            self._styled_message(
+                f"This model setup would not detect anything.\n\n{_dead}",
+                "Model Setup").exec_()
             return
 
         prompt = self._positive_prompt_text()
@@ -4401,16 +4791,61 @@ class ManualWindow(QtWidgets.QWidget):
         except Exception:
             return imread_unicode(path)
 
+    # Inference calls between full memory releases when AUTOANNOTATE_RELEASE_EVERY
+    # is unset, by device.
+    #
+    # MPS keeps 1 (every call). It is the 8GB Mac's setting and the reason this
+    # release exists at all: without it that machine swaps.
+    #
+    # CUDA gets 4. empty_cache() hands cached blocks back to the driver, so the
+    # next allocation has to fault them in again; doing that twice per image for
+    # a whole folder is real time spent undoing work the caching allocator did on
+    # purpose. Since expandable_segments:True (autoannotate/__init__.py) took over
+    # the fragmentation problem this was papering over, the per-call release buys
+    # much less on CUDA than it costs. 4 still bounds the pool over a long run.
+    RELEASE_EVERY_DEFAULT = {"cuda": 4, "mps": 1, "cpu": 1}
+
     def _release_every(self):
-        """Inference calls between full memory releases. From
-        AUTOANNOTATE_RELEASE_EVERY (default 1 = release every time = the original
-        behavior). Raise it (e.g. 5) on a roomy CUDA / large-RAM machine to cut
-        the per-image gc + empty_cache overhead; keep it at 1 on an 8GB box."""
+        """Inference calls between full memory releases.
+
+        AUTOANNOTATE_RELEASE_EVERY wins when set. Unset, the default comes from
+        RELEASE_EVERY_DEFAULT for the active device. Lower it to 1 if a long CUDA
+        run creeps up on the card; raise it on any device to cut the per-image
+        gc + empty_cache overhead further.
+
+        One thing outranks both: once this session has actually run out of
+        memory, every call releases. That is not a preference being overridden,
+        it is a measurement replacing an estimate. The relaxed CUDA default is a
+        bet that the card has room, and an OOM is the bet being settled."""
+        forced = getattr(self, "_release_every_forced", None)
+        if forced:
+            return forced
+        raw = os.environ.get("AUTOANNOTATE_RELEASE_EVERY")
+        if raw is not None and raw.strip() != "":
+            try:
+                n = int(raw)
+                return n if n > 0 else 1
+            except (TypeError, ValueError):
+                return 1
+        return self.RELEASE_EVERY_DEFAULT.get(self._active_device_kind(), 1)
+
+    def _active_device_kind(self):
+        """'cuda', 'mps' or 'cpu' for the device inference actually runs on.
+        Probed once: it cannot change mid-session."""
+        cached = getattr(self, "_device_kind_cache", None)
+        if cached is not None:
+            return cached
+        kind = "cpu"
         try:
-            n = int(os.environ.get("AUTOANNOTATE_RELEASE_EVERY", "1"))
-            return n if n > 0 else 1
-        except (TypeError, ValueError):
-            return 1
+            if torch.cuda.is_available():
+                kind = "cuda"
+            elif (hasattr(torch.backends, "mps")
+                  and torch.backends.mps.is_available()):
+                kind = "mps"
+        except Exception:
+            kind = "cpu"
+        self._device_kind_cache = kind
+        return kind
 
     def _release_inference_memory(self, force=False):
         """Free per-image inference memory (gc + torch allocator empty_cache) so
@@ -4433,6 +4868,123 @@ class ManualWindow(QtWidgets.QWidget):
                 torch.mps.empty_cache()
         except Exception:
             pass
+
+    # GPU out-of-memory recovery
+    #
+    # Hint appended wherever an OOM is reported, so the batch summary and the
+    # review report name the two knobs instead of just echoing torch.
+    OOM_HINT = ("GPU out of memory. Lower AUTOANNOTATE_MODEL_BUDGET_GB (fewer "
+                "models resident at once) or AUTOANNOTATE_BATCH_CHUNK (shorter "
+                "detect/segment passes), or pick a lighter pipeline.")
+
+    @staticmethod
+    def _is_oom(exc):
+        """True for a GPU out-of-memory failure, including one another library
+        has already caught and re-raised as its own exception type.
+
+        torch.cuda.OutOfMemoryError covers modern CUDA; the text match catches
+        older torch (which raised a plain RuntimeError) and the MPS wording, both
+        of which still turn up on the machines this app is run on.
+
+        The chain walk is what makes this hold up against ultralytics and
+        diffusers, which do catch errors mid-forward and re-raise something of
+        their own. `raise Foo(...) from oom` and a bare re-raise inside an except
+        block both leave the original reachable through __cause__ / __context__,
+        and an OOM buried one level down is still an OOM: treating it as an
+        ordinary failure would skip the purge and write off every remaining
+        image. Depth-bounded, with an identity guard, because a chain can loop."""
+        oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+        seen = []
+        cur = exc
+        for _ in range(10):
+            if cur is None or any(cur is s for s in seen):
+                break
+            seen.append(cur)
+            if oom_cls is not None and isinstance(cur, oom_cls):
+                return True
+            if (isinstance(cur, RuntimeError)
+                    and "out of memory" in str(cur).lower()):
+                return True
+            cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        return False
+
+    def _purge_all_models(self):
+        """Drop EVERY resident model and free the allocator. _offload_unused_models
+        with an empty keep-set: used only on an out-of-memory recovery, where
+        holding on to anything is what caused the failure. Every model reloads
+        lazily through _get_model, so the cost is a reload, not a lost run.
+
+        EVERY means all three places a model can be resident, not just the
+        detector/segmenter cache:
+          _model_cache           DINO / YOLOE / SAM2 / SAM3 handles
+          the SAM3 text predictor  a separate multi-GB instance outside it
+          the SD inpainting pipeline  cached module-wide by load_sd_inpaint and
+                                   held for the life of the process
+        The SD pipeline is the one that makes this worth doing. Generating one
+        variation parks roughly 2GB of fp16 weights on the card and nothing ever
+        took them back, so on a machine that used the SD section earlier in the
+        session a purge that skipped it freed less than the retry needed and the
+        second attempt failed exactly like the first."""
+        cache = getattr(self, "_model_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+        lru = getattr(self, "_model_lru", None)
+        if isinstance(lru, dict):
+            lru.clear()
+        try:
+            sam_module.release_sam3_text_predictor()
+        except Exception:
+            pass
+        try:
+            sd_module.release_sd_inpaint()
+        except Exception:
+            pass
+        self._release_inference_memory(force=True)
+
+    def _failure_reason(self, exc):
+        """Text for a failed batch image. An out-of-memory failure has already
+        survived one purge-and-retry by the time it reaches a batch handler, so
+        say what to change rather than echoing torch; everything else is
+        reported verbatim. Also purges on OOM so the NEXT image in the run
+        starts from a clean allocator instead of inheriting the pressure."""
+        if not self._is_oom(exc):
+            return str(exc)
+        self._purge_all_models()
+        return f"{self.OOM_HINT} ({exc})"
+
+    def _run_with_oom_retry(self, label, fn):
+        """Run `fn()`; on a GPU out-of-memory, purge every cached model and run
+        it ONCE more. `fn` must fetch its model through _get_model so the retry
+        picks up a freshly loaded one after the purge.
+
+        Bounded at two attempts, so an image that genuinely cannot fit still
+        fails (and is reported with OOM_HINT) instead of looping.
+
+        A batch run pins its detector and segmenter so the two stop evicting each
+        other (see _pinned_model_keys). Landing here means the card could not
+        hold them after all, so the pin comes off for the rest of the run: from
+        here on the budget is allowed to trade a reload for staying alive, which
+        is the better deal once failing is the alternative."""
+        try:
+            return fn()
+        except Exception as e:
+            if not self._is_oom(e):
+                raise
+            if getattr(self, "_pin_pipeline_models", False):
+                self._pin_pipeline_models = False
+                print("[oom] the pipeline does not fit; allowing the budget to "
+                      "evict between passes for the rest of this run.")
+            # Same reasoning one level down: the relaxed CUDA release cadence is
+            # a bet that the card has headroom, and this is the bet being lost.
+            # Back to releasing on every call for the rest of the session.
+            if getattr(self, "_release_every_forced", None) != 1:
+                self._release_every_forced = 1
+                print("[oom] releasing GPU memory after every inference from "
+                      "here on.")
+            print(f"[oom] {label}: out of memory -- freeing every cached model "
+                  f"and retrying once.")
+            self._purge_all_models()
+            return fn()
 
     def display_boxes_with_borders(self, image_path, prompt, confidence, max_area, output_path, DINO=None):
         """Run detection and display boxes. Updates `self.live_boxes` as truth source.
@@ -6532,10 +7084,32 @@ class ManualWindow(QtWidgets.QWidget):
                 print(traceback.format_exc())
 
     def go_back(self):
-        from .splash import MainWindow
-        self.main_window = MainWindow(self.model, self.processor)
-        self.main_window.show()
-        self.close()
+        # hand_off destroys this window rather than hiding it; see its docstring
+        # for why a hidden fullscreen window is a problem and not just untidy.
+        from .splash import MainWindow, hand_off
+        hand_off(MainWindow(self.model, self.processor), self)
+
+    def open_user_manual(self):
+        """Show the manual over this window. It touches nothing: your prompts,
+        boxes and position in the folder are exactly where you left them.
+
+        An overlay INSIDE this window, not a separate one: this window is
+        fullscreen, and macOS merges new windows opened from a fullscreen window
+        into it as native tabs. See UserManualOverlay for the full story. Built
+        once and reused, so its expanded sections survive reopening."""
+        from .user_manual import UserManualOverlay
+        if getattr(self, "_manual_overlay", None) is None:
+            self._manual_overlay = UserManualOverlay(self)
+        self._manual_overlay.show_over()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The overlay sits outside the layout, so nothing else will resize it.
+        # getattr rather than hasattr: showFullScreen() in init_ui fires a resize
+        # while init_ui is still running, before the attribute exists.
+        ov = getattr(self, "_manual_overlay", None)
+        if ov is not None and ov.isVisible():
+            ov.setGeometry(self.rect())
 
     def select_folder(self):
         options = QtWidgets.QFileDialog.Options()
@@ -7209,6 +7783,15 @@ class ManualWindow(QtWidgets.QWidget):
                 "Press 'Apply to All Classes' or 'Revert' first.",
                 "Class Settings").exec_()
             return
+        # Refuse a run that cannot detect anything, BEFORE the busy lock and the
+        # output folders are made. Losing a folder to empty labels and only
+        # finding out from the summary is the failure this replaces.
+        _dead = self._dead_pipeline_reason()
+        if _dead:
+            self._styled_message(
+                f"This run would not annotate anything.\n\n{_dead}",
+                "Auto Annotate Remaining").exec_()
+            return
 
         # Lock the bottom-left buttons + set the busy flag so a second click
         # on Regenerate / Next / Previous / Auto Annotate is dropped while
@@ -7221,6 +7804,13 @@ class ManualWindow(QtWidgets.QWidget):
             _b.setEnabled(False)
         QtWidgets.QApplication.processEvents()
         self._busy = True
+        # Hold this run's detector and segmenter resident for its duration: the
+        # two-stage loop alternates between them every chunk, and evicting one to
+        # fit the other reloads multiple GB of weights that are wanted again a
+        # moment later. Dropped again at the end of the run, and by the first
+        # real out-of-memory, so this never becomes a permanent exemption from
+        # the budget.
+        self._pin_pipeline_models = True
 
         boxes_dir = os.path.join(self.output_folder, 'boxes')
         seg_dir   = os.path.join(self.output_folder, 'segments')
@@ -7359,9 +7949,10 @@ class ManualWindow(QtWidgets.QWidget):
                     except Exception as e:
                         import traceback
                         detected[image_path] = None
-                        failed.append((image_path, str(e)))
+                        _why = self._failure_reason(e)
+                        failed.append((image_path, _why))
                         review.append({"image": image_path, "stage": "boxes",
-                            "status": "failed", "reason": str(e)[:200],
+                            "status": "failed", "reason": _why[:200],
                             "detector": self.detector_choice, "prompt": prompt,
                             "orig": f"{det_thresh:.2f}", "retry": ""})
                         print(f"[auto-annotate] {image_path}: DETECT FAILED {e}")
@@ -7415,9 +8006,10 @@ class ManualWindow(QtWidgets.QWidget):
                                 "orig": f"{mask_thresh:.2f}", "retry": ""})
                     except Exception as e:
                         import traceback
-                        failed.append((image_path, str(e)))
+                        _why = self._failure_reason(e)
+                        failed.append((image_path, _why))
                         review.append({"image": image_path, "stage": "segments",
-                            "status": "failed", "reason": str(e)[:200],
+                            "status": "failed", "reason": _why[:200],
                             "detector": self.detector_choice, "prompt": prompt,
                             "orig": f"{mask_thresh:.2f}", "retry": ""})
                         print(f"[auto-annotate] {image_path}: SEGMENT FAILED {e}")
@@ -7496,9 +8088,10 @@ class ManualWindow(QtWidgets.QWidget):
                             "orig": f"{mask_thresh:.2f}", "retry": ""})
                 except Exception as e:
                     import traceback
-                    failed.append((image_path, str(e)))
+                    _why = self._failure_reason(e)
+                    failed.append((image_path, _why))
                     review.append({"image": image_path, "stage": "boxes",
-                        "status": "failed", "reason": str(e)[:200],
+                        "status": "failed", "reason": _why[:200],
                         "detector": self.detector_choice, "prompt": prompt,
                         "orig": f"{det_thresh:.2f}", "retry": ""})
                     print(f"[auto-annotate] {image_path}: FAILED {e}")
@@ -7509,6 +8102,21 @@ class ManualWindow(QtWidgets.QWidget):
 
         progress.setValue(len(targets))
         progress.close()
+
+        # Run over: the pipeline goes back under the ordinary budget so a later
+        # model switch can reclaim it. Released here rather than beside
+        # `self._busy = False` below because everything between the two is
+        # dialogs, and nothing that happens in a dialog needs the pin.
+        self._pin_pipeline_models = False
+
+        # Snapshot every path the Review Side by Side route needs BEFORE the
+        # alerts below, because _finish_folder clears self.images and
+        # self.output_folder and the viewer opens after it.
+        review_sbs = (hasattr(self, "review_sbs_checkbox")
+                      and self.review_sbs_checkbox.isChecked())
+        sbs_input_dir  = os.path.dirname(targets[0]) if targets else None
+        sbs_output_dir = self.output_folder
+        sbs_model_tag  = self._model_tag()
 
         elapsed = time.perf_counter() - run_started
 
@@ -7556,6 +8164,13 @@ class ManualWindow(QtWidgets.QWidget):
         # Next Image: the all-done alert plus deselecting the folders.
         if not canceled:
             self._finish_folder()
+
+        # Review Side by Side (opt-in): last, so both alerts have been read and
+        # dismissed before the viewer takes the screen. A canceled run still
+        # opens -- what did finish is still worth looking at -- but a run that
+        # annotated nothing has nothing to show.
+        if review_sbs and processed:
+            self._open_review_side_by_side(sbs_input_dir, sbs_output_dir, sbs_model_tag)
 
     def _update_detection_threshold_label(self, value):
         # Show the EFFECTIVE confidence the current detector actually uses:

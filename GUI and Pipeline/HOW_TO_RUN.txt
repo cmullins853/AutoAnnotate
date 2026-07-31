@@ -36,8 +36,9 @@ device automatically and need no setting.
 Verify a machine quickly (any OS) with:
   python "GUI and Pipeline/check_environment.py"
 It loads no models - it just confirms the Python deps, prints which
-compute device the app will use, and lists which weight files are
-present. Run it inside the activated venv (Step 1).
+compute device the app will use, reports the PyTorch CUDA build/GPU and
+GroundingDINO compiled extension, and lists which weight files are present.
+Run it inside the activated venv (Step 1).
 
 --------------------------------------------------------
 STEP 0 - FRESH MACHINE PREREQUISITES (install these first)
@@ -62,8 +63,10 @@ b) Python 3.13 - the version every requirements file is proven on.
    Verify:   py -3.13 --version        (Windows)
              python3.13 --version      (macOS/Linux)
 
-The rest of this step is WINDOWS/LINUX + NVIDIA GPU ONLY. A CPU-only
-machine (or a Mac) needs nothing else; go to STEP 1.
+Subsection c is WINDOWS/LINUX + NVIDIA GPU ONLY. A CPU-only machine
+skips subsection c. Every Windows machine, including Windows 10 CPU-only,
+must still complete subsection d because GroundingDINO builds a C++
+extension.
 
 c) NVIDIA driver + CUDA Toolkit. These are two different installs and
    BOTH are needed:
@@ -76,7 +79,7 @@ c) NVIDIA driver + CUDA Toolkit. These are two different installs and
      The toolkit provides nvcc, which compiles GroundingDINO's CUDA
      extension in STEP 4. The driver alone cannot build anything.
    VERSION MATCH RULE: the toolkit version must match the +cuXXX pins
-   in requirements-windows.txt. The one combination actually validated
+   in requirements-windows11-cuda.txt. The one combination actually validated
    here is CUDA Toolkit 13.2 with torch==2.12.1+cu132, which is what
    that file pins. Install that toolkit and the pins work as written.
    Other toolkits need a torch build that exists for them, and not
@@ -87,8 +90,9 @@ c) NVIDIA driver + CUDA Toolkit. These are two different installs and
    leave it in place. The app reads it at startup to register the
    CUDA DLL folder (see COMMON ERRORS, "DLL load failed").
 
-d) Visual Studio Build Tools (Windows only) - the C++ compiler that
-   nvcc drives during the GroundingDINO build:
+d) Visual Studio Build Tools (all Windows machines) - the C++ compiler
+   used to build GroundingDINO's extension. On CUDA systems, nvcc also
+   drives this compiler:
      https://visualstudio.microsoft.com/visual-studio-build-tools/
    In the installer select the "Desktop development with C++"
    workload (this includes MSVC v143 and the Windows SDK). The
@@ -113,7 +117,9 @@ If the venv doesn't exist yet, create it first:
 
   There is no one-size-fits-all requirements file. Pick the one for your OS:
     - requirements-macos.lock    macOS / Apple Silicon (MPS): exact pins
-    - requirements-windows.txt   Windows 11 + NVIDIA CUDA: pinned CUDA torch
+    - requirements-windows10-cpu.txt
+                                  Windows 10 CPU-only: exact proven pins
+    - requirements-windows11-cuda.txt   Windows 11 + NVIDIA CUDA: pinned CUDA torch
     - requirements.txt           generic floors: Linux, or any OS (advanced)
 
   macOS:
@@ -134,17 +140,30 @@ If the venv doesn't exist yet, create it first:
   (match the cuXXX to your toolkit, see STEP 0c), then verify:
     python -c "import torch; print(torch.cuda.is_available())"
 
-  Windows (PowerShell), validated on Windows 11 + Python 3.13:
+  Windows 10 CPU-only (PowerShell), validated with Python 3.13:
+    py -3.13 -m venv .venv
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   (one-time)
+    .venv\Scripts\Activate.ps1
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements-windows10-cpu.txt
+
+  This exact lock uses torch 2.6.0+cpu with torchvision 0.21.0+cpu. It does
+  not require an NVIDIA driver or CUDA Toolkit. It DOES require Visual Studio
+  Build Tools with the "Desktop development with C++" workload because DINO
+  builds a CPU C++ extension in STEP 4. On a very slow computer, prefer DINO
+  (SwinT) + SAM2 (tiny); SwinB is much larger and slower.
+
+  Windows 11 + NVIDIA CUDA (PowerShell), validated with Python 3.13:
     py -3.13 -m venv .venv
     Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   (one-time; lets
                                                            Activate.ps1 run)
     .venv\Scripts\Activate.ps1
     pip uninstall -y torch torchvision torchaudio   (clear any CPU build first)
-    pip install -r requirements-windows.txt
+    pip install -r requirements-windows11-cuda.txt
   From cmd instead of PowerShell, activate with .venv\Scripts\activate.bat
   and skip the Set-ExecutionPolicy step.
 
-  WINDOWS + NVIDIA GPU: requirements-windows.txt already pins the CUDA
+  WINDOWS + NVIDIA GPU: requirements-windows11-cuda.txt already pins the CUDA
   torch/torchvision wheels (+cuXXX) and adds the PyTorch CUDA index, so pip
   installs the GPU build instead of the CPU one. The validated combo was
   torch 2.12.1+cu132 on CUDA 13.2 / RTX 4060. If your driver needs a
@@ -161,10 +180,11 @@ If the venv doesn't exist yet, create it first:
 install is needed.)
 
 REPRODUCIBLE INSTALL: the platform files above ARE the reproducible path
-(requirements-macos.lock is a full `pip freeze`; requirements-windows.txt
-pins the CUDA torch stack). requirements.txt only pins floors and is for
-advanced users who want the newest resolutions. Note: GroundingDINO is NOT
-in any of them; install it in STEP 4.
+(requirements-macos.lock and requirements-windows10-cpu.txt are full tested
+environment locks; requirements-windows11-cuda.txt pins the CUDA torch stack).
+requirements.txt only pins floors and is for advanced users who want the
+newest resolutions. Note: GroundingDINO is NOT in any of them; install it
+in STEP 4.
 
 No Jupyter setup is needed. The app is plain Python scripts launched
 from the terminal (STEP 5); there is no notebook to run.
@@ -276,12 +296,12 @@ torch must already be installed (it is, from STEP 1) before you run this.
 If you see CUDA/torch errors, make sure your PyTorch version
 matches your CUDA driver before installing.
 
-WINDOWS + CUDA BUILD PREREQUISITES (validated on Windows 11, CUDA 13.2,
+WINDOWS BUILD PREREQUISITES (CUDA path validated on Windows 11, CUDA 13.2,
 RTX 4060, VS Build Tools with MSVC 14.51):
 
   1. Install Visual Studio Build Tools with the "Desktop development
-     with C++" workload (provides cl.exe / MSVC v143). nvcc drives
-     cl.exe during the build.
+     with C++" workload (provides cl.exe / MSVC v143). This is needed
+     for both CPU and CUDA builds; on CUDA machines, nvcc drives cl.exe.
   2. In the venv, install the build helpers first (wheel fixes
      "invalid command 'bdist_wheel'"; ninja was required on the
      validation machine):
@@ -533,6 +553,27 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
       The _review folder is rebuilt every run (a clean run removes it). The
       end-of-run popup reports "Failed: N", "Empty (needs review): N", and
       the review-folder path.
+    - REVIEW SIDE BY SIDE: turn this toggle ON before starting the batch
+      and the side-by-side viewer opens as soon as the run finishes, with
+      the input images on one side and this run's annotated images on the
+      other, both folders already loaded. Which overlay it shows follows
+      the Bounding Box / Segmentation checkboxes:
+        Bounding Box only    -> output/annotated_<model>/boxes
+        Segmentation only    -> output/annotated_<model>/masks
+        both ticked          -> you are asked which one (or Skip)
+        neither / not saved  -> whichever the run actually produced
+      It opens after both end-of-run popups, and closing it (Back, Esc, or
+      the window's X) returns you to the annotation window rather than the
+      main menu. A canceled run still opens the viewer for what did finish;
+      a run that annotated nothing does not.
+    - GPU OUT OF MEMORY: if a detector or segmenter call runs the GPU out
+      of memory, the app frees EVERY resident model (the detector/segmenter
+      cache, the SAM3 text predictor, and the Stable Diffusion pipeline,
+      which otherwise stays on the card for the rest of the session once
+      you have generated a variation) and retries that image once before
+      giving up. An image that fails anyway is reported with the two knobs
+      to turn (AUTOANNOTATE_MODEL_BUDGET_GB, AUTOANNOTATE_BATCH_CHUNK)
+      instead of a bare torch error.
 
 --------------------------------------------------------
 TUNING KNOBS (optional environment variables)
@@ -549,9 +590,37 @@ AUTOANNOTATE_SD_DEVICE).
   AUTOANNOTATE_MODEL_BUDGET_GB  Soft RAM budget for resident detection/
                                 segmentation models; least-recently-used
                                 models are evicted when a load would exceed
-                                it. Default: unset = unbounded (never evict).
-                                Set ~4.5 on an 8 GB machine to stop SAM3
-                                (~3.3 GB) co-residing with other heavy models.
+                                it. Default on CUDA: 55% of the card's total
+                                VRAM (so DINO + SAM3 + YOLOE cannot all sit on
+                                an 8 GB card at once, which is what ran batch
+                                runs out of memory). Default elsewhere: unset
+                                = unbounded. An explicit value always wins,
+                                including 0 to restore unbounded. Set ~4.5 on
+                                an 8 GB Mac to stop SAM3 (~3.3 GB) co-residing
+                                with other heavy models.
+                                Auto Annotate Remaining is EXEMPT: a batch run
+                                holds its own detector and segmenter for the
+                                whole run, so the two never evict each other
+                                between the chunked detect and segment passes.
+                                Offloading is for a detector/segmenter SWITCH,
+                                where the dropped model is not coming back; mid
+                                run it would only reload multi-GB weights the
+                                next chunk asks for again. Models the running
+                                pipeline does NOT use are still reclaimed.
+                                If a batch runs out of memory anyway, the card
+                                has proved it cannot hold both, so the exemption
+                                is dropped for the rest of that run and the app
+                                prints a "[model-cache] ... wants N GB against
+                                an M GB budget" line naming the tradeoff. Raise
+                                this variable, set it to 0, or pick a lighter
+                                pipeline if you would rather not pay it.
+
+  PYTORCH_CUDA_ALLOC_CONF       Set to expandable_segments:True by
+                                autoannotate/__init__.py before torch is
+                                imported, so a long batch run does not
+                                fragment VRAM into blocks it can never merge.
+                                This is a torch variable, not ours: export
+                                your own value to override it entirely.
 
   AUTOANNOTATE_KEEP_MODELS_WARM 1 = keep every model cached across detector/
                                 segmenter switches (faster switching, more
@@ -564,9 +633,17 @@ AUTOANNOTATE_SD_DEVICE).
                                 model is resident per pass. Default: 8.
 
   AUTOANNOTATE_RELEASE_EVERY    Release GPU/MPS memory every Nth inference.
-                                Default: 1 (every time -- needed on 8 GB).
-                                Raise it (e.g. 5) on a large-RAM/CUDA box to
-                                cut the per-image gc + empty_cache overhead.
+                                Default: 4 on CUDA, 1 (every time) on MPS and
+                                CPU. MPS keeps 1 because the 8 GB Mac needs it.
+                                CUDA relaxes because empty_cache() hands blocks
+                                back to the driver for the next allocation to
+                                fault in again, and expandable_segments (above)
+                                now covers the fragmentation this was guarding
+                                against. Lower it to 1 if a long CUDA run creeps
+                                up on the card. Once a session has actually run
+                                out of memory the app drops to 1 by itself for
+                                the rest of that session, whatever this is set
+                                to.
 
   AUTOANNOTATE_RETRY_FACTOR     Multiplier for the single lower-threshold
                                 retry on an empty detection in Auto Annotate
@@ -641,6 +718,17 @@ COMMON ERRORS & FIXES
 
 "DINO (SwinB) is greyed out in the Detector dropdown"
   -> groundingdino_swinb_cogcoor.pth (~938 MB) is missing; see Step 3a.
+
+"DINO (SwinB) has a problem even though its weight is present"
+  -> First run check_environment.py and save its full output. It now reports
+     the installed torch build, CUDA runtime, GPU name/memory, and whether
+     groundingdino._C imports. Then isolate checkpoint/config loading:
+       python -c "from autoannotate.pipeline.dino import load_dino_model; m=load_dino_model('swinb'); print(type(m).__name__, sum(p.numel() for p in m.parameters()))"
+     A successful result ends with GroundingDINO and 232903808. If that works
+     but inference fails, capture the full traceback plus the image dimensions;
+     the remaining likely class is CUDA/host-memory pressure, not a missing or
+     mismatched checkpoint. On CPU-only Windows, use SwinT unless SwinB's
+     accuracy is essential.
 
 ".env values seem ignored" / VS Code "python.terminal.useEnvFile" warning
   -> The editor warning is unrelated: the app loads .env itself via

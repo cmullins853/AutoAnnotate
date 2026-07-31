@@ -5,7 +5,49 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 
 from ..config import WEIGHTS_DIR
 from .llm import LLMWorker
-from .style import BTN_BLUE, BTN_GREY, BTN_PURPLE, BTN_RED, btn_qss
+from .style import BTN_BLUE, BTN_GAP, BTN_GREEN, BTN_GREY, BTN_PURPLE, BTN_RED, btn_qss
+
+# Windows that have to outlive whatever created them.
+#
+# Every navigation edge in this app builds its destination and abandons its
+# source, and the source is normally the only thing holding a reference to the
+# destination. Without an owner here, destroying the source would take the new
+# window down with it. A plain module-level list is enough: the app shows one
+# window at a time and these live for the process.
+_LIVE_WINDOWS = []
+
+
+def hand_off(new_window, old_window=None):
+    """Show `new_window`, then destroy `old_window`, moving ownership across.
+
+    Use this for every window-to-window transition. Abandoning a window used to
+    mean hide(), which leaves a live NATIVE window behind: close() and hide()
+    both only take a top-level widget off screen. On macOS a fullscreen window
+    owns a Space, so each abandoned one is an empty Space the app can be sent
+    to, and the user lands on a blank screen they have to navigate out of. Every
+    window here goes fullscreen in its init_ui, so they all qualify. Measured
+    before this existed, one Menu -> Manual -> Back round trip leaked two of
+    them, and three round trips left six windows where there should be one.
+
+    Order matters. The new window is shown BEFORE the old one closes, so there
+    is never a moment with no visible window: quitOnLastWindowClosed defaults to
+    true, and closing the only visible window would end the application.
+    """
+    _LIVE_WINDOWS.append(new_window)
+    new_window.show()
+    if old_window is None:
+        return
+    old_window.close()
+    # Drop our own reference before the queued delete, so the registry does not
+    # accumulate wrappers around deleted C++ objects for the life of the process.
+    try:
+        _LIVE_WINDOWS.remove(old_window)
+    except ValueError:
+        pass
+    # Queued: safe to call on the window whose method is running right now,
+    # because it only fires once the current event-loop pass unwinds.
+    old_window.deleteLater()
+
 
 class SplashScreen(QtWidgets.QWidget):
     def __init__(self):
@@ -71,9 +113,8 @@ class SplashScreen(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(1000, self.show_main_window)
 
     def show_main_window(self):
-        self.main_window = MainWindow(self.model, self.processor)
-        self.main_window.show()
-        self.close()
+        # Destroys the splash rather than hiding it; see hand_off.
+        hand_off(MainWindow(self.model, self.processor), self)
 
 
 class MainWindow(QtWidgets.QWidget):
@@ -100,12 +141,32 @@ class MainWindow(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout()
 
+        # Top row rather than a fourth menu button: the three menu buttons are
+        # already menu_h tall each, and a fourth of that size crowds a short
+        # laptop screen. The manual is a quick reference, not a mode, so it gets
+        # Exit's small footprint.
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(BTN_GAP)
+
         exit_btn = QtWidgets.QPushButton("Exit")
         exit_btn.setStyleSheet(btn_qss(BTN_GREY, font))
         exit_btn.setFixedSize(200, exit_h)
         exit_btn.setToolTip("Close the application.")
         exit_btn.clicked.connect(self.close)
-        layout.addWidget(exit_btn, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        top_row.addWidget(exit_btn)
+
+        manual_help_btn = QtWidgets.QPushButton("User Manual")
+        manual_help_btn.setStyleSheet(btn_qss(BTN_GREEN, font))
+        manual_help_btn.setFixedSize(200, exit_h)
+        manual_help_btn.setToolTip(
+            "Step-by-step instructions for the manual annotation window: "
+            "prompts, box annotation, carrying prompts forward, editing, "
+            "synthetic images and the keyboard shortcuts.")
+        manual_help_btn.clicked.connect(self.open_user_manual)
+        top_row.addWidget(manual_help_btn)
+
+        top_row.addStretch()
+        layout.addLayout(top_row)
 
         button_layout = QtWidgets.QVBoxLayout()
         # Breathing room between the stacked menu buttons.
@@ -145,18 +206,34 @@ class MainWindow(QtWidgets.QWidget):
     # import them lazily here to keep module loading acyclic.
     def select_manual(self):
         from .manual_window import ManualWindow
-        self.manual_window = ManualWindow(self.model, self.processor)
-        self.manual_window.show()
-        self.hide()
+        hand_off(ManualWindow(self.model, self.processor), self)
 
     def select_automated(self):
         from .automated_window import AutomatedWindow
-        self.automated_window = AutomatedWindow(self.model, self.processor)
-        self.automated_window.show()
-        self.hide()
+        hand_off(AutomatedWindow(self.model, self.processor), self)
 
     def select_side_by_side(self):
         from .side_by_side import SideBySideWindow
-        self.side_by_side_window = SideBySideWindow(self.model, self.processor)
-        self.side_by_side_window.show()
-        self.hide()
+        hand_off(SideBySideWindow(self.model, self.processor), self)
+
+    def open_user_manual(self):
+        """Show the manual over the menu.
+
+        An overlay INSIDE this window, not a separate one: this window is
+        fullscreen, and macOS merges new windows opened from a fullscreen window
+        into it as native tabs. See UserManualOverlay for the full story. Built
+        once and reused, so reopening is instant and its expanded sections are
+        where you left them."""
+        from .user_manual import UserManualOverlay
+        if getattr(self, "_manual_overlay", None) is None:
+            self._manual_overlay = UserManualOverlay(self)
+        self._manual_overlay.show_over()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The overlay sits outside the layout, so nothing else will resize it.
+        # getattr rather than hasattr: showFullScreen() in init_ui fires a resize
+        # while init_ui is still running, before the attribute exists.
+        ov = getattr(self, "_manual_overlay", None)
+        if ov is not None and ov.isVisible():
+            ov.setGeometry(self.rect())

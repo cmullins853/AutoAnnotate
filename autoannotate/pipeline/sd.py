@@ -70,9 +70,11 @@ _SD_DEFAULT_NEGATIVE = (
 # pile of loose berries) and makes the preserved foreground look pasted
 # on. Lower values keep the REAL background from the source image and
 # only lightly vary it, so the preserved berries sit naturally in an
-# actual field. 0.4-0.7 is the sweet spot for realistic variations
-# (lower = more realistic but less diverse). Override per-call via
-# generate_variation(strength=...).
+# actual field. 0.1 to 0.2 is the sweet spot, established by testing on
+# real field images rather than inherited from a reference implementation:
+# an earlier comment here claimed 0.4-0.7, which is where the fills start
+# looking synthetic on this data. Lower = more realistic but less diverse.
+# Override per-call via generate_variation(strength=...).
 _SD_STRENGTH = 0.2
 
 
@@ -132,6 +134,36 @@ def _sd_release_resident_models(extra_caches=None):
         if hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
     print("[SD] release complete.")
+
+
+def release_sd_inpaint():
+    """Drop the cached Stable Diffusion pipeline. Returns True if one was
+    resident.
+
+    The counterpart to load_sd_inpaint's cache, and the only way its memory ever
+    comes back: the pipeline is moved onto the GPU once and then held for the
+    life of the process, so on CUDA it sits on roughly 2GB of VRAM that no
+    empty_cache() can reclaim while the reference lives. That is fine while the
+    user is generating variations and actively wrong when a batch annotation run
+    afterwards is fighting for the same card, which is why the out-of-memory
+    recovery calls this (see ManualWindow._purge_all_models).
+
+    Reloading costs one pipeline construction from the local HF cache, not a
+    re-download."""
+    global _sd_inpaint_pipe, _sd_inpaint_device
+    if _sd_inpaint_pipe is None:
+        return False
+    _sd_inpaint_pipe   = None
+    _sd_inpaint_device = None
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        if hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    print("[SD] released the cached inpainting pipeline.")
+    return True
 
 
 # Backwards-compat shim: existing callers use this name.

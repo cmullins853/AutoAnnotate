@@ -1,10 +1,12 @@
 # AutoAnnotate - Windows 11 + NVIDIA (CUDA) install file.
 #
-# PLATFORM: Windows 11, Python 3.13, NVIDIA GPU with CUDA. This is one of THREE
+# PLATFORM: Windows 11, Python 3.13, NVIDIA GPU with CUDA. This is one of FOUR
 # requirements files; pick the one for your machine:
 #   - requirements.txt            generic floors, no upper pins (any OS)
 #   - requirements-macos.lock     exact pins proven on macOS / Apple Silicon (MPS)
-#   - requirements-windows.txt    THIS FILE: Windows + NVIDIA CUDA
+#   - requirements-windows10-cpu.txt
+#                                 exact pins proven on Windows 10 CPU-only
+#   - requirements-windows11-cuda.txt  THIS FILE: Windows 11 + NVIDIA CUDA
 #
 # Proven Windows environment (RTX 4060 Laptop, CUDA Toolkit 13.2, MSVC 14.51):
 #   Python 3.13, torch 2.12.1+cu132, torchvision 0.27.1+cu132,
@@ -22,14 +24,21 @@
 # INSTALL (PowerShell), from the repo root, inside your venv:
 #   pip install --upgrade pip
 #   pip uninstall -y torch torchvision torchaudio        # clear any CPU build first
-#   pip install -r requirements-windows.txt
+#   pip install -r requirements-windows11-cuda.txt
+#   pip install wheel setuptools ninja
 #   pip install --no-build-isolation -e "autoannotate study/GroundingDINO"
 #
-# If your machine uses a different CUDA version, change EVERY cu132 below AND the
-# --extra-index-url to match (e.g. cu124), then rebuild GroundingDINO.
+# PREREQUISITES: NVIDIA driver, CUDA Toolkit 13.2, and Visual Studio Build Tools
+# with the "Desktop development with C++" workload. See HOW_TO_RUN.txt STEP 0.
 #
-# For a fully reproducible lock on your exact machine, after a working install:
-#   pip freeze > requirements-windows.lock
+# If using another CUDA version, first choose a torch/torchvision pair that
+# actually exists in PyTorch's official wheel index, change both pins and the
+# index URL together, install the matching CUDA Toolkit, and rebuild
+# GroundingDINO. Do not change only the "cu132" text and assume compatibility.
+#
+# For a fully reproducible snapshot of your exact machine, after a working
+# install (this creates a separate snapshot; do not replace this install file):
+#   pip freeze > requirements-windows11-cuda.freeze.txt
 
 --extra-index-url https://download.pytorch.org/whl/cu132
 

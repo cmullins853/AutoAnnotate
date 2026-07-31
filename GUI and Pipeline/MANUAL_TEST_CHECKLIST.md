@@ -29,6 +29,56 @@ Tested on: __________   OS: __________   Date: __________
 
 ## A. Changes made this session (verify these first)
 
+### A0. User manual + the guard against blank runs
+- [ ] Main menu: a green **User Manual** button sits beside Exit. It opens a
+      dialog over the menu; closing it leaves you on the menu, not somewhere else.
+- [ ] Annotation window: the same green button sits beside **Back**. Opening and
+      closing it leaves your prompts, boxes and place in the folder untouched.
+- [ ] **No new window and no new tab.** The manual appears as a panel inside the
+      window you were already on, with that window dimmed but still visible
+      around it. Nothing animates in from the side, no tab bar appears, and the
+      window title does not change. This is the specific thing that was broken:
+      macOS was merging the old dialog into the parent as a native tab.
+- [ ] It opens with **Getting started** expanded and the other seven topics
+      collapsed. Each header expands and collapses, and the arrow flips between
+      `▸` and `▾` each time.
+- [ ] Closes three ways: the **Close** button, **Esc**, and clicking the dimmed
+      area outside the panel. Clicking the panel itself does NOT close it.
+- [ ] **Nothing leaks through to the window behind.** With the manual open in the
+      annotation window, press **Enter** and then **Delete**. No model run may
+      start (check the console for a detector line) and no annotation may
+      disappear. A key reaching the window underneath is the main hazard of
+      drawing the manual in-window instead of as a dialog.
+- [ ] Text is readable, wraps rather than clipping, and the whole thing scrolls.
+- [ ] Read the **Use First Image as Prompt** topic against what the app actually
+      does. It is the one section where a wrong sentence costs someone a folder.
+- [ ] **Blank-run guard (YOLOE-vis)**: pick YOLOE-vis, draw a yellow box, leave
+      "Use First Image as Prompt" **OFF**, press **Auto Annotate Remaining**. It
+      must refuse with a message naming that toggle, and must NOT write a folder
+      of empty labels. Turn the toggle ON → the run proceeds normally.
+- [ ] **Blank-run guard (SAM3)**: pick SAM3 (one-shot), then set the Segmenter
+      dropdown to SAM2. Press **Regenerate**: refused, with a message saying to
+      set the segmenter to "(none)". Set it back → Regenerate works.
+- [ ] The guard does not fire on a healthy setup: DINO + text prompt, and
+      YOLOE-vis + box + toggle ON, both run without any dialog.
+
+### A0b. Post-batch Review Side by Side
+- [ ] Two-stage pipeline (DINO + SAM2), "Review Side by Side (post)" On, run Auto
+      Annotate Remaining. After both end-of-run popups the **"Which annotated
+      images"** prompt appears. It must ask whichever of Bounding Box /
+      Segmentation is ticked, because a two-stage run saves both kinds; those
+      checkboxes untick each other and no longer decide this.
+- [ ] Segmentation opens `annotated_<model>/masks`, Bounding Boxes opens
+      `.../boxes`. Cancel sits on the LEFT edge, away from the two choices,
+      and opens nothing.
+- [ ] A run that saved only one kind opens it with **no** prompt.
+- [ ] Leave the viewer three ways: **Back**, **Esc**, and the window's close
+      button. Each lands on the **main menu at full screen size**. A quarter-size
+      window is the bug this replaced.
+- [ ] With `AUTOANNOTATE_DEBUG=1`, after landing on the menu, open the manual and
+      check the `[manual]` dump lists no leftover hidden `ManualWindow` or
+      `SideBySideWindow`.
+
 ### A1. Box-prompt + carry-forward matrix (all detectors × both modes)
 For each detector, load a folder, pick it, set an output folder, and run.
 - [ ] **DINO (SwinT)**: Text mode only (box radio greyed). Type a prompt → boxes

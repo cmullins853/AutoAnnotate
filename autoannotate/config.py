@@ -134,17 +134,13 @@ def user_config_path(filename):
 # editing code; truthy = 1/true/yes/on (case-insensitive). Default off.
 AUTOANNOTATE_DEBUG = os.environ.get("AUTOANNOTATE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
-# Hugging Face login is OPTIONAL. Every model the GUI uses downloads
-# anonymously: SAM2 / YOLOE come from ultralytics' own asset server, and
-# bert-base-uncased (DINO text encoder), SmolVLM, and SD-1.5 are PUBLIC HF
-# repos. A token is only needed for a FIRST-TIME download of the gated
-# sam3.pt (facebook/sam3); once sam3.pt sits in "GUI and Pipeline/" the
-# app runs fully token-free.
+# Do not call huggingface_hub.login() at application startup. Every runtime
+# model is public or already on disk, and huggingface_hub/transformers already
+# read HF_TOKEN themselves when a request actually needs authentication.
+# Proactively validating a token makes a fully cached/offline launch perform a
+# network request and abort before any model is loaded.
 hf_token = os.environ.get("HF_TOKEN")
-if hf_token and hf_token != "paste_your_hf_token_here":
-    from huggingface_hub import login
-    login(token=hf_token)
-else:
+if not hf_token or hf_token == "paste_your_hf_token_here":
     print("[HF] No HF_TOKEN set -- running token-free. Public models "
           "download anonymously; SAM3 needs sam3.pt already present.")
 

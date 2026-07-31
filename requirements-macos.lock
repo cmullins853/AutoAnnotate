@@ -1,10 +1,11 @@
 # AutoAnnotate - EXACT reproducible lockfile for macOS (Apple Silicon / MPS).
 #
-# PLATFORM: macOS, Python 3.13, CPU/MPS torch (no CUDA). This is one of THREE
+# PLATFORM: macOS, Python 3.13, CPU/MPS torch (no CUDA). This is one of FOUR
 # requirements files; pick the one for your machine:
 #   - requirements.txt            generic floors, no upper pins (any OS)
 #   - requirements-macos.lock     THIS FILE: exact pins proven on macOS/MPS
-#   - requirements-windows.txt    Windows 11 + NVIDIA CUDA (pinned +cuXXX torch)
+#   - requirements-windows10-cpu.txt  Windows 10 CPU-only exact pins
+#   - requirements-windows11-cuda.txt  Windows 11 + NVIDIA CUDA (pinned +cuXXX torch)
 #
 # This pins every package to the exact version the app is known to run on
 # (Python 3.13, captured 2026-06-16). Use it for a reproducible macOS install;
@@ -21,7 +22,7 @@
 # intentionally omitted here so the lock installs offline from the local tree
 # and does not depend on the GitHub remote being reachable or up to date.
 #
-# NOTE: this lock is macOS-only. On Windows + NVIDIA use requirements-windows.txt
+# NOTE: this lock is macOS-only. On Windows + NVIDIA use requirements-windows11-cuda.txt
 # (it installs the CUDA torch wheels); do NOT install this lock there or pip
 # will pick the CPU torch build and CUDA acceleration will not work.
 

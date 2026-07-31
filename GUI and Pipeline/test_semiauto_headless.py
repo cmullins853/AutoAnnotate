@@ -123,10 +123,30 @@ SideBySideWindow = G["SideBySideWindow"]
 
 
 # ── tiny test runner ──────────────────────────────────────────────────────
+def _say(line):
+    """Print a result line that CANNOT fail on the console it is printed to.
+
+    The GUI is full of functional glyphs (the collapsible arrows, the swap
+    arrow, the multiplication-sign close button) and failure details routinely
+    quote widget text back, so a failing check can carry non-ASCII. On Windows
+    that is fine to a real console but raises UnicodeEncodeError as soon as the
+    output is redirected to a file, because a redirected stream falls back to
+    the locale encoding (cp1252). Losing the run to an encoding error while
+    reporting a failure is the worst possible time for it, so unencodable
+    characters degrade to a backslash escape instead."""
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        line.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        line = line.encode(enc, "backslashreplace").decode(enc, "replace")
+    print(line)
+
+
 _results = []
 def check(name, cond, detail=""):
     _results.append((name, bool(cond), detail))
-    print(("PASS" if cond else "FAIL"), "-", name, ("" if cond else f"  [{detail}]"))
+    _say(("PASS" if cond else "FAIL") + " - " + name
+         + ("" if cond else f"  [{detail}]"))
 
 _skipped = []
 def skip(name, why):
@@ -138,7 +158,7 @@ def skip(name, why):
     a missing dependency or a missing vendored file is visible rather than silent.
     """
     _skipped.append((name, why))
-    print("SKIP -", name, f"  [{why}]")
+    _say(f"SKIP - {name}  [{why}]")
 
 def mk_window():
     """Bare ManualWindow: skips the heavy __init__/model load but initializes
@@ -2928,7 +2948,12 @@ def t71():
                 names.add(m.group(1).lower().replace("_", "-"))
         return names
 
-    for fname in ("requirements.txt", "requirements-windows.txt", "requirements-macos.lock"):
+    for fname in (
+        "requirements.txt",
+        "requirements-windows10-cpu.txt",
+        "requirements-windows11-cuda.txt",
+        "requirements-macos.lock",
+    ):
         path = os.path.join(repo, fname)
         if not os.path.exists(path):
             check(f"T71 {fname} exists", False, "missing")
@@ -3975,6 +4000,1193 @@ def t80_empty_segmenter_output():
               "0 segments but 3 classes" in str(e), str(e))
 
 t80_empty_segmenter_output()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T81: Review Side by Side -- Auto Annotate Remaining routes straight into the
+#      side-by-side viewer with both folders preloaded, and returns to the
+#      annotation window rather than the main menu.
+# ══════════════════════════════════════════════════════════════════════════
+def t81_review_side_by_side():
+    import os as _os, tempfile
+
+    def _touch(folder, *names):
+        _os.makedirs(folder, exist_ok=True)
+        for n in names:
+            open(_os.path.join(folder, n), "wb").write(b"x")
+        return folder
+
+    # --- preloading a side skips its file dialog ---------------------------
+    d = tempfile.mkdtemp()
+    gt  = _touch(_os.path.join(d, "input"), "berry_01.jpg", "berry_02.jpg")
+    ann = _touch(_os.path.join(d, "annotated", "masks"), "berry_01.jpg", "berry_02.jpg")
+    w = SideBySideWindow(None, None, synth_folder=ann, gt_folder=gt,
+                         titles={"synth": "Auto Annotated (Segmentation)",
+                                 "gt": "Original Images"},
+                         folder_labels={"synth": "Open Annotated Folder",
+                                        "gt": "Open Original Images Folder"})
+    check("T81 both preloaded folders paired by stem",
+          len(w.pairs) == 2 and all(s and g for s, g in w.pairs), w.pairs)
+    check("T81 preloaded titles applied",
+          w.titles["synth"] == "Auto Annotated (Segmentation)", w.titles)
+    # gt is on the LEFT by default, so the left button carries the gt label.
+    check("T81 preloaded folder-button labels applied",
+          w.left_folder_btn.text() == "Open Original Images Folder"
+          and w.right_folder_btn.text() == "Open Annotated Folder",
+          (w.left_folder_btn.text(), w.right_folder_btn.text()))
+    # A dialog selection must still land the same way through the new loader.
+    w.load_synth_folder(ann)
+    check("T81 load_synth_folder pairs like a dialog pick", len(w.pairs) == 2, w.pairs)
+
+    # --- every way out goes to the main menu ------------------------------
+    # Back, Esc and the window close all land on a FRESH MainWindow. Fresh
+    # matters: constructing it runs init_ui, which calls showFullScreen(). The
+    # old post-batch route re-showed the hidden annotation window instead, and a
+    # re-show does not repeat init_ui, so it came back at its pre-fullscreen
+    # size. go_back resolves MainWindow through a local `from .splash import`,
+    # so the patch has to land on the module LIVE in sys.modules now -- T77
+    # drops every autoannotate module to re-import config, which leaves the
+    # file-level _mod_splash pointing at a stale object nothing resolves to.
+    import importlib as _il
+    _splash = _il.import_module("autoannotate.gui.splash")
+    _real_main = _splash.MainWindow
+    built = []
+    _splash.MainWindow = lambda *a, **k: built.append(a) or QtWidgets.QWidget()
+    try:
+        for label, act in (
+            ("Back", lambda w: w.go_back()),
+            ("Esc", lambda w: w.keyPressEvent(QtGui.QKeyEvent(
+                QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier))),
+            ("closing the window", lambda w: w.close()),
+        ):
+            built.clear()
+            _splash._LIVE_WINDOWS.clear()
+            wv = SideBySideWindow(None, None)
+            act(wv)
+            check(f"T81 {label} builds the main menu", len(built) == 1, built)
+            # The new menu must be owned by something that outlives this window,
+            # which is about to delete itself.
+            check(f"T81 {label} registers the menu so it is not garbage",
+                  len(_splash._LIVE_WINDOWS) == 1, _splash._LIVE_WINDOWS)
+        # Back closes the window itself, so Back-then-close must not build two.
+        built.clear()
+        _splash._LIVE_WINDOWS.clear()
+        wv = SideBySideWindow(None, None)
+        wv.go_back()
+        wv.close()
+        check("T81 Back plus the close it triggers builds one menu",
+              len(built) == 1, built)
+    finally:
+        _splash.MainWindow = _real_main
+        _splash._LIVE_WINDOWS.clear()
+    check("T81 SideBySideWindow no longer takes a return_to",
+          "return_to" not in _il.import_module(
+              "inspect").signature(SideBySideWindow.__init__).parameters)
+
+    # --- which overlay the viewer opens on --------------------------------
+    # Driven by what the run WROTE, never by the display checkboxes. Those two
+    # untick each other in the real GUI, so the old "both ticked -> ask" branch
+    # could never fire, and a two-stage run (which saves boxes AND masks) always
+    # silently opened whichever happened to be ticked.
+    mw = mk_window()
+    out = _os.path.join(d, "out")
+    tag = mw._model_tag()
+    boxes_dir = _touch(_os.path.join(out, f"annotated_{tag}", "boxes"), "berry_01.jpg")
+    masks_dir = _touch(_os.path.join(out, f"annotated_{tag}", "masks"), "berry_01.jpg")
+    mw.box_checkbox  = QtWidgets.QCheckBox()
+    mw.mask_checkbox = QtWidgets.QCheckBox()
+
+    # Both kinds on disk -> ask, whatever the checkboxes say. The three states
+    # below are every state the real GUI can reach.
+    for box_on, mask_on, label in ((True, False, "Bounding Box ticked"),
+                                   (False, True, "Segmentation ticked"),
+                                   (False, False, "neither ticked")):
+        mw.box_checkbox.setChecked(box_on)
+        mw.mask_checkbox.setChecked(mask_on)
+        for answer, want in (("boxes", boxes_dir), ("masks", masks_dir)):
+            asked = []
+            mw._ask_review_overlay_kind = lambda a=answer, k=asked: (k.append(a) or a)
+            got = mw._review_overlay_dir(out, tag)
+            check(f"T81 both kinds saved, {label} -> asks and honours {answer}",
+                  got == want and asked == [answer], (got, asked))
+    # Cancelling opens nothing at all.
+    mw._ask_review_overlay_kind = lambda: None
+    check("T81 cancelling the prompt opens nothing",
+          mw._review_overlay_dir(out, tag) is None)
+
+    # --- the prompt's own buttons -----------------------------------------
+    # Position is the point here. QMessageBox sorts buttons by role and put the
+    # opt-out BETWEEN the two real choices, which is where a mis-click lands, so
+    # this is a hand-laid row instead. Cancel goes hard against the left edge,
+    # the two choices sit together on the right, identically on every platform.
+    _dlg, _buttons = mw._build_review_kind_dialog()
+    _row = _dlg.layout().itemAt(1).layout()
+    _order = [(_row.itemAt(i).widget().text() if _row.itemAt(i).widget()
+               else "<stretch>") for i in range(_row.count())]
+    check("T81 Cancel sits on the left edge, choices on the right",
+          _order == ["Cancel", "<stretch>", "Bounding Boxes", "Segmentation"],
+          _order)
+    check("T81 the Skip button is gone", not any("Skip" in o for o in _order), _order)
+    _dlg.deleteLater()
+
+    # Each button returns what it says. exec_ is replaced by a click so the real
+    # signal wiring is exercised without a modal dialog to escape from.
+    #
+    # Drop the instance stub the checks above installed first, or this calls
+    # that lambda instead of the real method. It returns None, so Cancel would
+    # pass for the wrong reason and the two choice buttons would fail.
+    del mw._ask_review_overlay_kind
+    _real_build = mw._build_review_kind_dialog
+    for _want, _label in (("boxes", "Bounding Boxes"),
+                          ("masks", "Segmentation"),
+                          (None, "Cancel")):
+        def _build(w=_want):
+            dd, bb = _real_build()
+            dd.exec_ = lambda b=bb[w]: b.click()
+            return dd, bb
+        mw._build_review_kind_dialog = _build
+        check(f"T81 the {_label!r} button returns {_want!r}",
+              mw._ask_review_overlay_kind() == _want)
+    mw._build_review_kind_dialog = _real_build
+
+    # Only ONE kind saved -> open it, and do NOT ask; there is no choice to make.
+    out2 = _os.path.join(d, "out2")
+    boxes2 = _touch(_os.path.join(out2, f"annotated_{tag}", "boxes"), "berry_01.jpg")
+    _os.makedirs(_os.path.join(out2, f"annotated_{tag}", "masks"), exist_ok=True)
+    for box_on, mask_on in ((True, False), (False, True), (False, False)):
+        mw.box_checkbox.setChecked(box_on)
+        mw.mask_checkbox.setChecked(mask_on)
+        asked = []
+        mw._ask_review_overlay_kind = lambda k=asked: (k.append(1) or "masks")
+        got = mw._review_overlay_dir(out2, tag)
+        check("T81 a bbox-only run opens boxes without asking",
+              got == boxes2 and asked == [], (got, asked))
+    # Nothing saved at all -> nothing to review, and still no prompt.
+    out3 = _os.path.join(d, "out3"); _os.makedirs(out3, exist_ok=True)
+    asked = []
+    mw._ask_review_overlay_kind = lambda k=asked: (k.append(1) or "masks")
+    check("T81 no annotated images -> None, without asking",
+          mw._review_overlay_dir(out3, tag) is None and asked == [], asked)
+    check("T81 a missing annotated folder is empty, not an error",
+          mw._dir_has_images(_os.path.join(out3, "does_not_exist")) is False)
+
+    # --- the batch run snapshots its paths before _finish_folder wipes them -
+    src = _os.path.abspath(_mod_mw.__file__)
+    with open(src, encoding="utf-8") as f:
+        body = f.read()
+    aar = body[body.index("def auto_annotate_remaining"):]
+    aar = aar[:aar.index("\n    def _update_detection_threshold_label")]
+    snap = aar.index("sbs_output_dir = self.output_folder")
+    fin  = aar.index("self._finish_folder()")
+    open_call = aar.index("self._open_review_side_by_side(")
+    check("T81 output folder snapshotted before _finish_folder clears it",
+          snap < fin, (snap, fin))
+    check("T81 the viewer opens after both alerts and _finish_folder",
+          fin < open_call, (fin, open_call))
+    check("T81 an empty run does not open the viewer",
+          "if review_sbs and processed:" in aar)
+
+    # --- the whole handoff, end to end -------------------------------------
+    # The unit checks above stub _ask_review_overlay_kind and patch MainWindow.
+    # This drives the real _open_review_side_by_side on real folders, because
+    # the risky part is not the logic but the lifetime: this method destroys the
+    # window it is running on, and if the viewer is not owned by something else
+    # first, Qt takes it down too and the user is left with nothing.
+    from PyQt5 import sip as _sip
+    _splash2 = _il.import_module("autoannotate.gui.splash")
+    _real_mw = _mod_mw.ManualWindow
+    e2e = _os.path.join(d, "e2e")
+    e2e_in = _touch(_os.path.join(e2e, "in"), "a.jpg", "b.jpg")
+    e2e_tag = "SwinT_SAM2"
+    for _k in ("boxes", "masks"):
+        _touch(_os.path.join(e2e, "out", f"annotated_{e2e_tag}", _k), "a.jpg", "b.jpg")
+    _splash2._LIVE_WINDOWS.clear()
+    real_mw = _real_mw(None, None)
+    real_mw._ask_review_overlay_kind = lambda: "masks"
+    real_mw._open_review_side_by_side(e2e_in, _os.path.join(e2e, "out"), e2e_tag)
+    QtWidgets.QApplication.processEvents()
+    QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    check("T81 the annotation window is destroyed, not left hidden",
+          _sip.isdeleted(real_mw))
+    check("T81 the viewer survives the window that opened it being destroyed",
+          len(_splash2._LIVE_WINDOWS) == 1
+          and not _sip.isdeleted(_splash2._LIVE_WINDOWS[0])
+          and _splash2._LIVE_WINDOWS[0].isVisible(),
+          _splash2._LIVE_WINDOWS)
+    _viewer = _splash2._LIVE_WINDOWS[0]
+    check("T81 the viewer opens fullscreen with both folders paired",
+          _viewer.isFullScreen() and len(_viewer.pairs) == 2,
+          (_viewer.isFullScreen(), len(_viewer.pairs)))
+    # ...and leaving it lands on a FULLSCREEN menu. Coming back at a fraction of
+    # the screen was the second reported bug, caused by re-showing a hidden
+    # window instead of constructing one (a re-show never repeats init_ui).
+    _viewer.go_back()
+    QtWidgets.QApplication.processEvents()
+    QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    _menu = _splash2._LIVE_WINDOWS[-1]
+    check("T81 leaving the viewer lands on a fullscreen main menu",
+          type(_menu).__name__ == "MainWindow" and _menu.isVisible()
+          and _menu.isFullScreen(),
+          (type(_menu).__name__, _menu.isVisible(), _menu.isFullScreen()))
+    check("T81 the viewer destroys itself on the way out", _sip.isdeleted(_viewer))
+    for _w in list(_splash2._LIVE_WINDOWS):
+        if not _sip.isdeleted(_w):
+            _w.close()
+    _splash2._LIVE_WINDOWS.clear()
+
+t81_review_side_by_side()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T82: GPU out-of-memory -- a VRAM-derived default budget stops the models
+#      co-residing, and an OOM that happens anyway purges and retries instead
+#      of writing the image off.
+# ══════════════════════════════════════════════════════════════════════════
+def t82_cuda_oom():
+    import os as _os
+    import torch as _torch
+    w = mk_window()
+
+    # --- classification --------------------------------------------------
+    oom_cls = getattr(_torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None:
+        check("T82 torch.cuda.OutOfMemoryError is an OOM",
+              w._is_oom(oom_cls("CUDA out of memory.")))
+    else:
+        skip("T82 torch.cuda.OutOfMemoryError is an OOM", "torch too old for the class")
+    check("T82 legacy RuntimeError wording is an OOM",
+          w._is_oom(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")))
+    check("T82 MPS wording is an OOM",
+          w._is_oom(RuntimeError("MPS backend out of memory")))
+    check("T82 an unrelated RuntimeError is not an OOM",
+          not w._is_oom(RuntimeError("shape mismatch")))
+    check("T82 an unrelated exception type is not an OOM",
+          not w._is_oom(ValueError("out of memory")))
+
+    # --- purge drops every cached model ----------------------------------
+    w._model_cache = {"dino_swint": object(), "sam3": object()}
+    w._model_lru = {"dino_swint": 1, "sam3": 2}
+    w._purge_all_models()
+    check("T82 purge empties the model cache", w._model_cache == {}, w._model_cache)
+    check("T82 purge empties the LRU", w._model_lru == {}, w._model_lru)
+
+    # --- retry: purge once, run twice, succeed ---------------------------
+    purges = []
+    w._purge_all_models = lambda: purges.append(1)
+    calls = []
+    def _oom_then_ok():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return "ok"
+    check("T82 an OOM is retried and succeeds",
+          w._run_with_oom_retry("detector", _oom_then_ok) == "ok")
+    check("T82 the retry ran the work exactly twice", len(calls) == 2, calls)
+    check("T82 the retry purged exactly once", len(purges) == 1, purges)
+
+    # A second OOM is NOT retried again: two attempts, then it fails for real.
+    purges.clear()
+    calls.clear()
+    def _always_oom():
+        calls.append(1)
+        raise RuntimeError("CUDA out of memory")
+    try:
+        w._run_with_oom_retry("detector", _always_oom)
+        check("T82 a persistent OOM still fails", False, "no error raised")
+    except RuntimeError:
+        check("T82 a persistent OOM still fails", True)
+    check("T82 a persistent OOM is bounded at two attempts", len(calls) == 2, calls)
+
+    # A non-OOM error is re-raised immediately, with no purge and no retry.
+    purges.clear()
+    calls.clear()
+    def _other():
+        calls.append(1)
+        raise ValueError("bad prompt")
+    try:
+        w._run_with_oom_retry("detector", _other)
+        check("T82 a non-OOM error is not retried", False, "no error raised")
+    except ValueError:
+        check("T82 a non-OOM error is not retried", len(calls) == 1, calls)
+    check("T82 a non-OOM error does not purge", purges == [], purges)
+
+    # --- the failure text tells the user what to change ------------------
+    reason = w._failure_reason(RuntimeError("CUDA out of memory"))
+    check("T82 an OOM failure names AUTOANNOTATE_MODEL_BUDGET_GB",
+          "AUTOANNOTATE_MODEL_BUDGET_GB" in reason, reason)
+    check("T82 an OOM failure names AUTOANNOTATE_BATCH_CHUNK",
+          "AUTOANNOTATE_BATCH_CHUNK" in reason, reason)
+    check("T82 an OOM failure purges for the next image", len(purges) == 1, purges)
+    check("T82 a non-OOM failure is reported verbatim",
+          w._failure_reason(ValueError("bad prompt")) == "bad prompt")
+
+    # --- budget: env wins, otherwise derive from VRAM --------------------
+    w2 = mk_window()
+    _saved = _os.environ.get("AUTOANNOTATE_MODEL_BUDGET_GB")
+    try:
+        _os.environ["AUTOANNOTATE_MODEL_BUDGET_GB"] = "4.5"
+        check("T82 an explicit budget wins", w2._model_budget_gb() == 4.5)
+        _os.environ["AUTOANNOTATE_MODEL_BUDGET_GB"] = "0"
+        check("T82 an explicit 0 still means unbounded", w2._model_budget_gb() == 0.0)
+        _os.environ["AUTOANNOTATE_MODEL_BUDGET_GB"] = "not-a-number"
+        check("T82 an unparseable budget falls back to unbounded",
+              w2._model_budget_gb() == 0.0)
+        _os.environ.pop("AUTOANNOTATE_MODEL_BUDGET_GB", None)
+        # _cuda_budget_cache is the probe's memo, so it doubles as the injection
+        # point for a card this machine may not have.
+        w2._cuda_budget_cache = 4.4
+        check("T82 unset budget derives from VRAM", w2._model_budget_gb() == 4.4)
+        w3 = mk_window()
+        w3._cuda_budget_cache = 0.0
+        check("T82 off CUDA the default stays unbounded", w3._model_budget_gb() == 0.0)
+        # An 8GB card must not fit DINO + SAM3 + YOLOE at once: that co-residency
+        # is what ran the batch out of memory.
+        budget = 8.0 * ManualWindow.CUDA_BUDGET_FRACTION
+        heavy = sum(ManualWindow.MODEL_FOOTPRINT_GB[k]
+                    for k in ("dino_swint", "sam3", "yoloe_vis"))
+        check("T82 an 8GB card cannot hold DINO + SAM3 + YOLOE together",
+              heavy > budget, (heavy, budget))
+        check("T82 an 8GB card still holds DINO + SAM2 together",
+              ManualWindow.MODEL_FOOTPRINT_GB["dino_swint"]
+              + ManualWindow.MODEL_FOOTPRINT_GB["sam2_t"] < budget)
+    finally:
+        if _saved is None:
+            _os.environ.pop("AUTOANNOTATE_MODEL_BUDGET_GB", None)
+        else:
+            _os.environ["AUTOANNOTATE_MODEL_BUDGET_GB"] = _saved
+
+    # --- the allocator flag is set before torch can read it ---------------
+    check("T82 expandable_segments requested",
+          "expandable_segments" in _os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
+          _os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
+    import autoannotate as _pkg
+    with open(_pkg.__file__, encoding="utf-8") as f:
+        check("T82 the flag is set in the package __init__, not in config",
+              "PYTORCH_CUDA_ALLOC_CONF" in f.read())
+
+    # --- the legacy run_image path reuses ONE segmenter -------------------
+    from autoannotate.pipeline import dino as _dino
+    builds = []
+    _real_load = _dino.load_sam
+    _real_cache = dict(_dino._SAM_CACHE)
+    _dino._SAM_CACHE.clear()
+    _dino.load_sam = lambda v: builds.append(v) or object()
+    try:
+        first = _dino._cached_sam("sam2_t.pt")
+        again = _dino._cached_sam("sam2_t.pt")
+        check("T82 run_image reuses one segmenter across images",
+              first is again and len(builds) == 1, builds)
+        _dino._cached_sam("sam3.pt")
+        check("T82 a different variant gets its own instance", len(builds) == 2, builds)
+    finally:
+        _dino.load_sam = _real_load
+        _dino._SAM_CACHE.clear()
+        _dino._SAM_CACHE.update(_real_cache)
+
+t82_cuda_oom()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T83: the review-route and out-of-memory follow-ups. Closing a window has to
+#      leave the user somewhere, an image with no detections still has to hand
+#      its memory back, the purge has to reach the Stable Diffusion pipeline,
+#      and a pipeline that cannot fit its budget has to say so.
+# ══════════════════════════════════════════════════════════════════════════
+def t83_close_and_purge_followups():
+    import os as _os, tempfile
+    import importlib as _il
+
+    # --- the title-bar X lands where Back does -----------------------------
+    # go_back and the window close both route through _restore_caller, so the
+    # user ends up on the main menu either way. Closing used to do nothing at
+    # all, which left no window at all and took the whole app down with
+    # quitOnLastWindowClosed. (Which destination it is, and that all three ways
+    # out agree on it, is covered in T81.)
+    _splash = _il.import_module("autoannotate.gui.splash")
+    _real_main = _splash.MainWindow
+    built = []
+    _splash.MainWindow = lambda *a, **k: built.append(a) or QtWidgets.QWidget()
+    try:
+        w3 = SideBySideWindow(None, None)
+        w3.close()
+        check("T83 closing with the X rebuilds the menu", len(built) == 1, built)
+        built.clear()
+        w4 = SideBySideWindow(None, None)
+        w4.go_back()
+        w4.close()
+        check("T83 a second close does not build another menu",
+              len(built) == 1, built)
+    finally:
+        _splash.MainWindow = _real_main
+
+    # --- an image with no detections still releases ------------------------
+    _dino = _il.import_module("autoannotate.pipeline.dino")
+    released = []
+    _real_release = _dino._release_memory
+    _real_run = _dino.run_dino_from_model
+    _dino._release_memory = lambda: released.append(1)
+    _dino.run_dino_from_model = lambda *a, **k: []
+    d = tempfile.mkdtemp()
+    try:
+        out = _dino.run_image(None, _os.path.join(d, "img.jpg"),
+                              _os.path.join(d, "out"), "berry", 0.3, 0.25,
+                              _os.path.join(d, "save"))
+        check("T83 no detections still returns empty", out == ([], []), out)
+        check("T83 no detections still releases the image's memory",
+              len(released) == 1, released)
+    finally:
+        _dino._release_memory = _real_release
+        _dino.run_dino_from_model = _real_run
+
+    # --- the purge reaches Stable Diffusion --------------------------------
+    # SD parks its pipeline on the GPU for the life of the process, so a purge
+    # that skipped it freed less than the retry needed and the second attempt
+    # failed exactly like the first.
+    _sd = _il.import_module("autoannotate.pipeline.sd")
+    check("T83 sd exposes a release for its cached pipeline",
+          callable(getattr(_sd, "release_sd_inpaint", None)))
+    _real_pipe = _sd._sd_inpaint_pipe
+    try:
+        _sd._sd_inpaint_pipe = object()
+        check("T83 releasing a resident SD pipeline reports it",
+              _sd.release_sd_inpaint() is True)
+        check("T83 the SD pipeline is actually dropped",
+              _sd._sd_inpaint_pipe is None)
+        check("T83 releasing again is a no-op", _sd.release_sd_inpaint() is False)
+    finally:
+        _sd._sd_inpaint_pipe = _real_pipe
+
+    # The window's purge has to call it. Patch __globals__ rather than a module
+    # object: T77 drops every autoannotate module to re-import config, so
+    # import_module and the file-level _mod_* handle can hand back two different
+    # modules and only one of them is the one this method reads its names from.
+    # __globals__ IS that one, whichever it turned out to be.
+    w4 = mk_window()
+    w4._model_cache = {"sam3": object()}
+    w4._model_lru = {"sam3": 1}
+    w4._release_inference_memory = lambda force=False: None
+    calls = []
+    _g = ManualWindow._purge_all_models.__globals__
+    _real_sd_mod = _g["sd_module"]
+    _real_sam_mod = _g["sam_module"]
+
+    class _StubMod:
+        def __init__(self, name): self.name = name
+        def __getattr__(self, attr):
+            return lambda *a, **k: calls.append(f"{self.name}.{attr}")
+
+    _g["sd_module"] = _StubMod("sd")
+    _g["sam_module"] = _StubMod("sam")
+    try:
+        w4._purge_all_models()
+        check("T83 the purge releases the SD pipeline",
+              "sd.release_sd_inpaint" in calls, calls)
+        check("T83 the purge still releases the SAM3 text predictor",
+              "sam.release_sam3_text_predictor" in calls, calls)
+        check("T83 the purge still empties the model cache",
+              w4._model_cache == {}, w4._model_cache)
+    finally:
+        _g["sd_module"] = _real_sd_mod
+        _g["sam_module"] = _real_sam_mod
+
+    # --- a pipeline that cannot fit its budget says so ---------------------
+    # Evicting a model the pipeline does not use is the budget working. Evicting
+    # one it needs on the next call is thrash, and the only symptom otherwise is
+    # a run that got slow with nothing said about why.
+    w5 = mk_window()
+    w5.detector_choice = "SAM3 (one-shot)"
+    w5.segmenter_choice = "SAM3"
+    warned = []
+    import builtins as _bi
+    _real_print = _bi.print
+    _bi.print = lambda *a, **k: warned.append(" ".join(str(x) for x in a))
+    try:
+        w5._warn_pipeline_over_budget("sam3", "sam3_det", 4.4)
+        w5._warn_pipeline_over_budget("sam3", "sam3_det", 4.4)
+        # An eviction of something the pipeline is not using is not thrash.
+        w5._warn_pipeline_over_budget("yoloe_vis", "sam3_det", 4.4)
+    finally:
+        _bi.print = _real_print
+    hits = [m for m in warned if "AUTOANNOTATE_MODEL_BUDGET_GB" in m]
+    check("T83 an over-budget pipeline warns", len(hits) == 1, warned)
+    check("T83 the warning names the pipeline and both numbers",
+          "SAM3_SAM3" in hits[0] and "6.6GB" in hits[0] and "4.4GB" in hits[0],
+          hits)
+    # A different pipeline (or a changed budget) is a new fact worth stating.
+    w5.segmenter_choice = "SAM2 (tiny)"
+    warned.clear()
+    _bi.print = lambda *a, **k: warned.append(" ".join(str(x) for x in a))
+    try:
+        w5._warn_pipeline_over_budget("sam2_t", "sam3_det", 4.4)
+    finally:
+        _bi.print = _real_print
+    check("T83 a different pipeline warns again",
+          any("AUTOANNOTATE_MODEL_BUDGET_GB" in m for m in warned), warned)
+
+t83_close_and_purge_followups()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T84: Auto Annotate Remaining must not churn models. A batch loads its
+#      detector and segmenter ONCE and keeps them; offloading belongs to a
+#      detector/segmenter switch. Plus the release cadence that rides along
+#      with it, and the edge cases around both that have not bitten yet.
+# ══════════════════════════════════════════════════════════════════════════
+def t84_batch_does_not_churn_models():
+    import os as _os
+
+    # --- the pin holds the pipeline's own models -------------------------
+    def _pinned_window(det="DINO (SwinT)", seg="SAM3"):
+        w = mk_window()
+        w.detector_choice, w.segmenter_choice = det, seg
+        w._model_lru = {}
+        w._model_lru_tick = 0
+        w._release_inference_memory = lambda force=False: None
+        # A budget far under the pipeline's own footprint: without the pin this
+        # evicts on every single load, which is the behaviour being fixed.
+        w._cuda_budget_cache = 1.0
+        return w
+
+    _saved_budget = _os.environ.get("AUTOANNOTATE_MODEL_BUDGET_GB")
+    _os.environ.pop("AUTOANNOTATE_MODEL_BUDGET_GB", None)
+    try:
+        w = _pinned_window()
+        w._busy = True
+        w._pin_pipeline_models = True
+        w._model_cache = {"dino_swint": object()}
+        w._evict_for("sam3")
+        check("T84 a batch does not evict the detector to fit the segmenter",
+              "dino_swint" in w._model_cache, w._model_cache)
+        w._model_cache = {"sam3": object()}
+        w._evict_for("dino_swint")
+        check("T84 a batch does not evict the segmenter to fit the detector",
+              "sam3" in w._model_cache, w._model_cache)
+
+        # A leftover from earlier interactive work is NOT pinned: reclaiming it
+        # once is what makes room for the pair, and it is not churn.
+        w._model_cache = {"dino_swint": object(), "yoloe_vis": object()}
+        w._evict_for("sam3")
+        check("T84 a batch still reclaims a model the pipeline does not use",
+              "yoloe_vis" not in w._model_cache and "dino_swint" in w._model_cache,
+              w._model_cache)
+
+        # Interactive (no batch) is unchanged: the budget still evicts.
+        w2 = _pinned_window()
+        w2._busy = False
+        w2._pin_pipeline_models = False
+        w2._model_cache = {"dino_swint": object()}
+        w2._evict_for("sam3")
+        check("T84 outside a batch the budget still evicts",
+              "dino_swint" not in w2._model_cache, w2._model_cache)
+
+        # A stuck pin flag cannot outlive the run: _busy gates it too.
+        w3 = _pinned_window()
+        w3._busy = False
+        w3._pin_pipeline_models = True
+        w3._model_cache = {"dino_swint": object()}
+        w3._evict_for("sam3")
+        check("T84 the pin expires with the busy flag",
+              "dino_swint" not in w3._model_cache, w3._model_cache)
+
+        # --- the whole two-stage run, counted -----------------------------
+        # The point of the pin, measured the way the user feels it: how many
+        # times does a multi-GB model get built over a folder? Chunking means
+        # the loop alternates detect/segment passes many times; each alternation
+        # used to be two reloads.
+        def _count_loads(pinned):
+            w = _pinned_window()
+            w._busy = True
+            w._pin_pipeline_models = pinned
+            w._model_cache = {}
+            builds = []
+
+            def _load(key):
+                # _get_model's real body, minus the model construction.
+                w._model_lru_tick += 1
+                if key in w._model_cache:
+                    w._model_lru[key] = w._model_lru_tick
+                    return w._model_cache[key]
+                w._evict_for(key)
+                builds.append(key)
+                w._model_cache[key] = object()
+                w._model_lru[key] = w._model_lru_tick
+                return w._model_cache[key]
+
+            # 40 images, chunk 8 -> 5 detect/segment alternations.
+            for _chunk in range(5):
+                for _img in range(8):
+                    _load("dino_swint")
+                for _img in range(8):
+                    _load("sam3")
+            return builds
+
+        pinned_builds = _count_loads(True)
+        churn_builds  = _count_loads(False)
+        check("T84 a pinned 40-image run builds each model exactly once",
+              pinned_builds == ["dino_swint", "sam3"], pinned_builds)
+        check("T84 the same run without the pin is what churn looks like",
+              len(churn_builds) == 10, churn_builds)
+
+        # An out-of-memory means the card really cannot hold both, so the pin
+        # comes off and the rest of the run may evict again.
+        w4 = _pinned_window()
+        w4._busy = True
+        w4._pin_pipeline_models = True
+        w4._purge_all_models = lambda: None
+        calls = []
+
+        def _oom_once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("CUDA out of memory")
+            return "ok"
+
+        check("T84 the retry still succeeds after an OOM",
+              w4._run_with_oom_retry("detector", _oom_once) == "ok")
+        check("T84 an OOM drops the pin for the rest of the run",
+              w4._pin_pipeline_models is False)
+        w4._model_cache = {"dino_swint": object()}
+        w4._evict_for("sam3")
+        check("T84 after an OOM the budget may evict between passes again",
+              "dino_swint" not in w4._model_cache, w4._model_cache)
+
+        # A non-OOM failure must NOT cost the run its pin.
+        w5 = _pinned_window()
+        w5._busy = True
+        w5._pin_pipeline_models = True
+        try:
+            w5._run_with_oom_retry("detector", lambda: (_ for _ in ()).throw(ValueError("nope")))
+        except ValueError:
+            pass
+        check("T84 an unrelated failure leaves the pin alone",
+              w5._pin_pipeline_models is True)
+    finally:
+        if _saved_budget is None:
+            _os.environ.pop("AUTOANNOTATE_MODEL_BUDGET_GB", None)
+        else:
+            _os.environ["AUTOANNOTATE_MODEL_BUDGET_GB"] = _saved_budget
+
+    # The batch run has to actually set and clear the flag.
+    src = _os.path.abspath(_mod_mw.__file__)
+    with open(src, encoding="utf-8") as f:
+        body = f.read()
+    aar = body[body.index("def auto_annotate_remaining"):]
+    aar = aar[:aar.index("\n    def _update_detection_threshold_label")]
+    check("T84 the batch pins its pipeline", "self._pin_pipeline_models = True" in aar)
+    check("T84 the batch releases the pin", "self._pin_pipeline_models = False" in aar)
+    check("T84 the pin is set before the per-image loop",
+          aar.index("self._pin_pipeline_models = True")
+          < aar.index("self._pin_pipeline_models = False"))
+
+    # --- release cadence -------------------------------------------------
+    # empty_cache() on CUDA hands blocks back to the driver, so doing it twice
+    # per image undoes the caching allocator on purpose. MPS still needs it.
+    _saved_every = _os.environ.get("AUTOANNOTATE_RELEASE_EVERY")
+    _os.environ.pop("AUTOANNOTATE_RELEASE_EVERY", None)
+    try:
+        for kind, want in (("cuda", 4), ("mps", 1), ("cpu", 1)):
+            w = mk_window()
+            w._device_kind_cache = kind
+            check(f"T84 release cadence default on {kind} is {want}",
+                  w._release_every() == want, w._release_every())
+        w = mk_window(); w._device_kind_cache = "cuda"
+        _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = "1"
+        check("T84 an explicit cadence wins over the device default",
+              w._release_every() == 1, w._release_every())
+        _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = "0"
+        check("T84 a zero cadence floors at 1", w._release_every() == 1)
+        _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = "not-a-number"
+        check("T84 an unparseable cadence falls back to 1", w._release_every() == 1)
+        _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = ""
+        check("T84 an empty cadence uses the device default",
+              w._release_every() == 4, w._release_every())
+        # A demonstrated OOM outranks both the device default and an explicit
+        # env value: the relaxed cadence was an estimate, the OOM is a fact.
+        _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = "10"
+        w6 = mk_window()
+        w6._device_kind_cache = "cuda"
+        w6._purge_all_models = lambda: None
+        check("T84 a relaxed cadence applies before any OOM",
+              w6._release_every() == 10, w6._release_every())
+        try:
+            w6._run_with_oom_retry("detector", lambda: (_ for _ in ()).throw(
+                RuntimeError("CUDA out of memory")))
+        except RuntimeError:
+            pass
+        check("T84 an OOM tightens the cadence to every call",
+              w6._release_every() == 1, w6._release_every())
+    finally:
+        if _saved_every is None:
+            _os.environ.pop("AUTOANNOTATE_RELEASE_EVERY", None)
+        else:
+            _os.environ["AUTOANNOTATE_RELEASE_EVERY"] = _saved_every
+
+    # A skipped release must still be a no-op, not a partial free.
+    w = mk_window()
+    w._device_kind_cache = "cuda"
+    w._release_tick = 0
+    freed = []
+    # Count only the calls that get past the cadence gate.
+    w._release_every = lambda: 4
+    import gc as _gc
+    _real_collect = _gc.collect
+    _gc.collect = lambda *a, **k: freed.append(1) or 0
+    try:
+        for _ in range(8):
+            w._release_inference_memory()
+    finally:
+        _gc.collect = _real_collect
+    check("T84 a cadence of 4 releases twice in eight calls", len(freed) == 2, freed)
+    freed.clear()
+    _gc.collect = lambda *a, **k: freed.append(1) or 0
+    try:
+        w._release_inference_memory(force=True)
+    finally:
+        _gc.collect = _real_collect
+    check("T84 force ignores the cadence", len(freed) == 1, freed)
+
+    # --- an OOM another library already wrapped --------------------------
+    # ultralytics and diffusers both catch mid-forward and re-raise their own
+    # type. An OOM one level down is still an OOM; missing it would skip the
+    # purge and write off every remaining image in the folder.
+    w = mk_window()
+    _oom = RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    try:
+        try:
+            raise _oom
+        except RuntimeError as e:
+            raise ValueError("inference failed") from e
+    except ValueError as wrapped:
+        check("T84 an OOM re-raised with `from` is still an OOM", w._is_oom(wrapped))
+    try:
+        try:
+            raise _oom
+        except RuntimeError:
+            raise ValueError("inference failed")
+    except ValueError as implicit:
+        check("T84 an OOM in the implicit context is still an OOM", w._is_oom(implicit))
+    check("T84 an unrelated wrapped error is still not an OOM",
+          not w._is_oom(ValueError("bad shape")))
+    # A self-referential chain must not hang the classifier.
+    _loop = ValueError("a")
+    _loop.__cause__ = _loop
+    check("T84 a looping exception chain terminates", w._is_oom(_loop) is False)
+
+    # --- review pairing edge cases ---------------------------------------
+    import tempfile
+    def _touch(folder, *names):
+        _os.makedirs(folder, exist_ok=True)
+        for n in names:
+            open(_os.path.join(folder, n), "wb").write(b"x")
+        return folder
+
+    d = tempfile.mkdtemp()
+    # Overlays are ALWAYS saved as .jpg (_save_annotated_image hardcodes it), so
+    # a folder of PNG inputs pairs across a different extension. Pairing is by
+    # stem, which is the only reason this works; a switch to full filenames
+    # would blank every right-hand pane on a PNG dataset.
+    gt_png = _touch(_os.path.join(d, "png_in"), "berry_01.png", "berry_02.png")
+    ann_jpg = _touch(_os.path.join(d, "png_ann"), "berry_01.jpg", "berry_02.jpg")
+    w = SideBySideWindow(None, None, synth_folder=ann_jpg, gt_folder=gt_png)
+    check("T84 PNG inputs pair with JPG overlays across the extension",
+          len(w.pairs) == 2 and all(s and g for s, g in w.pairs), w.pairs)
+
+    # A run where some images failed leaves FEWER overlays than inputs. The
+    # matched ones must still line up rather than sliding out of register.
+    gt_all = _touch(_os.path.join(d, "part_in"),
+                    "a_01.jpg", "a_02.jpg", "a_03.jpg", "a_04.jpg")
+    ann_some = _touch(_os.path.join(d, "part_ann"), "a_02.jpg", "a_04.jpg")
+    w2 = SideBySideWindow(None, None, synth_folder=ann_some, gt_folder=gt_all)
+    def _stem(p):
+        return _os.path.splitext(_os.path.basename(p))[0]
+    matched = [(_stem(s), _stem(g)) for s, g in w2.pairs if s and g]
+    check("T84 a partial run still pairs each overlay with its own original",
+          matched == [("a_02", "a_02"), ("a_04", "a_04")], matched)
+    check("T84 the un-annotated originals are still reachable",
+          sum(1 for s, g in w2.pairs if s is None and g) == 2, w2.pairs)
+
+    # Both folders empty: the viewer must come up rather than divide by zero.
+    empty_a = _touch(_os.path.join(d, "empty_a"))
+    empty_b = _touch(_os.path.join(d, "empty_b"))
+    w3 = SideBySideWindow(None, None, synth_folder=empty_a, gt_folder=empty_b)
+    check("T84 two empty folders give no pairs and no crash", w3.pairs == [], w3.pairs)
+    w3.show_next(); w3.show_prev()
+    check("T84 stepping through an empty viewer is a no-op", w3.pairs == [], w3.pairs)
+
+    # --- purge must survive a release that throws -------------------------
+    # torch teardown, a half-initialised diffusers import: the purge is the
+    # recovery path and must not itself become the failure.
+    w4 = mk_window()
+    w4._model_cache = {"sam3": object()}
+    w4._model_lru = {"sam3": 1}
+    w4._release_inference_memory = lambda force=False: None
+    _g = ManualWindow._purge_all_models.__globals__
+    _real_sd = _g["sd_module"]
+
+    class _Boom:
+        def __getattr__(self, attr):
+            def _raise(*a, **k):
+                raise RuntimeError("diffusers is half-imported")
+            return _raise
+
+    _g["sd_module"] = _Boom()
+    try:
+        w4._purge_all_models()
+        check("T84 a throwing SD release does not break the purge",
+              w4._model_cache == {}, w4._model_cache)
+    finally:
+        _g["sd_module"] = _real_sd
+
+t84_batch_does_not_churn_models()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T85: the in-app user manual, and the pre-flight guard that stops a run which
+#      could only ever write empty labels. The manual documents the switches;
+#      the guard enforces them.
+# ══════════════════════════════════════════════════════════════════════════
+def t85_user_manual_and_dead_pipeline_guard():
+    import importlib as _il
+    _um = _il.import_module("autoannotate.gui.user_manual")
+
+    # --- content -----------------------------------------------------------
+    titles = [t for t, _ in _um.MANUAL_SECTIONS]
+    check("T85 the manual has all eight sections", len(titles) == 8, titles)
+    check("T85 section titles are unique", len(set(titles)) == 8, titles)
+    check("T85 every section has a body",
+          all(len(b.strip()) > 200 for _, b in _um.MANUAL_SECTIONS),
+          [(t, len(b)) for t, b in _um.MANUAL_SECTIONS])
+    for want in ("Getting started", "Text prompts", "Box annotation",
+                 "Use First Image as Prompt", "Auto Annotate Remaining",
+                 "Editing annotations", "Synthetic images", "Keyboard"):
+        check(f"T85 manual covers {want!r}",
+              any(want in t for t in titles), titles)
+
+    # The carry section is the reason this exists: it must name every one of the
+    # five requirements, or it is worse than no documentation.
+    carry = next(b for t, b in _um.MANUAL_SECTIONS if "Use First Image" in t)
+    for want in ("YOLOE-vis", "YOLOE-seg", "SAM3", "DINO", "Boxes",
+                 "(none)", "yellow", "Use First Image as Prompt"):
+        check(f"T85 the carry section names {want!r}", want in carry,
+              want)
+    check("T85 the carry section warns about empty results",
+          "empty" in carry.lower(), carry[:200])
+
+    # --- the accordion works ----------------------------------------------
+    dlg = _um.UserManualOverlay()
+    check("T85 one collapsible per section", len(dlg.sections) == 8,
+          len(dlg.sections))
+    first_hdr, first_panel = dlg.sections[0]
+    check("T85 the first section starts expanded",
+          first_hdr.isChecked() and "▾" in first_hdr.text(),
+          first_hdr.text())
+    check("T85 every other section starts collapsed",
+          all(not h.isChecked() and "▸" in h.text()
+              for h, _ in dlg.sections[1:]),
+          [h.text() for h, _ in dlg.sections[1:]])
+    # Toggling has to move BOTH the panel and the arrow; a stale arrow is the
+    # bug this idiom invites.
+    hdr, panel = dlg.sections[3]
+    hdr.setChecked(True)
+    check("T85 expanding a section shows its panel and flips the arrow",
+          "▾" in hdr.text() and "▸" not in hdr.text(), hdr.text())
+    hdr.setChecked(False)
+    check("T85 collapsing it puts the arrow back",
+          "▸" in hdr.text(), hdr.text())
+    check("T85 the section title survives toggling",
+          "Use First Image as Prompt" in hdr.text(), hdr.text())
+
+    # --- it is NOT a window, which is the whole fix ------------------------
+    # macOS defaults AppleWindowTabbingMode to "fullscreen" (prefer tabs when
+    # opening windows in fullscreen) and both hosts call showFullScreen(), so a
+    # QDialog was being merged into the parent as a native window TAB. Two
+    # earlier attempts (repositioning it, changing its modality) both failed
+    # because the OS was reacting to it being a separate window at all.
+    #
+    # This check is proof rather than evidence: macOS can only tab an NSWindow,
+    # and a Qt widget that is not a window has no NSWindow behind it. If this
+    # passes, tabbing cannot happen, on any macOS version or tabbing preference.
+    host = QtWidgets.QWidget()
+    host.setGeometry(0, 0, 1200, 800)
+    ov = _um.UserManualOverlay(host)
+    check("T85 the manual is NOT a top-level window", not ov.isWindow())
+    check("T85 the manual is a child of the window that opened it",
+          ov.parentWidget() is host)
+    check("T85 the manual starts hidden", not ov.isVisible())
+    # A stylesheet background is ignored on a QWidget SUBCLASS without this, and
+    # the scrim would be invisible with the canvas showing through.
+    check("T85 the scrim actually paints",
+          ov.testAttribute(QtCore.Qt.WA_StyledBackground))
+
+    host.show()          # offscreen platform, so a child's isVisible() is real
+    ov.show_over()
+    check("T85 showing it covers the whole host window",
+          ov.geometry() == host.rect(), (ov.geometry(), host.rect()))
+    check("T85 a parentless overlay show_over is a no-op, not a crash",
+          _um.UserManualOverlay().show_over() is None)
+
+    # --- keys must not leak to the window underneath -----------------------
+    # ManualWindow.keyPressEvent maps Enter to display_predictions() and never
+    # calls super() or ignore(). A QDialog stopped propagation for free because
+    # an ignored key stops at the first isWindow() widget; a child widget does
+    # not, so without an explicit sink, Enter would start a model run behind the
+    # manual and Delete would soft-delete an annotation nobody can see.
+    leaked = []
+    class _LeakHost(QtWidgets.QWidget):
+        def keyPressEvent(self, event):      # stands in for ManualWindow's
+            leaked.append(event.key())
+    lh = _LeakHost()
+    lh.setGeometry(0, 0, 1000, 700)
+    lh.show()
+    lov = _um.UserManualOverlay(lh)
+    lov.show_over()
+    for _key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter,
+                 QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace,
+                 QtCore.Qt.Key_S):
+        QtWidgets.QApplication.sendEvent(
+            lov, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, _key,
+                                 QtCore.Qt.NoModifier))
+    check("T85 no keypress reaches the window behind the manual",
+          leaked == [], leaked)
+    # The same, from a widget INSIDE the card: an ignored key walks the parent
+    # chain, and the overlay has to be the thing that stops it.
+    lov.close_btn.setFocus()
+    QtWidgets.QApplication.sendEvent(
+        lov.close_btn, QtGui.QKeyEvent(QtCore.QEvent.KeyPress,
+                                       QtCore.Qt.Key_Return, QtCore.Qt.NoModifier))
+    check("T85 a keypress inside the card does not reach it either",
+          leaked == [], leaked)
+
+    # --- closing -----------------------------------------------------------
+    check("T85 the manual is visible before closing", lov.isVisible())
+    QtWidgets.QApplication.sendEvent(
+        lov, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape,
+                             QtCore.Qt.NoModifier))
+    check("T85 Esc closes the manual", not lov.isVisible())
+    lov.show_over()
+    lov.close_btn.click()
+    check("T85 the Close button closes the manual", not lov.isVisible())
+    # Clicking the dimmed area dismisses; clicking the card does not.
+    lov.show_over()
+    _corner = QtCore.QPoint(4, 4)
+    check("T85 the click target outside the card really is outside it",
+          not lov.card.geometry().contains(_corner), lov.card.geometry())
+    lov.mousePressEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress, _corner, QtCore.Qt.LeftButton,
+        QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    check("T85 clicking the dimmed area closes the manual", not lov.isVisible())
+    lov.show_over()
+    lov.mousePressEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress, lov.card.geometry().center(),
+        QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    check("T85 clicking the card itself does not close it", lov.isVisible())
+
+    # --- the app must own exactly ONE top-level window ---------------------
+    # A hidden top-level window is still a NATIVE window, and close() only
+    # hides. MainWindow goes fullscreen, which on macOS puts it on a Space of
+    # its own, so a surviving splash leaves the app owning a window on each
+    # Space. Activating the app could then send the display to the splash's
+    # Space, which is empty because the splash is hidden: the reported "it
+    # opens a new window with nothing in it". The splash must be DESTROYED.
+    import autoannotate.gui.splash as _sp
+    from PyQt5 import sip as _sip
+
+    _sp._LIVE_WINDOWS.clear()
+    # Hold real REFERENCES to the pre-existing windows, not their ids. Two
+    # reasons: CPython recycles ids, and 4000 lines of earlier tests have left
+    # plenty of windows lying around, so a global count would measure them
+    # rather than this handoff.
+    _before = list(QtWidgets.QApplication.topLevelWidgets())
+    _s = _sp.SplashScreen.__new__(_sp.SplashScreen)
+    QtWidgets.QWidget.__init__(_s)
+    _s.model = None
+    _s.processor = None
+    _s.show_main_window()
+    QtWidgets.QApplication.processEvents()
+    QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    check("T85 the splash is destroyed, not just hidden", _sip.isdeleted(_s))
+    # ...and the main window must survive it. The splash held the ONLY reference
+    # to MainWindow before this, so deleting it without an owner kills the app
+    # at launch. _LIVE_WINDOWS is that owner.
+    check("T85 the main window is kept alive by _LIVE_WINDOWS",
+          len(_sp._LIVE_WINDOWS) == 1
+          and not _sip.isdeleted(_sp._LIVE_WINDOWS[0])
+          and _sp._LIVE_WINDOWS[0].isVisible(),
+          _sp._LIVE_WINDOWS)
+    _new = [w for w in QtWidgets.QApplication.topLevelWidgets()
+            if not any(w is b for b in _before)]
+    _new_names = [type(w).__name__ for w in _new]
+    check("T85 launching adds exactly one top-level window, the menu",
+          _new_names == ["MainWindow"], _new_names)
+    check("T85 no splash window survives the handoff",
+          "SplashScreen" not in _new_names, _new_names)
+    for _w in _new:
+        _w.close()
+    _sp._LIVE_WINDOWS.clear()
+
+    # --- navigation must not accumulate windows ---------------------------
+    # Every window here goes fullscreen in init_ui, and on macOS a fullscreen
+    # window owns a Space, so an abandoned one is an empty Space the app can be
+    # sent to. Before hand_off, ONE Menu -> Manual -> Back round trip left two
+    # of them behind and three round trips left six windows where there should
+    # be one. Counting round trips rather than asserting on a single transition,
+    # because a leak of one is invisible and a leak per trip is the actual bug.
+    _WINDOW_TYPES = ("MainWindow", "ManualWindow", "AutomatedWindow",
+                     "SideBySideWindow", "SplashScreen")
+
+    def _app_windows():
+        QtWidgets.QApplication.processEvents()
+        QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        return sorted(type(w).__name__
+                      for w in QtWidgets.QApplication.topLevelWidgets()
+                      if type(w).__name__ in _WINDOW_TYPES and not _sip.isdeleted(w))
+
+    _held = [w for w in QtWidgets.QApplication.topLevelWidgets()
+             if type(w).__name__ in _WINDOW_TYPES]
+    for _w in _held:            # quieten anything earlier tests left visible
+        _w.close()
+    _sp._LIVE_WINDOWS.clear()
+    _baseline = _app_windows()
+
+    for _open_name in ("select_manual", "select_side_by_side"):
+        _sp._LIVE_WINDOWS.clear()
+        _menu = _sp.MainWindow(None, None)
+        _sp._LIVE_WINDOWS.append(_menu)
+        _menu.show()
+        for _trip in (1, 2, 3):
+            getattr(_menu, _open_name)()
+            _opened = _sp._LIVE_WINDOWS[-1]
+            _opened.go_back()
+            _menu = _sp._LIVE_WINDOWS[-1]
+        check(f"T85 three {_open_name} round trips leave one window, not seven",
+              _app_windows().count("MainWindow")
+              == _baseline.count("MainWindow") + 1,
+              _app_windows())
+        check(f"T85 {_open_name} leaves nothing else behind",
+              _app_windows().count("ManualWindow")
+              == _baseline.count("ManualWindow")
+              and _app_windows().count("SideBySideWindow")
+              == _baseline.count("SideBySideWindow"),
+              _app_windows())
+        check(f"T85 the {_open_name} registry does not grow",
+              len(_sp._LIVE_WINDOWS) == 1, _sp._LIVE_WINDOWS)
+        _menu.close()
+        _sp._LIVE_WINDOWS.clear()
+
+    # --- the hosts keep it fitted -----------------------------------------
+    # The overlay is outside both hosts' layouts, so nothing sizes it but their
+    # resizeEvent. Both hosts must also survive the resize that showFullScreen()
+    # fires from inside init_ui, before the overlay attribute exists.
+    for _mod_name, _cls_name in (("autoannotate.gui.splash", "MainWindow"),
+                                 ("autoannotate.gui.manual_window", "ManualWindow")):
+        _cls = getattr(_il.import_module(_mod_name), _cls_name)
+        check(f"T85 {_cls_name} defines resizeEvent to refit the overlay",
+              "resizeEvent" in _cls.__dict__)
+        _bare = _cls.__new__(_cls)
+        QtWidgets.QWidget.__init__(_bare)
+        # No _manual_overlay attribute yet: exactly the init_ui-time resize.
+        _cls.resizeEvent(_bare, QtGui.QResizeEvent(
+            QtCore.QSize(10, 10), QtCore.QSize(10, 10)))
+        check(f"T85 {_cls_name}.resizeEvent survives firing before init_ui ends",
+              True)
+        _bare.setGeometry(0, 0, 640, 480)
+        _bare._manual_overlay = _um.UserManualOverlay(_bare)
+        _bare.show()
+        _bare._manual_overlay.show_over()
+        _bare.setGeometry(0, 0, 1024, 768)
+        _cls.resizeEvent(_bare, QtGui.QResizeEvent(
+            QtCore.QSize(1024, 768), QtCore.QSize(640, 480)))
+        check(f"T85 {_cls_name} refits the overlay after a resize",
+              _bare._manual_overlay.geometry() == _bare.rect(),
+              (_bare._manual_overlay.geometry(), _bare.rect()))
+        _bare.hide()
+
+    # --- the pre-flight guard ----------------------------------------------
+    def _win(det, seg, carry=False, mode="boxes", text="", boxes=None):
+        w = mk_window()
+        w.detector_choice, w.segmenter_choice = det, seg
+        w.prompt_mode = mode
+        w.carry_forward_checkbox = QtWidgets.QPushButton()
+        w.carry_forward_checkbox.setCheckable(True)
+        w.carry_forward_checkbox.setChecked(carry)
+        w._positive_prompt_text = lambda: text
+        w.image_label = StubLabel()
+        w.image_label.get_prompt_boxes_in_image_coords = lambda: list(boxes or [])
+        return w
+
+    # YOLOE-vis with carry OFF: the batch never hands it the boxes.
+    w = _win("YOLOE-vis", "(none)", carry=False, boxes=[[0, 0, 10, 10]])
+    why = w._dead_pipeline_reason()
+    check("T85 YOLOE-vis with carry off is refused", why is not None, why)
+    check("T85 it names the switch to flip",
+          why and "Use First Image as Prompt" in why, why)
+    # Same setup with the toggle on is fine.
+    w = _win("YOLOE-vis", "(none)", carry=True, boxes=[[0, 0, 10, 10]])
+    check("T85 YOLOE-vis with carry on is allowed",
+          w._dead_pipeline_reason() is None, w._dead_pipeline_reason())
+
+    # SAM3 + a segmenter falls through _run_detector_positive entirely.
+    w = _win("SAM3 (one-shot)", "SAM2 (tiny)", carry=True, boxes=[[0, 0, 9, 9]])
+    why = w._dead_pipeline_reason()
+    check("T85 SAM3 with a segmenter is refused", why is not None, why)
+    check("T85 it names the segmenter fix", why and "(none)" in why, why)
+    # This one is dead interactively too, so it must survive batch=False.
+    check("T85 SAM3 with a segmenter is refused interactively as well",
+          w._dead_pipeline_reason(batch=False) is not None)
+    w = _win("SAM3 (one-shot)", "(none)", carry=True, boxes=[[0, 0, 9, 9]])
+    check("T85 SAM3 one-shot alone is allowed",
+          w._dead_pipeline_reason() is None, w._dead_pipeline_reason())
+
+    # Text mode with no text on a one-shot detector.
+    w = _win("YOLOE-seg (one-shot)", "(none)", mode="text", text="")
+    why = w._dead_pipeline_reason()
+    check("T85 text mode with no prompt is refused", why is not None, why)
+    check("T85 it explains that drawn boxes are not prompts here",
+          why and "manual annotations" in why, why)
+    w = _win("YOLOE-seg (one-shot)", "(none)", mode="text", text="blueberry")
+    check("T85 text mode with a prompt is allowed",
+          w._dead_pipeline_reason() is None, w._dead_pipeline_reason())
+
+    # Carry on, box detector, nothing to carry.
+    w = _win("YOLOE-seg (one-shot)", "(none)", carry=True, boxes=[])
+    w._carry_anchor = []
+    why = w._dead_pipeline_reason()
+    check("T85 carry with no prompt box is refused", why is not None, why)
+    check("T85 it asks for a yellow prompt box", why and "yellow" in why, why)
+
+    # DINO with text is the ordinary healthy case and must not be touched.
+    w = _win("DINO (SwinT)", "SAM2 (tiny)", mode="text", text="blueberry")
+    check("T85 DINO with a text prompt is allowed",
+          w._dead_pipeline_reason() is None, w._dead_pipeline_reason())
+
+    # The interactive path must NOT inherit the carry-only rules: Regenerate
+    # hands the detector its boxes directly and does not care about the toggle.
+    w = _win("YOLOE-vis", "(none)", carry=False, boxes=[[0, 0, 10, 10]])
+    check("T85 an interactive run ignores the carry-only rules",
+          w._dead_pipeline_reason(batch=False) is None,
+          w._dead_pipeline_reason(batch=False))
+
+    # --- wiring ------------------------------------------------------------
+    import os as _os
+    src = _os.path.abspath(_mod_mw.__file__)
+    with open(src, encoding="utf-8") as f:
+        body = f.read()
+    aar = body[body.index("def auto_annotate_remaining"):]
+    aar = aar[:aar.index("\n    def _update_detection_threshold_label")]
+    check("T85 the batch consults the guard", "_dead_pipeline_reason()" in aar)
+    check("T85 the guard runs before the busy lock and the pin",
+          aar.index("_dead_pipeline_reason()") < aar.index("self._busy = True"))
+    check("T85 the guard runs before the output folders are made",
+          aar.index("_dead_pipeline_reason()") < aar.index("os.makedirs(boxes_dir"))
+    check("T85 the interactive path consults it with batch=False",
+          "_dead_pipeline_reason(batch=False)" in body)
+    check("T85 both screens open the manual",
+          "def open_user_manual" in body
+          and "def open_user_manual" in open(
+              _os.path.join(_os.path.dirname(src), "splash.py"),
+              encoding="utf-8").read())
+
+t85_user_manual_and_dead_pipeline_guard()
 
 
 # ── summary ────────────────────────────────────────────────────────────────

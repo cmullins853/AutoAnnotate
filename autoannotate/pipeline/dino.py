@@ -249,6 +249,19 @@ def run_dino_from_model(model, img_path, prompt, box_threshold, text_threshold, 
         return absolute_boxes, det_scores
     return absolute_boxes
 
+# Segmenters built by run_image, keyed by checkpoint name. The automated window
+# calls run_image once per image over a whole folder; building a fresh SAM every
+# call left the previous one's weights on the GPU with nothing dropping them, so
+# a long folder climbed until it ran out of memory. One instance per variant is
+# reused for the life of the process, the same thing the manual window's
+# _model_cache does.
+_SAM_CACHE = {}
+
+def _cached_sam(variant):
+    if variant not in _SAM_CACHE:
+        _SAM_CACHE[variant] = load_sam(variant)
+    return _SAM_CACHE[variant]
+
 def run_image(DINO, img_dir, output_dir, prompt, conf, box_threshold, save_dir):
     sam_model = "sam2_t.pt"
     dino_model = "swint"
@@ -262,13 +275,38 @@ def run_image(DINO, img_dir, output_dir, prompt, conf, box_threshold, save_dir):
         print(f"{output_dir} does not exist, creating")
         os.makedirs(output_dir, exist_ok=True)
 
-    boxes = run_dino_from_model(DINO, img_dir, prompt, conf, 0.1, box_threshold, save_dir=save_dir)
-    if not boxes:
-        print(f"No detections for {fname}, skipping SAM.")
-        return [], []
-    model = load_sam(sam_model)
-    sam_results = model(img_dir, bboxes=boxes, verbose=False)
-    save_masks(sam_results, output_dir, img_dir)
+    # try/finally, not a call before each return: an image with NO detections
+    # still ran a full DINO pass, so its temporaries have to go back to the
+    # allocator too. A long stretch of empty images was otherwise the one path
+    # through this function that kept growing the pool.
+    try:
+        boxes = run_dino_from_model(DINO, img_dir, prompt, conf, 0.1, box_threshold, save_dir=save_dir)
+        if not boxes:
+            print(f"No detections for {fname}, skipping SAM.")
+            return [], []
+        model = _cached_sam(sam_model)
+        sam_results = model(img_dir, bboxes=boxes, verbose=False)
+        save_masks(sam_results, output_dir, img_dir)
 
-    print(f"Completed in: {t.time() - start} seconds, masks saved in {output_dir}")
-    return sam_results, boxes
+        print(f"Completed in: {t.time() - start} seconds, masks saved in {output_dir}")
+        return sam_results, boxes
+    finally:
+        _release_memory()
+
+
+def _release_memory():
+    """Return this image's inference temporaries to the allocator before the
+    caller moves on to the next one. The per-image loop in the automated window
+    is otherwise unbroken, so the pool only ever grows across a folder. Mirrors
+    ManualWindow._release_inference_memory, which the manual batch path already
+    calls for the same reason."""
+    import gc
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+                and hasattr(torch.mps, "empty_cache")):
+            torch.mps.empty_cache()
+    except Exception:
+        pass

@@ -17,9 +17,33 @@ class SideBySideWindow(QtWidgets.QWidget):
     list that pairs the two folders by filename so the same scene shows on
     both sides at once; when the names don't correspond it falls back to
     positional pairing, and an unmatched side shows a placeholder.
+
+    The optional keyword arguments serve the post-batch review route (the
+    manual window's Review Side by Side toggle), which already knows both
+    folders:
+
+      synth_folder / gt_folder  preload a side, skipping its file dialog
+      titles / folder_labels    per-side wording, e.g. "Auto Annotated"
+                                instead of "Synthetic Images"
+
+    Every way out of this window leads to the main menu, whichever route opened
+    it. There used to be a `return_to` that sent the post-batch route back to the
+    annotation window instead; it was removed because that window has finished
+    its folder by then, and re-showing it brought it back at its pre-fullscreen
+    size (showFullScreen runs in init_ui, which a re-show does not repeat).
     """
 
-    def __init__(self, model, processor):
+    # Class-level fallbacks for the attributes init_ui / _apply_sides / closeEvent
+    # read. The headless suite builds instances via __new__ and calls init_ui
+    # directly, so none of them may depend on __init__ having run. Read-only at
+    # class level: __init__ assigns its own instance dict before mutating
+    # folder_labels, and _caller_restored is only ever rebound, never mutated.
+    _caller_restored = False
+    folder_labels = {"synth": "Open Synthetic Folder",
+                     "gt": "Open Ground Truth Folder"}
+
+    def __init__(self, model, processor, synth_folder=None, gt_folder=None,
+                 titles=None, folder_labels=None):
         super().__init__()
         self.model = model
         self.processor = processor
@@ -37,12 +61,27 @@ class SideBySideWindow(QtWidgets.QWidget):
         # (Ground Truth on the left). Content-swap (not widget reparenting) keeps
         # this bulletproof; the physical widgets never move.
         self.titles = {"synth": "Synthetic Images", "gt": "Ground Truth"}
+        # Folder-button wording per logical side. An instance attribute (it used
+        # to be a literal inside _apply_sides) so the review route can say
+        # "Open Annotated Folder" without the menu route losing its own labels.
+        self.folder_labels = {"synth": "Open Synthetic Folder",
+                              "gt": "Open Ground Truth Folder"}
+        if titles:
+            self.titles.update(titles)
+        if folder_labels:
+            self.folder_labels.update(folder_labels)
         self._left, self._right = "gt", "synth"
         # Zoom / pan belong to the LOGICAL side, not the physical slot, so a
         # swap carries each side's view with its image. Physical widgets are
         # the live copy; these dicts hold the side that is off-slot.
         self.view_states = {"synth": None, "gt": None}
         self.init_ui()
+        # Preloaded folders land AFTER init_ui, so the views they render into
+        # exist. Both loaders rebuild the pairing, so passing one or both works.
+        if gt_folder:
+            self.load_gt_folder(gt_folder)
+        if synth_folder:
+            self.load_synth_folder(synth_folder)
 
     def init_ui(self):
         self.setWindowTitle("View Images Side by Side")
@@ -253,21 +292,31 @@ class SideBySideWindow(QtWidgets.QWidget):
         imgs.sort()
         return imgs
 
+    def load_synth_folder(self, folder):
+        """Put `folder` on the synthetic side and re-pair. Split out from the
+        dialog so a caller that already knows the path (the manual window's
+        post-batch review) can skip the file picker entirely."""
+        self.synth_images = self._list_images(folder)
+        self._build_pairs()
+        self._reset_views()
+        self._show_current()
+
+    def load_gt_folder(self, folder):
+        """Ground-truth counterpart to load_synth_folder."""
+        self.gt_images = self._list_images(folder)
+        self._build_pairs()
+        self._reset_views()
+        self._show_current()
+
     def select_synth_folder(self):
         folder = self._pick_folder("Select Synthetic Images Folder")
         if folder:
-            self.synth_images = self._list_images(folder)
-            self._build_pairs()
-            self._reset_views()
-            self._show_current()
+            self.load_synth_folder(folder)
 
     def select_gt_folder(self):
         folder = self._pick_folder("Select Ground Truth Folder")
         if folder:
-            self.gt_images = self._list_images(folder)
-            self._build_pairs()
-            self._reset_views()
-            self._show_current()
+            self.load_gt_folder(folder)
 
     def _reset_views(self):
         """Back to fit on both panes. A freshly opened folder has nothing to do
@@ -289,7 +338,7 @@ class SideBySideWindow(QtWidgets.QWidget):
         physical slot. Pixmaps/filenames are refreshed by _render/_show_current."""
         if not hasattr(self, "left_title"):
             return
-        folder_label = {"synth": "Open Synthetic Folder", "gt": "Open Ground Truth Folder"}
+        folder_label = self.folder_labels
         for phys, logical in (("left", self._left), ("right", self._right)):
             title_w = getattr(self, f"{phys}_title")
             # block signals so the programmatic setText doesn't fire textEdited
@@ -454,8 +503,46 @@ class SideBySideWindow(QtWidgets.QWidget):
         else:
             super().keyPressEvent(event)
 
+    def _restore_caller(self):
+        """Go to the main menu, exactly once, whichever route opened this window.
+
+        A FRESH MainWindow rather than re-showing anything. That is not just
+        tidiness: every other navigation edge in the app constructs its
+        destination, which runs init_ui and therefore showFullScreen(). The one
+        edge that used to re-show a hidden window instead (the post-batch route,
+        back to the annotation window) brought it back at its pre-fullscreen
+        size, because a re-show does not repeat init_ui.
+
+        Idempotent because Back, Esc and the window close all land here, and Back
+        closes the window itself, so two of them would otherwise fire in
+        sequence."""
+        if self._caller_restored:
+            return
+        self._caller_restored = True
+        # Lazy import: splash imports this module back for its own menu button.
+        from .splash import MainWindow, hand_off
+        # hand_off WITHOUT an old window, and this window is disposed of in
+        # closeEvent instead. Passing self here would have hand_off call
+        # self.close(), and _restore_caller is itself reached FROM closeEvent,
+        # so that would be re-entrant. Registering the menu is the part that
+        # matters: it stops the new window dying with this one.
+        hand_off(MainWindow(self.model, self.processor))
+
+    def closeEvent(self, event):
+        # The title-bar X has to leave the user somewhere, same as Back and Esc.
+        # Without this, closing led nowhere: a hidden window does not keep Qt
+        # alive, and quitOnLastWindowClosed ended the whole session.
+        self._restore_caller()
+        super().closeEvent(event)
+        # Destroy rather than linger; see splash.hand_off for why a hidden
+        # fullscreen window is a real problem on macOS and not just untidy.
+        from .splash import _LIVE_WINDOWS
+        try:
+            _LIVE_WINDOWS.remove(self)
+        except ValueError:
+            pass
+        self.deleteLater()
+
     def go_back(self):
-        from .splash import MainWindow
-        self.main_window = MainWindow(self.model, self.processor)
-        self.main_window.show()
+        self._restore_caller()
         self.close()

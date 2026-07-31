@@ -166,10 +166,10 @@ covers the torch install from Step 2 (clear any CPU build first):
 
 ```powershell
 pip uninstall -y torch torchvision torchaudio
-pip install -r requirements-windows.txt
+pip install -r requirements-windows11-cuda.txt
 ```
 
-There is no one-size-fits-all requirements file. `requirements-windows.txt` is the
+There is no one-size-fits-all requirements file. `requirements-windows11-cuda.txt` is the
 Windows + NVIDIA file (pinned CUDA torch). `requirements-macos.lock` is the macOS
 lock (CPU/MPS torch) and must NOT be used on Windows, or pip installs the CPU
 build. `requirements.txt` only pins floors and is for advanced users who want
@@ -178,7 +178,7 @@ the newest resolutions.
 For a fully reproducible lock on this exact desktop, after a verified install:
 
 ```powershell
-pip freeze > requirements-windows.lock
+pip freeze > requirements-windows11-cuda.freeze.txt
 ```
 
 ---
@@ -880,7 +880,7 @@ The requirements file allowed Transformers 5, which broke GroundingDINO.
 
 Fix:
 
-Use `requirements-windows.txt` (which pins `transformers==4.50.3`) or pin:
+Use `requirements-windows11-cuda.txt` (which pins `transformers==4.50.3`) or pin:
 
 ```text
 transformers>=4.40,<5
@@ -924,10 +924,10 @@ cd AutoAnnotate
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 3. Install all requirements (requirements-windows.txt pins the CUDA torch
+# 3. Install all requirements (requirements-windows11-cuda.txt pins the CUDA torch
 #    wheels and adds the PyTorch CUDA index, so it installs the GPU torch too)
 pip uninstall -y torch torchvision torchaudio
-pip install -r requirements-windows.txt
+pip install -r requirements-windows11-cuda.txt
 
 # 4. Verify CUDA
 python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0))"
@@ -1001,8 +1001,8 @@ autoannotate_study
 ### Strongly Recommended Changes
 
 1. Standardize the repo folder name to avoid spaces.
-2. Use `requirements-windows.txt` for research desktop installs (it pins the
-   CUDA torch wheels); freeze it to `requirements-windows.lock` once verified.
+2. Use `requirements-windows11-cuda.txt` for research desktop installs (it pins the
+   CUDA torch wheels); freeze it to `requirements-windows11-cuda.freeze.txt` once verified.
 3. Add a small CUDA inference test.
 4. Add clear warnings when PyTorch is CPU-only.
 5. Keep model weights out of git but document exact filenames and target folders.
@@ -1173,6 +1173,30 @@ Fix:
 
 * Download `groundingdino_swinb_cogcoor.pth`.
 * Place it in the GroundingDINO weights folder.
+
+---
+
+### DINO SwinB Weight Exists but Loading or Inference Still Fails
+
+Run:
+
+```powershell
+python "GUI and Pipeline/check_environment.py"
+python -c "from autoannotate.pipeline.dino import load_dino_model; m=load_dino_model('swinb'); print(type(m).__name__, sum(p.numel() for p in m.parameters()))"
+```
+
+The second command should finish with:
+
+```text
+GroundingDINO 232903808
+```
+
+If it does, the SwinB config and checkpoint match and load correctly. Save the
+full environment-check output and the complete inference traceback. In
+particular, check the reported PyTorch CUDA build, GPU memory, and
+`GroundingDINO _C extension` result. SwinB is substantially heavier than SwinT;
+an error that occurs only during prediction is more likely to be CUDA/host
+memory pressure or a compiled-extension problem than a missing checkpoint.
 
 ---
 

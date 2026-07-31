@@ -5,16 +5,18 @@
 #                                 Use only if you intentionally want the newest
 #                                 resolutions and will sort out torch yourself.
 #   - requirements-macos.lock     macOS / Apple Silicon (MPS): exact proven pins.
-#   - requirements-windows.txt    Windows 11 + NVIDIA CUDA: pinned CUDA torch
+#   - requirements-windows10-cpu.txt
+#                                 Windows 10 CPU-only: exact proven pins.
+#   - requirements-windows11-cuda.txt  Windows 11 + NVIDIA CUDA: pinned CUDA torch
 #                                 wheels so the right GPU build is installed.
 #
 # Floors here match what the project was developed against. Upper pins are
 # avoided where possible (they over-constrain wheel resolution); the only
 # exception is transformers, where 5.x breaks GroundingDINO.
 #
-# Windows + NVIDIA users: DO NOT use this file directly. Use
-# requirements-windows.txt, which installs the CUDA torch/torchvision wheels;
-# otherwise pip picks the CPU build and CUDA acceleration will not work.
+# Windows users: use requirements-windows10-cpu.txt on a CPU-only machine or
+# requirements-windows11-cuda.txt with an NVIDIA GPU. Do not use this generic file for
+# either proven Windows setup.
 #
 # GroundingDINO is intentionally NOT listed here - it ships with its own
 # setup.py under autoannotate study/GroundingDINO/. Install it after this

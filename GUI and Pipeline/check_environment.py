@@ -99,9 +99,22 @@ def main():
             print(f"  {FAIL} {mod:<14} missing -> pip install {pip_name}  ({e.__class__.__name__})")
             _mark_fail()
 
+    # The application imports the DINO wrapper during normal GUI startup, so
+    # GroundingDINO is required even if the user plans to select another
+    # detector. It is vendored in this repository and must be installed from
+    # that local tree; suggesting a similarly named PyPI package would be wrong.
+    try:
+        importlib.import_module("groundingdino")
+        print(f"  {OK} {'groundingdino':<14} present (local editable install)")
+    except Exception as e:
+        print(f"  {FAIL} {'groundingdino':<14} missing")
+        print('       Install with: pip install --no-build-isolation -e '
+              '"autoannotate study/GroundingDINO"')
+        print(f"       Import error: {e.__class__.__name__}: {e}")
+        _mark_fail()
+
     header("Python packages (optional)")
-    for mod, note in [("diffusers", "Stable Diffusion variations"),
-                      ("groundingdino", "DINO detector (pip install -e the GroundingDINO dir)")]:
+    for mod, note in [("diffusers", "Stable Diffusion variations")]:
         try:
             importlib.import_module(mod)
             print(f"  {OK} {mod:<14} present")
@@ -152,8 +165,25 @@ def main():
         cuda = torch.cuda.is_available()
         mps = bool(getattr(torch.backends, "mps", None)
                    and torch.backends.mps.is_available())
+        print(f"  PyTorch build  : {torch.__version__}")
+        print(f"  Built for CUDA : {torch.version.cuda or 'no (CPU-only build)'}")
         print(f"  CUDA available : {cuda}")
         print(f"  MPS available  : {mps}")
+        if cuda:
+            for index in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(index)
+                total_gb = props.total_memory / (1024 ** 3)
+                print(f"  CUDA device {index}  : {props.name} ({total_gb:.1f} GB)")
+
+        try:
+            import groundingdino._C  # noqa: F401
+            print(f"  GroundingDINO _C extension : {OK} importable")
+        except Exception as e:
+            print(f"  GroundingDINO _C extension : {WARN} unavailable "
+                  f"({e.__class__.__name__}: {e})")
+            if cuda:
+                print("       Rebuild GroundingDINO after installing CUDA PyTorch; "
+                      "DINO will otherwise be much slower.")
 
         # Mirror config.py's auto-detect + pipeline.sd._sd_select_device.
         override = os.environ.get("AUTOANNOTATE_SD_DEVICE", "").lower().strip()

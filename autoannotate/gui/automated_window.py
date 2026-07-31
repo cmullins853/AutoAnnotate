@@ -192,10 +192,10 @@ class AutomatedWindow(QtWidgets.QWidget):
         msg.exec_()
 
     def go_back(self):
-        from .splash import MainWindow
-        self.main_window = MainWindow(self.model, self.processor)
-        self.main_window.show()
-        self.close()
+        # hand_off destroys this window rather than hiding it; see its docstring
+        # for why a hidden fullscreen window is a problem and not just untidy.
+        from .splash import MainWindow, hand_off
+        hand_off(MainWindow(self.model, self.processor), self)
 
     def select_image_folder(self):
         options = QtWidgets.QFileDialog.Options()

@@ -149,7 +149,6 @@ def editable_target(search_dirs=None):
 
     Returns the mapped `groundingdino` package directory, or None.
     """
-    import re as _re
     if search_dirs is None:
         try:
             import site
@@ -174,9 +173,41 @@ def editable_target(search_dirs=None):
                     body = fh.read()
             except OSError:
                 continue
-            m = _re.search(r"['\"]groundingdino['\"]\s*:\s*['\"](.+?)['\"]", body)
-            if m:
-                return m.group(1)
+            found = _mapping_path(body)
+            if found:
+                return found
+    return None
+
+
+def _mapping_path(body):
+    """Pull the groundingdino path out of a pip editable finder module.
+
+    The finder is Python SOURCE, so a Windows path is written repr-escaped:
+
+        MAPPING = {'groundingdino': 'C:\\\\Users\\\\me\\\\GroundingDINO\\\\groundingdino'}
+
+    Reading that with a regex hands back the literal source text, backslashes
+    doubled, which is not a path that exists. It round-trips harmlessly on macOS
+    and Linux, where there are no backslashes to escape, and the Windows CI
+    runner is what caught it.
+
+    So the file is parsed and the string literal evaluated, which unescapes it
+    the same way Python would. ast.literal_eval only builds literals, so nothing
+    in the file is executed.
+    """
+    import ast
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if (isinstance(key, ast.Constant) and key.value == "groundingdino"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)):
+                return value.value
     return None
 
 

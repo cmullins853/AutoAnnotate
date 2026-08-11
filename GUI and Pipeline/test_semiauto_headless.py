@@ -5691,6 +5691,24 @@ def t88_groundingdino_split_tree():
         fh.write(f"MAPPING: dict[str, str] = {{'groundingdino': {mapped!r}}}\n")
     check("T88 the editable finder's target path is read back",
           ce.editable_target([sp]) == mapped, ce.editable_target([sp]))
+
+    # The finder is Python source, so pip writes a Windows path with its
+    # backslashes escaped. Reading it with a regex returned the raw source text,
+    # backslashes still doubled, which is not a path that exists. That is
+    # invisible on macOS and Linux, where there is nothing to escape, so the
+    # Windows form is pinned here explicitly rather than left to the CI runner.
+    win = r"C:\Users\RUNNER~1\AppData\Local\Temp\tmp1\GroundingDINO\groundingdino"
+    body = ("import x\n"
+            "MAPPING: dict[str, str] = {'groundingdino': " + repr(win) + "}\n")
+    check("T88 an escaped Windows path is unescaped, not returned raw",
+          ce._mapping_path(body) == win, ce._mapping_path(body))
+    check("T88 a quoted path with no escapes still reads back",
+          ce._mapping_path("MAPPING = {'groundingdino': '/home/me/GroundingDINO/groundingdino'}")
+          == "/home/me/GroundingDINO/groundingdino")
+    check("T88 a finder without the key gives None",
+          ce._mapping_path("MAPPING = {'other': '/x'}") is None)
+    check("T88 an unparseable finder gives None rather than raising",
+          ce._mapping_path("this is not python (((") is None)
     check("T88 no editable install -> None",
           ce.editable_target([_tf.mkdtemp()]) is None)
     check("T88 a missing site-packages dir is survivable",

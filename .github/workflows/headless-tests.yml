@@ -1,0 +1,94 @@
+# Runs the headless logic suite on Linux and Windows for every push.
+#
+# Why a Windows runner is the point of this file: the suite covers the
+# behaviour that only misbehaves off macOS. Non-ASCII image paths through
+# autoannotate/imageio.py, every text handle opened with encoding="utf-8", and
+# label files written with newline="\n" so Windows does not turn them into
+# \r\n. Those bugs are invisible on the development Mac and used to need a
+# physical Windows machine to find. T70 in particular shells out to a real
+# subprocess and writes an image under a directory whose name mixes an
+# accented Latin character with a CJK one, which is the exact call that fails
+# when cv2.imread is used directly on Windows.
+#
+# What this does NOT cover, and still needs a real GPU machine plus a walk
+# through GUI and Pipeline/MANUAL_TEST_CHECKLIST.md: CUDA, the VRAM-derived
+# model budget, the out-of-memory purge-and-retry path, actual model loading
+# and inference, and anything visual.
+name: headless tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the in-flight run pointless, so drop it
+# rather than pay for two answers to the same question.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    name: headless suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      # Windows is the interesting half. If Linux fails, the Windows result is
+      # still wanted, so one failure must not cancel the other job.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the documented development environment (root .venv is 3.13).
+          python-version: "3.13"
+
+      # PyQt5 links against libGL and the xcb libraries even when it is only
+      # ever asked for the offscreen platform, and the GitHub Linux image does
+      # not ship them.
+      - name: Install Qt system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libdbus-1-3 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0
+
+      # Deliberately a much smaller install than requirements.txt. The suite
+      # stubs cv2, ultralytics, groundingdino, transformers, diffusers and
+      # dotenv in sys.modules before it imports the package, so only the
+      # libraries that get imported for real are worth a runner minute. This
+      # exact set was verified in a clean Python 3.13 venv on 2026-08-10: all
+      # 807 checks pass, nothing skips.
+      #
+      # opencv is installed even though the in-process suite stubs it, because
+      # T70 spawns a subprocess that imports the real thing. The headless build
+      # is the one to use on a runner: it drops the GUI libraries that plain
+      # opencv-python would otherwise need.
+      #
+      # torch comes from the PyTorch CPU index. The default PyPI wheel for
+      # Linux bundles CUDA, which is roughly 2.5 GB of download for a runner
+      # with no GPU.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0"
+          pip install "numpy>=1.24" "Pillow>=10.0" "shapely>=2.0" "PyQt5==5.15.11" "opencv-python-headless>=4.8"
+
+      - name: Show environment
+        run: |
+          python -VV
+          python -c "import torch, numpy, shapely, cv2, PyQt5.QtCore as q; print('torch', torch.__version__); print('numpy', numpy.__version__); print('cv2', cv2.__version__); print('Qt', q.QT_VERSION_STR)"
+
+      # The suite sets this itself on import; setting it here too means a
+      # failure that happens before that line still cannot try to open a display.
+      - name: Run headless suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python "GUI and Pipeline/test_semiauto_headless.py"

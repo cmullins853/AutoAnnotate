@@ -135,6 +135,19 @@ that file is in place, nothing reads the token. See HOW_TO_RUN.txt for details.
 - Commit frequently with well-documented messages. Follow the [commit message guidelines](#commit-message-guidelines) provided below.
 - Update the `requirements.txt` file only after validating that no dependency conflicts arise from the updates.
 
+### Continuous integration
+
+`.github/workflows/headless-tests.yml` runs the headless suite on every push,
+on both Linux and Windows. The Windows job is the point of it: the suite covers
+non-ASCII image paths, `encoding="utf-8"` on every text handle, and label files
+written with `newline="\n"`, and those only misbehave off macOS. It installs a
+much smaller dependency set than `requirements.txt` because the suite stubs the
+heavy ML packages, so a run takes minutes rather than downloading CUDA wheels.
+
+It does not cover CUDA, the VRAM budget, the out-of-memory retry path, model
+loading, or anything visual. Those still need a GPU machine and a pass through
+[GUI and Pipeline/MANUAL_TEST_CHECKLIST.md](GUI%20and%20Pipeline/MANUAL_TEST_CHECKLIST.md).
+
 ---
 
 ## What Makes a Good Commit? [[1]](#1)

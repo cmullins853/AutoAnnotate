@@ -44,6 +44,19 @@ _hf = _stub("huggingface_hub"); _hf.login = lambda *a, **k: None
 # exercise the degrade-gracefully path instead of downloading a model.
 _stub("transformers")
 
+# torch BEFORE PyQt5, and this order is load bearing on Windows.
+#
+# Qt sets up its own DLL search path when it is imported. If that happens
+# first, torch's _load_dll_libraries can then fail to bring up c10.dll with
+# "OSError: [WinError 1114] A dynamic link library (DLL) initialization
+# routine failed". The suite died on that on the windows-latest runner while
+# the CI step immediately before it, which imported torch first, loaded the
+# very same torch install without complaint.
+#
+# It costs nothing on macOS or Linux, where the import order does not matter,
+# and it mirrors what autoannotate/app.py does for the real application.
+import torch  # noqa: F401  (imported for DLL load order, not for use here)
+
 from PyQt5 import QtWidgets, QtGui, QtCore
 import numpy as np
 

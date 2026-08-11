@@ -88,7 +88,40 @@ jobs:
 
       # The suite sets this itself on import; setting it here too means a
       # failure that happens before that line still cannot try to open a display.
+      #
+      # bash on both runners (Windows images ship git bash) so the failure
+      # reporting below is one script rather than two.
       - name: Run headless suite
+        shell: bash
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python "GUI and Pipeline/test_semiauto_headless.py"
+        run: |
+          set -o pipefail
+          python "GUI and Pipeline/test_semiauto_headless.py" 2>&1 | tee suite-output.txt
+
+      # Downloading job logs through the API needs admin rights on the
+      # repository, which makes a red tick on someone else's fork impossible to
+      # act on. Failures are therefore re-emitted as workflow annotations, which
+      # are readable by anyone who can see the repository, and the whole output
+      # is attached as an artifact.
+      - name: Report which checks failed
+        if: failure()
+        shell: bash
+        run: |
+          echo "--- failing checks ---"
+          grep -E "^FAIL - " suite-output.txt || echo "(no FAIL lines; the suite died before finishing)"
+          grep -E "^FAIL - " suite-output.txt | head -20 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          echo "--- skipped ---"
+          grep -E "^SKIP - " suite-output.txt || echo "(none)"
+          echo "--- last 40 lines ---"
+          tail -n 40 suite-output.txt
+
+      - name: Upload suite output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-output-${{ matrix.os }}
+          path: suite-output.txt
+          if-no-files-found: warn

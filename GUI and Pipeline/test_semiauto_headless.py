@@ -5189,6 +5189,507 @@ def t85_user_manual_and_dead_pipeline_guard():
 t85_user_manual_and_dead_pipeline_guard()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# T87: optimizer.py scoring. This is the code behind the Automated window's
+# "best prompt" recommendation, and every one of its failures is silent: a
+# wrong number here does not crash anything, it just recommends the wrong
+# prompt. The metric expectations below are worked out by hand, not read back
+# out of the implementation.
+#
+# The cv2-dependent half runs in a SUBPROCESS against the real library,
+# because this file stubs cv2 in sys.modules and a thresholding stub would only
+# be testing itself.
+# ══════════════════════════════════════════════════════════════════════════
+def t87_optimizer_scoring():
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tf
+
+    import autoannotate.optimizer as _opt
+
+    # --- calculate_metrics, worked out by hand ------------------------------
+    # tp=8 fp=2 fn=4 tn=6: precision 8/10, recall 8/12, f1 2*(.8*.667)/(1.467).
+    p, r, f1, mcc, spec = _opt.calculate_metrics(8.0, 2.0, 4.0, 6.0)
+    check("T87 precision = tp/(tp+fp)", abs(p - 0.8) < 1e-9, p)
+    check("T87 recall = tp/(tp+fn)", abs(r - 2 / 3) < 1e-9, r)
+    check("T87 f1 is the harmonic mean", abs(f1 - 2 * (0.8 * (2 / 3)) / (0.8 + 2 / 3)) < 1e-9, f1)
+    check("T87 specificity = tn/(tn+fp)", abs(spec - 0.75) < 1e-9, spec)
+    # MCC = (8*6 - 2*4)/sqrt(10*12*8*10) = 40/sqrt(9600).
+    check("T87 mcc matches the closed form",
+          abs(mcc - 40 / (9600 ** 0.5)) < 1e-9, mcc)
+
+    # Every denominator can legitimately be zero, and each guard must yield 0
+    # rather than raising or producing nan.
+    check("T87 all-zero counts give zeros, not a crash",
+          _opt.calculate_metrics(0.0, 0.0, 0.0, 0.0) == (0, 0, 0, 0, 0))
+    check("T87 a perfect prediction scores 1s",
+          _opt.calculate_metrics(5.0, 0.0, 0.0, 5.0)[:3] == (1.0, 1.0, 1.0))
+
+    # --- pixel_accuracy -----------------------------------------------------
+    a = np.zeros((4, 5), dtype=np.uint8)
+    b = np.zeros((4, 5), dtype=np.uint8)
+    b[0, 0] = 1  # 1 wrong pixel out of 20
+    check("T87 pixel_accuracy counts matching pixels",
+          abs(_opt.pixel_accuracy(a, b) - 19 / 20) < 1e-9, _opt.pixel_accuracy(a, b))
+
+    # --- draw_boxes ---------------------------------------------------------
+    # A 10x20 canvas with one box covering x 0..4, y 0..1 inclusive = 5*2 = 10
+    # filled pixels, value 255.
+    img = _opt.draw_boxes([[0, 0, 4, 1]], image_dim=(10, 20))
+    check("T87 draw_boxes returns a (h, w) uint8 canvas",
+          img.shape == (20, 10) and img.dtype == np.uint8, (img.shape, img.dtype))
+    check("T87 draw_boxes fills exactly the box", int((img == 255).sum()) == 10,
+          int((img == 255).sum()))
+    check("T87 an empty box list leaves a blank canvas",
+          int(_opt.draw_boxes([], image_dim=(10, 20)).sum()) == 0)
+
+    # --- read_and_draw_boxes_from_file: normalized -> canvas ----------------
+    d = _tf.mkdtemp()
+    def _w(name, text):
+        p = _os.path.join(d, name)
+        with open(p, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        return p
+
+    # cx .5 cy .5 w .5 h .5 on a 100x200 canvas -> x 25..75, y 50..150.
+    got = _opt.read_and_draw_boxes_from_file(_w("one.txt", "0 0.5 0.5 0.5 0.5\n"),
+                                             image_dim=(100, 200))
+    ys, xs = np.nonzero(got)
+    check("T87 normalized box maps onto the canvas",
+          (xs.min(), xs.max(), ys.min(), ys.max()) == (25, 75, 50, 150),
+          (xs.min(), xs.max(), ys.min(), ys.max()))
+
+    # A blank line, a garbage row and a polygon row all used to raise
+    # ValueError and abandon the whole optimizer run.
+    for name, body in (("blank.txt", "0 0.5 0.5 0.1 0.1\n\n"),
+                       ("garbage.txt", "0 0.5 0.5 0.1 0.1\nnot a box\n"),
+                       ("poly.txt", "0 0.1 0.2 0.5 0.2 0.1 0.6\n")):
+        try:
+            out = _opt.read_and_draw_boxes_from_file(_w(name, body))
+            check(f"T87 {name} is read without raising", out.shape == (720, 1280), out.shape)
+        except Exception as e:
+            check(f"T87 {name} is read without raising", False, f"{type(e).__name__}: {e}")
+
+    # --- clean_labels_from_file --------------------------------------------
+    # Opening in 'w' truncated the file BEFORE deciding there was nothing to
+    # write, so a file whose boxes were all oversized came back empty.
+    both_big = "0 0.5 0.5 0.99 0.99\n0 0.5 0.5 0.98 0.98\n"
+    p_big = _w("big.txt", both_big)
+    _opt.clean_labels_from_file(p_big, 0.6)
+    check("T87 a file of only oversized boxes is left intact, not blanked",
+          open(p_big, encoding="utf-8").read() == both_big,
+          repr(open(p_big, encoding="utf-8").read()))
+
+    p_mix = _w("mix.txt", "0 0.5 0.5 0.99 0.99\n0 0.2 0.2 0.1 0.1\n")
+    _opt.clean_labels_from_file(p_mix, 0.6)
+    check("T87 oversized boxes are dropped and the rest kept",
+          open(p_mix, encoding="utf-8").read() == "0 0.2 0.2 0.1 0.1\n",
+          repr(open(p_mix, encoding="utf-8").read()))
+
+    p_one = _w("one_big.txt", "0 0.5 0.5 0.99 0.99\n")
+    _opt.clean_labels_from_file(p_one, 0.6)
+    check("T87 a single oversized box is still left alone",
+          open(p_one, encoding="utf-8").read() == "0 0.5 0.5 0.99 0.99\n")
+
+    p_bad = _w("bad.txt", "0 0.2 0.2 0.1 0.1\nGARBAGE\n")
+    try:
+        _opt.clean_labels_from_file(p_bad, 0.6)
+        check("T87 an unparseable row does not abort the clean", True)
+    except Exception as e:
+        check("T87 an unparseable row does not abort the clean", False,
+              f"{type(e).__name__}: {e}")
+
+    check("T87 cleaning writes unix newlines",
+          b"\r\n" not in open(p_mix, "rb").read())
+
+    # --- the IoU zero-denominator guard, and the ranking it protects --------
+    check("T87 empty vs empty IoU is 0.0, never nan", _opt._iou(0, 0) == 0.0)
+    check("T87 IoU is intersection over union", _opt._iou(25, 75) == 25 / 75)
+
+    # nan compares False against everything, so ONE nan makes sorted() return an
+    # order that depends on the order prompts appear in the prompts file. This
+    # pins the property that matters: the best-scoring prompt wins regardless.
+    for order in (["empty", "good", "ok"], ["good", "empty", "ok"], ["ok", "empty", "good"]):
+        scores = {"empty": _opt._iou(0, 0), "good": 0.8, "ok": 0.5}
+        dd = {k: {"iou_scores": scores[k]} for k in order}
+        ranked = [k for k, _ in sorted(dd.items(), key=lambda a: a[1]["iou_scores"],
+                                       reverse=True)]
+        check(f"T87 highest score ranks first from {order[0]}-first input",
+              ranked[0] == "good", ranked)
+
+    # --- cv2-dependent half, against the REAL library ----------------------
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    probe = (
+        "import sys, types, numpy as np\n"
+        f"sys.path.insert(0, {repo!r})\n"
+        # cv2 must be the REAL library here (that is the point of the
+        # subprocess), but optimizer imports pipeline.dino, which reaches
+        # groundingdino and ultralytics. Those are stubbed exactly as the parent
+        # suite stubs them, so this does not silently turn into a skip on a
+        # machine that has opencv but not the vendored detector, which is
+        # precisely the CI runner.
+        "def _stub(name):\n"
+        "    m = types.ModuleType(name); sys.modules[name] = m; return m\n"
+        "_gd = _stub('groundingdino'); _gdu = _stub('groundingdino.util')\n"
+        "_gdi = _stub('groundingdino.util.inference')\n"
+        "_gd.util = _gdu; _gdu.inference = _gdi\n"
+        "_gdi.load_model = _gdi.load_image = _gdi.predict = lambda *a, **k: None\n"
+        "_ul = _stub('ultralytics'); _ul.SAM = lambda *a, **k: object()\n"
+        "_de = _stub('dotenv'); _de.load_dotenv = lambda *a, **k: None\n"
+        "import cv2\n"
+        "from autoannotate.optimizer import process_mask_arrays as f\n"
+        "a = np.zeros((10,10), np.uint8); a[:5,:] = 255\n"
+        "b = np.zeros((10,10), np.uint8); b[:,:5] = 255\n"
+        "same = f(a, a.copy())['iou_scores'][0]\n"
+        "quarter = f(a, b)['iou_scores'][0]\n"
+        "empty = f(np.zeros((10,10), np.uint8), np.zeros((10,10), np.uint8))['iou_scores'][0]\n"
+        # Different shapes exercise the resize branch: a full-white 20x20
+        # against a full-white 10x10 must still be a perfect overlap.
+        "resized = f(np.full((20,20), 255, np.uint8), np.full((10,10), 255, np.uint8))['iou_scores'][0]\n"
+        "m = f(a, b)\n"
+        "keys = sorted(m)\n"
+        "print(round(same,6), round(quarter,6), round(empty,6), round(resized,6), ','.join(keys))\n"
+    )
+    res = _sp.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    # Only a missing cv2 may skip this. Any other failure is a real one and has
+    # to be reported, not swallowed as an environment quirk.
+    if res.returncode != 0 and "No module named 'cv2'" in (res.stderr or ""):
+        skip("T87 process_mask_arrays against real cv2", "real cv2 not installed")
+    else:
+        out = (res.stdout or "").strip().splitlines()
+        got = out[-1] if out else (res.stderr or "")[-300:]
+        parts = got.split()
+        check("T87 identical masks score IoU 1.0",
+              parts[:1] == ["1.0"], got)
+        check("T87 a quarter overlap scores 25/75",
+              len(parts) > 1 and parts[1] == str(round(25 / 75, 6)), got)
+        check("T87 both masks empty scores 0.0, not nan",
+              len(parts) > 2 and parts[2] == "0.0", got)
+        check("T87 a size mismatch is resized before comparison, not misscored",
+              len(parts) > 3 and parts[3] == "1.0", got)
+        check("T87 every metric list is populated",
+              len(parts) > 4 and parts[4] == "f1_scores,iou_scores,mcc_scores,"
+                                             "precision_scores,recall_scores,specificity_scores",
+              got)
+
+t87_optimizer_scoring()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T88: the GroundingDINO split-tree diagnosis in check_environment.py.
+#
+# Reproduces the Windows 11 failure of 2026-08 without needing Windows. The
+# machine held both folder spellings; the editable install pointed at the
+# untracked "autoannotate_study" copy, a git pull refreshed only the tracked
+# "autoannotate study" copy, and the untracked one was left holding its
+# compiled _C extension with the .py sources gone. The splash screen came up
+# and entering Manual mode died with ModuleNotFoundError.
+#
+# Every layout is built in a temp directory and the import origin is injected,
+# which is the whole reason diagnose_groundingdino takes it as an argument.
+# ══════════════════════════════════════════════════════════════════════════
+def t88_groundingdino_split_tree():
+    import importlib.util as _ilu
+    import os as _os
+    import tempfile as _tf
+
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("_chkenv",
+                                        _os.path.join(here, "check_environment.py"))
+    ce = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+
+    def _tree(root, study, sources=True, compiled=False):
+        """Build <root>/<study>/GroundingDINO/groundingdino/."""
+        pkg = _os.path.join(root, study, "GroundingDINO", "groundingdino")
+        _os.makedirs(pkg, exist_ok=True)
+        if sources:
+            for rel in ce.GD_REQUIRED_SOURCES:
+                p = _os.path.join(pkg, rel)
+                _os.makedirs(_os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("# source\n")
+        if compiled:
+            with open(_os.path.join(pkg, "_C.cp313-win_amd64.pyd"), "wb") as fh:
+                fh.write(b"\x00")
+        return pkg
+
+    def _text(lines):
+        return "\n".join(t for _tag, t in lines)
+
+    SPACE, UNDER = "autoannotate study", "autoannotate_study"
+
+    # --- healthy: one tracked tree, import and config agree ----------------
+    root = _tf.mkdtemp()
+    pkg = _tree(root, SPACE)
+    lines, fatal = ce.diagnose_groundingdino(
+        root, pkg, None, _os.path.join(root, SPACE, "GroundingDINO"))
+    check("T88 a healthy single tree is not fatal", not fatal, _text(lines))
+    check("T88 a healthy single tree raises no warning",
+          not any(tag == ce.WARN for tag, _ in lines), _text(lines))
+
+    # --- the field failure --------------------------------------------------
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)                                      # git refreshed this
+    stale = _tree(root, UNDER, sources=False, compiled=True)  # editable points here
+    lines, fatal = ce.diagnose_groundingdino(
+        root, stale, None, _os.path.join(root, SPACE, "GroundingDINO"))
+    body = _text(lines)
+    check("T88 a source-less import tree is fatal", fatal, body)
+    check("T88 it names the tree Python actually imports from",
+          "the tree Python imports from" in body, body)
+    check("T88 it lists the missing sources",
+          "groundingdino/__init__.py" in body
+          and _os.path.join("util", "inference.py").replace("\\", "/") in body.replace("\\", "/"),
+          body)
+    check("T88 it says the compiled extension does not need rebuilding",
+          "does NOT need redoing" in body, body)
+    check("T88 it reports the two trees",
+          "two separate GroundingDINO trees" in body, body)
+    check("T88 it warns that git tracks only the space copy",
+          "Only the \"autoannotate study\" (space) copy is tracked" in body, body)
+    check("T88 it offers the repoint-the-editable-install fix",
+          'pip install --no-build-isolation -e "autoannotate study/GroundingDINO"' in body,
+          body)
+    check("T88 it offers the junction so the split cannot recur",
+          "mklink /J" in body, body)
+
+    # --- import failed outright --------------------------------------------
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)
+    lines, fatal = ce.diagnose_groundingdino(
+        root, None, "ModuleNotFoundError: No module named 'groundingdino'",
+        _os.path.join(root, SPACE, "GroundingDINO"))
+    body = _text(lines)
+    check("T88 an unimportable package is fatal", fatal, body)
+    check("T88 it quotes the real import error",
+          "No module named 'groundingdino'" in body, body)
+
+    # --- code and configs read from different trees -------------------------
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)
+    other = _tree(root, UNDER)          # complete, so only the SPLIT is at issue
+    lines, fatal = ce.diagnose_groundingdino(
+        root, other, None, _os.path.join(root, SPACE, "GroundingDINO"))
+    body = _text(lines)
+    check("T88 two complete trees are not fatal", not fatal, body)
+    check("T88 it flags code and configs coming from different trees",
+          "DIFFERENT trees" in body, body)
+
+    # --- a junction/symlink is the fix, not a second copy -------------------
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)
+    try:
+        _os.symlink(_os.path.join(root, SPACE), _os.path.join(root, UNDER),
+                    target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError) as e:
+        skip("T88 linked spellings are not reported as two copies",
+             f"cannot create a symlink here ({e.__class__.__name__})")
+    else:
+        linked_pkg = _os.path.join(root, UNDER, "GroundingDINO", "groundingdino")
+        lines, fatal = ce.diagnose_groundingdino(
+            root, linked_pkg, None, _os.path.join(root, SPACE, "GroundingDINO"))
+        body = _text(lines)
+        check("T88 a linked second spelling is not fatal", not fatal, body)
+        check("T88 a link is reported as one tree, not two",
+              "two separate GroundingDINO trees" not in body
+              and "same tree (linked, not copied)" in body, body)
+        check("T88 a link does not trigger the different-trees warning",
+              "DIFFERENT trees" not in body, body)
+
+    # --- a stale copy that nothing imports is only a warning ----------------
+    root = _tf.mkdtemp()
+    good = _tree(root, SPACE)
+    _tree(root, UNDER, sources=False, compiled=True)
+    lines, fatal = ce.diagnose_groundingdino(
+        root, good, None, _os.path.join(root, SPACE, "GroundingDINO"))
+    body = _text(lines)
+    check("T88 a broken but unused copy is not fatal", not fatal, body)
+    check("T88 the unused copy is still called out",
+          "an unused copy" in body, body)
+
+    # --- reading the editable install's target ------------------------------
+    # This is what names the offending copy when the import has FAILED, which is
+    # the state the field failure was actually in.
+    sp = _tf.mkdtemp()
+    mapped = _os.path.join(sp, "somewhere", "GroundingDINO", "groundingdino")
+    with open(_os.path.join(sp, "__editable___groundingdino_0_1_0_finder.py"),
+              "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("import x\n")
+        fh.write(f"MAPPING: dict[str, str] = {{'groundingdino': {mapped!r}}}\n")
+    check("T88 the editable finder's target path is read back",
+          ce.editable_target([sp]) == mapped, ce.editable_target([sp]))
+    check("T88 no editable install -> None",
+          ce.editable_target([_tf.mkdtemp()]) is None)
+    check("T88 a missing site-packages dir is survivable",
+          ce.editable_target([_os.path.join(sp, "does-not-exist")]) is None)
+
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)
+    broken = _tree(root, UNDER, sources=False, compiled=True)
+    lines, fatal = ce.diagnose_groundingdino(
+        root, None, "ModuleNotFoundError: No module named 'groundingdino'",
+        _os.path.join(root, SPACE, "GroundingDINO"), editable_dir=broken)
+    body = _text(lines)
+    check("T88 a failed import still names the copy pip points at",
+          "the tree the editable install points at" in body, body)
+    check("T88 the editable target is reported", "editable install points at" in body, body)
+    check("T88 a broken editable target is fatal", fatal, body)
+
+    # --- the untracked artifacts decide which remedy is safe ----------------
+    # .gitignore excludes *.so/*.pyd and weights/, so the CUDA build and the
+    # .pth files exist in exactly ONE tree. Advice that moves someone off that
+    # tree without saying so costs them a long rebuild.
+    root = _tf.mkdtemp()
+    _tree(root, SPACE)
+    keeper = _os.path.join(root, UNDER, "GroundingDINO")
+    _tree(root, UNDER, sources=False, compiled=True)
+    with open(_os.path.join(keeper, "groundingdino", "_C.cp313-win_amd64.pyd"), "wb") as fh:
+        fh.write(b"\x00")
+    _os.makedirs(_os.path.join(keeper, "weights"), exist_ok=True)
+    with open(_os.path.join(keeper, "weights", "groundingdino_swint_ogc.pth"), "wb") as fh:
+        fh.write(b"\x00")
+    st = ce.gd_tree_state(keeper)
+    check("T88 gd_tree_state finds the _C extension", st["ext"], st)
+    check("T88 gd_tree_state lists the weight files",
+          st["weights"] == ["groundingdino_swint_ogc.pth"], st["weights"])
+    lines, _f = ce.diagnose_groundingdino(
+        root, None, "ModuleNotFoundError", _os.path.join(root, SPACE, "GroundingDINO"),
+        editable_dir=_os.path.join(keeper, "groundingdino"))
+    body = _text(lines)
+    check("T88 it inventories which copy holds the build and weights",
+          "compiled _C extension, 1 weight file(s)" in body
+          and "no _C extension, no weights" in body, body)
+    check("T88 it warns against reinstalling before moving the artifacts",
+          "Do NOT simply reinstall against the tracked copy first" in body, body)
+    check("T88 it says to copy the build and weights across first",
+          "Copy the _C extension and the weights into the tracked copy" in body, body)
+
+    # With the artifacts already in the tracked copy there is nothing to
+    # rescue, so the blunt advice is fine and the warning must NOT appear.
+    root = _tf.mkdtemp()
+    good = _os.path.join(root, SPACE, "GroundingDINO")
+    _tree(root, SPACE)
+    _os.makedirs(_os.path.join(good, "weights"), exist_ok=True)
+    with open(_os.path.join(good, "weights", "groundingdino_swint_ogc.pth"), "wb") as fh:
+        fh.write(b"\x00")
+    _tree(root, UNDER, sources=False, compiled=True)
+    lines, _f = ce.diagnose_groundingdino(
+        root, _os.path.join(good, "groundingdino"), None, good)
+    check("T88 no rescue warning when the tracked copy already holds them",
+          "Do NOT simply reinstall" not in _text(lines), _text(lines))
+
+    # --- gd_tree_state itself ----------------------------------------------
+    root = _tf.mkdtemp()
+    p = _tree(root, SPACE, sources=False, compiled=True)
+    st = ce.gd_tree_state(_os.path.join(root, SPACE, "GroundingDINO"))
+    check("T88 gd_tree_state finds every missing source",
+          sorted(st["missing"]) == sorted(ce.GD_REQUIRED_SOURCES), st["missing"])
+    check("T88 gd_tree_state spots the compiled leftovers", st["compiled"], st)
+    st2 = ce.gd_tree_state(_os.path.join(root, "nope"))
+    check("T88 gd_tree_state handles a missing tree",
+          not st2["pkg_exists"] and st2["missing"] == [], st2)
+
+t88_groundingdino_split_tree()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T89: config.py picking the GroundingDINO tree. The old rule was "first
+# spelling that exists", which is what put the code in one tree and the model
+# configs and weights in another on the Windows 11 machine. The tree Python
+# will really import from now leads the candidate list, and the most COMPLETE
+# candidate wins, because a directory can exist and still be the wrong answer.
+# ══════════════════════════════════════════════════════════════════════════
+def t89_gd_dir_resolution():
+    import os as _os
+    import tempfile as _tf
+
+    import autoannotate.config as _cfg
+
+    SPACE, UNDER = "autoannotate study", "autoannotate_study"
+
+    def _mk(root, study, cfg=True, weights=False):
+        tree = _os.path.join(root, study, "GroundingDINO")
+        if cfg:
+            _os.makedirs(_os.path.join(tree, "groundingdino", "config"), exist_ok=True)
+        else:
+            _os.makedirs(_os.path.join(tree, "groundingdino"), exist_ok=True)
+        if weights:
+            wd = _os.path.join(tree, "weights")
+            _os.makedirs(wd, exist_ok=True)
+            with open(_os.path.join(wd, "groundingdino_swint_ogc.pth"), "wb") as fh:
+                fh.write(b"\x00")
+        return tree
+
+    # Only the tracked spelling exists: unchanged behaviour.
+    root = _tf.mkdtemp()
+    space = _mk(root, SPACE, weights=True)
+    check("T89 a single tracked tree is chosen",
+          _cfg.resolve_gd_dir(root) == space, _cfg.resolve_gd_dir(root))
+
+    # The field case: both spellings present, the UNDERSCORE one is what Python
+    # imports and the one holding the weights. The old rule took the space copy
+    # purely because it is listed first.
+    root = _tf.mkdtemp()
+    _mk(root, SPACE)                                  # bare, refreshed by git
+    under = _mk(root, UNDER, weights=True)            # real one, has the weights
+    got = _cfg.resolve_gd_dir(root, import_dir=under)
+    check("T89 the tree Python imports from wins over the bare spelling",
+          got == under, got)
+
+    # Same layout but without the import hint, completeness alone must still
+    # pick the tree that actually holds the weights.
+    got = _cfg.resolve_gd_dir(root)
+    check("T89 the more complete tree wins even with no import hint",
+          got == under, got)
+
+    # An explicit env setting is a decision and still wins outright.
+    root = _tf.mkdtemp()
+    _mk(root, SPACE, weights=True)
+    under = _mk(root, UNDER)
+    got = _cfg.resolve_gd_dir(root, env=under, import_dir=None)
+    check("T89 an explicit GROUNDING_DINO_DIR still wins", got == under, got)
+    # ...unless it does not exist, in which case it must not be returned.
+    bogus = _os.path.join(root, "nowhere")
+    got = _cfg.resolve_gd_dir(root, env=bogus)
+    check("T89 a non-existent env value falls back rather than being used",
+          got != bogus and got is not None, got)
+
+    check("T89 nothing anywhere resolves to None",
+          _cfg.resolve_gd_dir(_tf.mkdtemp()) is None)
+
+    # Candidate ordering and de-duplication.
+    root = _tf.mkdtemp()
+    space = _mk(root, SPACE)
+    cands = _cfg.gd_candidates(root, None, space)
+    check("T89 the import tree leads the candidate list", cands[0] == space, cands)
+    check("T89 it is not repeated when it is also a known spelling",
+          len(cands) == 2, cands)
+
+    # Scoring: config modules and weights, in that order of significance.
+    root = _tf.mkdtemp()
+    full = _mk(root, SPACE, cfg=True, weights=True)
+    bare = _mk(root, UNDER, cfg=False, weights=False)
+    check("T89 a complete tree scores above a bare one",
+          _cfg._gd_score(full) > _cfg._gd_score(bare),
+          (_cfg._gd_score(full), _cfg._gd_score(bare)))
+
+    # A junction/symlink must read as one tree, not a split.
+    root = _tf.mkdtemp()
+    space = _mk(root, SPACE, weights=True)
+    try:
+        _os.symlink(_os.path.join(root, SPACE), _os.path.join(root, UNDER),
+                    target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError) as e:
+        skip("T89 linked spellings are one tree", f"no symlink here ({e.__class__.__name__})")
+    else:
+        linked = _os.path.join(root, UNDER, "GroundingDINO")
+        check("T89 a linked spelling is the same tree, not a split",
+              _cfg._gd_same_tree(linked, space), (linked, space))
+
+t89_gd_dir_resolution()
+
+
 # ── summary ────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok, _ in _results if ok)
 total = len(_results)

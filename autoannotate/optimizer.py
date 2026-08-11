@@ -9,6 +9,48 @@ from PIL import Image, ImageDraw
 from .config import BASE_DIR
 from .imageio import imread_unicode
 from .pipeline.dino import run_dino_from_model
+from .pipeline.labels import _atomic_write_lines
+
+
+def _iou(intersection_sum, union_sum):
+    """Intersection over union, with the empty-vs-empty case pinned to 0.0.
+
+    A predicted mask and a ground-truth mask that are BOTH empty give 0/0, which
+    numpy evaluates to nan rather than raising. That nan then flows into
+    np.mean, into the per-prompt score, and finally into the sort in
+    prompt_optimizer, where it does real damage: nan compares False against
+    everything, so Python's sort silently stops ordering correctly and the
+    "best" prompt becomes a function of the order prompts happen to appear in
+    the prompts file. A prompt that detected nothing could be returned as the
+    winner over one scoring 0.8.
+
+    Zero is the right value rather than one: the caller is choosing the prompt
+    that best reproduces the ground truth, and a prompt that found nothing is no
+    evidence of a good prompt even when the ground truth is also empty.
+    """
+    union_sum = float(union_sum)
+    if union_sum <= 0:
+        return 0.0
+    return float(intersection_sum) / union_sum
+
+
+def _parse_yolo_box_line(line):
+    """One 'cls cx cy w h' row -> (cls, cx, cy, w, h) floats, or None.
+
+    Every other label reader in the project skips a row it cannot parse. These
+    functions used to unpack straight into five names, so a blank line, a
+    trailing newline pair, or a segments/ file handed over by mistake raised
+    ValueError and took down the whole optimizer run. One unreadable row is not
+    a reason to abandon the other three hundred.
+    """
+    parts = line.split()
+    if len(parts) != 5:
+        return None
+    try:
+        cls, cx, cy, w, h = (float(v) for v in parts)
+    except ValueError:
+        return None
+    return cls, cx, cy, w, h
 
 def prompt_optimizer(prompts_file, gt_path, img_path, save_file, threshold, DINO):
     print('entered prompt optimizer')
@@ -77,7 +119,7 @@ def process_mask_arrays(predicted_mask_array, ground_truth_mask_array):
     # Calculate IoU and pixel accuracy
     intersection = np.logical_and(predicted_mask_bin, ground_truth_mask_bin)
     union = np.logical_or(predicted_mask_bin, ground_truth_mask_bin)
-    metrics['iou_scores'].append(np.sum(intersection) / np.sum(union))
+    metrics['iou_scores'].append(_iou(np.sum(intersection), np.sum(union)))
     #metrics['pixel_accuracies'].append(pixel_accuracy(predicted_mask_bin, ground_truth_mask_bin))
 
     # Calculate precision, recall, f1-score, MCC, and specificity
@@ -169,7 +211,10 @@ def read_and_draw_boxes_from_file(file_path, image_dim=(1280, 720)):
     boxes = []
     with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
-            class_id, x, y, width, height = map(float, line.strip().split())
+            parsed = _parse_yolo_box_line(line)
+            if parsed is None:
+                continue
+            class_id, x, y, width, height = parsed
             x1 = (x-(width/2))*image_dim[0]
             x2 = (x+(width/2))*image_dim[0]
             y1 = (y-(height/2))*image_dim[1]
@@ -216,7 +261,7 @@ def process_file(predicted_mask_file, ground_truth_mask_file, threshold):
     # Calculate metrics
     intersection = np.logical_and(predicted_mask_bin, ground_truth_mask_bin)
     union = np.logical_or(predicted_mask_bin, ground_truth_mask_bin)
-    metrics['iou_scores'].append(np.sum(intersection) / np.sum(union))
+    metrics['iou_scores'].append(_iou(np.sum(intersection), np.sum(union)))
     # Calculate precision, recall, f1-score, MCC, and specificity
     precision, recall, f1, mcc, specificity = calculate_metrics(tp, fp, fn, tn)
     metrics['precision_scores'].append(precision)
@@ -280,25 +325,47 @@ def read_and_draw_boxes(results, image_dim=(1280, 720)):
 
 
 def clean_labels_from_file(file_path, cleaning_threshold=0.6):
-    # Read the file and check if it has more than one line
+    """Drop boxes covering more than `cleaning_threshold` of the image, in place.
+
+    Three things this used to get wrong, all of them silent:
+
+    The file was opened in 'w' (which truncates) and only then checked whether
+    there was anything to write, so a file whose boxes were ALL oversized came
+    back empty. The guard was clearly meant to prevent exactly that. Nothing is
+    written now unless there is something to write, and the write goes through
+    the same atomic helper the label writers use, so an interruption cannot
+    leave a half-cleaned file.
+
+    Cleaning was skipped entirely for a single-line file. With the truncation
+    fixed that special case is no longer needed: a lone oversized box leaves an
+    empty accepted list, and an empty accepted list now leaves the file alone.
+
+    A row it could not parse raised ValueError and took down the whole
+    optimizer run. Such rows are skipped now, and are therefore dropped if the
+    file is rewritten for other reasons. That is deliberate: this reads a
+    machine-generated predictions file, where an unparseable row is corruption
+    rather than something worth preserving.
+    """
     with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    if len(lines) > 1:
-        accepted_lines = []
+    accepted_lines = []
+    for line in lines:
+        parsed = _parse_yolo_box_line(line)
+        if parsed is None:
+            continue
+        _cls, _x, _y, width, height = parsed
+        if (width * height) < cleaning_threshold:
+            accepted_lines.append(line if line.endswith('\n') else line + '\n')
 
-        # Process each line
-        for line in lines:
-            class_id, x, y, width, height = map(float, line.strip().split())
-            # if width * height < 0.9:
-            if (width * height) < cleaning_threshold:
-                accepted_lines.append(line)
-
-        # Overwrite the file with accepted lines
-        with open(file_path, 'w', encoding='utf-8', newline='\n') as f:
-            if len(accepted_lines) > 0:
-                for line in accepted_lines:
-                    f.write(line)
+    # Every box was oversized (or unparseable). Leaving the file as it is keeps
+    # the prompt honestly scored on what it actually predicted; blanking it
+    # would score it as if it had predicted nothing.
+    if not accepted_lines:
+        return
+    if len(accepted_lines) == len(lines):
+        return
+    _atomic_write_lines(file_path, accepted_lines)
 
 def process_files(predicted_mask_dir, ground_truth_mask_dir, threshold):
     predicted_files = os.listdir(ground_truth_mask_dir)
@@ -348,7 +415,7 @@ def process_files(predicted_mask_dir, ground_truth_mask_dir, threshold):
 
         intersection = np.logical_and(predicted_mask_bin, ground_truth_mask_bin)
         union = np.logical_or(predicted_mask_bin, ground_truth_mask_bin)
-        metrics['iou_scores'].append(np.sum(intersection) / np.sum(union))
+        metrics['iou_scores'].append(_iou(np.sum(intersection), np.sum(union)))
         metrics['pixel_accuracies'].append(pixel_accuracy(predicted_mask_bin, ground_truth_mask_bin))
         precision, recall, f1, mcc, specificity = calculate_metrics(tp, fp, fn, tn)
         metrics['precision_scores'].append(precision)

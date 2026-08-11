@@ -149,18 +149,90 @@ if not hf_token or hf_token == "paste_your_hf_token_here":
 # The study folder is git-tracked as "autoannotate study" (with a space), but
 # zips/transfers sometimes mangle it into "autoannotate_study"; accept both so
 # neither checkout style bricks startup.
-_gd_candidates = []
-_gd_env = os.environ.get("GROUNDING_DINO_DIR")
-if _gd_env:
-    _gd_candidates.append(_gd_env)
-for _study in ("autoannotate study", "autoannotate_study"):
-    _gd_candidates.append(os.path.join(REPO_ROOT, _study, "GroundingDINO"))
+#
+# Picking the FIRST directory that exists is not good enough, and cost a day on
+# a Windows 11 machine in 2026-08. That machine had both spellings. Python
+# imported groundingdino from the underscore copy (the absolute path pip baked
+# into the editable install), while this block picked the space copy because it
+# is listed first. Code came from one tree, model configs and weights from
+# another, and a git pull only ever refreshed one of them.
+#
+# So the tree the interpreter will ACTUALLY import from is asked for first, via
+# find_spec, which locates the package without importing it (no torch pulled in
+# before autoannotate/__init__.py has set the CUDA allocator flag, and no cost
+# worth measuring). Candidates are then scored on whether they really hold the
+# config modules and the weights, because both are gitignored and therefore
+# exist only in the tree they were built or downloaded into.
+def _gd_import_tree():
+    """The GroundingDINO checkout Python would import, or None."""
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("groundingdino")
+    except (ImportError, ValueError, AttributeError):
+        # ValueError when something has put a spec-less stub in sys.modules,
+        # which is exactly what the headless test suite does.
+        return None
+    origin = getattr(spec, "origin", None) if spec else None
+    if not origin:
+        return None
+    # <tree>/groundingdino/__init__.py -> <tree>
+    return os.path.dirname(os.path.dirname(os.path.abspath(origin)))
 
-GROUNDING_DINO_DIR = None
-for _cand in _gd_candidates:
-    if os.path.isdir(_cand):
-        GROUNDING_DINO_DIR = _cand
-        break
+
+def _gd_score(tree):
+    """How complete a checkout is: (has config modules, has weights)."""
+    has_cfg = os.path.isdir(os.path.join(tree, "groundingdino", "config"))
+    weights_dir = os.path.join(tree, "weights")
+    try:
+        has_weights = any(n.endswith(".pth") for n in os.listdir(weights_dir))
+    except OSError:
+        has_weights = False
+    return (has_cfg, has_weights)
+
+
+def gd_candidates(repo_root, env=None, import_dir=None):
+    """Candidate GroundingDINO trees, best-informed first, without duplicates."""
+    out = []
+    if env:
+        out.append(env)
+    if import_dir:
+        out.append(import_dir)
+    for study in ("autoannotate study", "autoannotate_study"):
+        out.append(os.path.join(repo_root, study, "GroundingDINO"))
+    seen = set()
+    unique = []
+    for c in out:
+        key = os.path.normcase(os.path.abspath(c))
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+def resolve_gd_dir(repo_root, env=None, import_dir=None):
+    """Choose the GroundingDINO tree, or None when none exists.
+
+    An explicit GROUNDING_DINO_DIR wins outright: that is a decision, not a
+    guess. Otherwise the most COMPLETE existing candidate wins, with ties broken
+    by candidate order, which puts the tree Python actually imports from ahead
+    of a bare spelling guess. Completeness matters because the config modules
+    and the weights are both gitignored, so a tree can exist and still be the
+    wrong answer.
+    """
+    if env and os.path.isdir(env):
+        return env
+    existing = [c for c in gd_candidates(repo_root, env, import_dir)
+                if os.path.isdir(c)]
+    if not existing:
+        return None
+    return max(existing, key=_gd_score)
+
+
+_gd_env = os.environ.get("GROUNDING_DINO_DIR")
+_gd_import_dir = _gd_import_tree()
+_gd_candidates = gd_candidates(REPO_ROOT, _gd_env, _gd_import_dir)
+GROUNDING_DINO_DIR = resolve_gd_dir(REPO_ROOT, _gd_env, _gd_import_dir)
+
 if GROUNDING_DINO_DIR is None:
     raise EnvironmentError(
         "GroundingDINO not found. Tried: "
@@ -169,6 +241,25 @@ if GROUNDING_DINO_DIR is None:
 if _gd_env and GROUNDING_DINO_DIR != _gd_env:
     print(f"[config] GROUNDING_DINO_DIR from .env is not a directory "
           f"({_gd_env!r}); using {GROUNDING_DINO_DIR!r} instead.")
+
+def _gd_same_tree(a, b):
+    """True when two paths are the same directory, through a symlink or a
+    Windows junction as well, since linking the two spellings together is the
+    recommended permanent fix and must not be reported as a split."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return (os.path.normcase(os.path.realpath(a))
+                == os.path.normcase(os.path.realpath(b)))
+
+
+# Loud, because a silent split is what made the Windows failure so hard to read.
+if (_gd_import_dir and os.path.isdir(_gd_import_dir)
+        and not _gd_same_tree(_gd_import_dir, GROUNDING_DINO_DIR)):
+    print("[config] WARNING: GroundingDINO code and data come from DIFFERENT trees.")
+    print(f"[config]   code    : {_gd_import_dir}")
+    print(f"[config]   configs : {GROUNDING_DINO_DIR}")
+    print('[config]   Run: python "GUI and Pipeline/check_environment.py" for the fix.')
 
 # Default cap on detection area as a fraction of the image, shared by the GUI
 # (_max_area_frac) and documented in HOW_TO_RUN. Override per session with the

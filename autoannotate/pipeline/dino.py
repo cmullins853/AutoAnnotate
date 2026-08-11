@@ -8,7 +8,28 @@ from ..config import AUTOANNOTATE_DEBUG, BASE_DIR, GROUNDING_DINO_DIR
 
 import cv2
 import torch
-from groundingdino.util.inference import load_model, load_image, predict
+
+try:
+    from groundingdino.util.inference import load_model, load_image, predict
+except ImportError as _gd_exc:
+    # A bare "No module named 'groundingdino'" here is the least helpful thing
+    # the app can say, because the usual cause is not a missing install at all.
+    # On a machine holding both the tracked "autoannotate study" folder and an
+    # "autoannotate_study" copy, pip's editable install points at one of them
+    # and git only ever refreshes the other, so the copy Python imports can be
+    # left with its compiled _C extension and no .py sources. That happened on
+    # Windows 11 in 2026-08 and presented as a crash on entering Manual mode,
+    # long after a splash screen that suggested everything was fine.
+    raise ImportError(
+        f"{_gd_exc}\n\n"
+        "GroundingDINO could not be imported. This is often NOT a missing\n"
+        "install: if this machine has both an 'autoannotate study' folder and\n"
+        "an 'autoannotate_study' folder, the copy pip points at may have lost\n"
+        "its .py sources while keeping the compiled extension.\n\n"
+        'Diagnose it with: python "GUI and Pipeline/check_environment.py"\n'
+        "It reports which copy Python imports, which copy pip was installed\n"
+        "against, and exactly which files are missing.\n"
+    ) from _gd_exc
 
 from .labels import save_masks
 from .sam import load_sam

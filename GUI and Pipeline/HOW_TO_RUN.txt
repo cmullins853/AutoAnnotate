@@ -687,6 +687,59 @@ COMMON ERRORS & FIXES
      "autoannotate_study" folder names are accepted. If the folder truly
      lives elsewhere, set GROUNDING_DINO_DIR in .env (Step 2).
 
+"ModuleNotFoundError: No module named 'groundingdino'"
+  -- the splash screen opens, then clicking into Manual mode crashes
+  -> Your machine has BOTH folder spellings and they have drifted apart.
+     Run:  python "GUI and Pipeline/check_environment.py"
+     and read the "GroundingDINO install integrity" section. It prints
+     which tree Python imports from, which tree pip was installed
+     against, which one GROUNDING_DINO_DIR resolves to, and exactly
+     which source files are missing.
+
+     What causes it: only "autoannotate study" (with the space) is
+     tracked by git. If "pip install -e" was pointed at the
+     "autoannotate_study" copy instead, then git updates refresh the
+     tracked tree while the copy Python actually imports goes stale. It
+     can end up holding just the compiled _C extension with the .py
+     sources gone, which is this error.
+
+     The compiled extension is NOT the problem and does not need
+     rebuilding.
+
+     READ THIS BEFORE REINSTALLING ANYTHING. The compiled _C extension
+     and the weights/*.pth files are excluded by .gitignore (*.so,
+     *.pyd, weights/). They therefore exist ONLY in the tree they were
+     built or downloaded into, which on a machine with this problem is
+     usually the UNTRACKED copy. Reinstalling against the tracked copy
+     as a first move abandons both, and the CUDA extension is slow to
+     rebuild. check_environment.py prints which copy holds them.
+
+     Fix it this way:
+
+       1. Copy the untracked artifacts into the tracked copy:
+            groundingdino/_C.*        (the compiled extension)
+            weights/*.pth             (the DINO checkpoints)
+          from "autoannotate_study/GroundingDINO"
+          into "autoannotate study/GroundingDINO".
+
+       2. Repoint the editable install at the tracked copy:
+            pip install --no-build-isolation -e "autoannotate study/GroundingDINO"
+
+       3. Rename the untracked copy aside and re-run check_environment.
+          Git now maintains the only tree that matters.
+
+     Alternative, if you would rather not move anything: make the two
+     spellings the SAME directory so they can never diverge again.
+     Rename the untracked copy away first, then at the repo root:
+       Windows (Administrator):
+         mklink /J "autoannotate_study" "autoannotate study"
+       macOS/Linux:
+         ln -s "autoannotate study" autoannotate_study
+
+     Quickest patch (does not fix the cause): copy the missing .py
+     files across from the tracked copy and leave the _C extension
+     alone. This goes stale again on the next git pull.
+
 "FileNotFoundError: groundingdino_swint_ogc.pth"
   -> Download the weights file (Step 3a) and place it in
      autoannotate study/GroundingDINO/weights/

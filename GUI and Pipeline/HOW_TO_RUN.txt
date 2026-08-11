@@ -233,6 +233,25 @@ STEP 3 - ONE-TIME SETUP: DOWNLOAD MODEL WEIGHTS
 The app needs several weight files that are NOT in the repo
 (too large for git).
 
+THE SHORT WAY (does everything below except sam3.pt):
+
+    python "GUI and Pipeline/download_weights.py"
+
+It downloads each file straight into the folder the app reads it
+from, checks the size against the published one, and refuses to
+install a partial download. Run it again any time to fill in
+whatever is missing; files already in place are left alone.
+Add --list to see what you have without downloading anything,
+and --all to include the optional SwinB detector.
+
+sam3.pt is gated and needs your own Hugging Face account (see (c)
+below). Once you have accepted the licence and made a read token:
+
+    python "GUI and Pipeline/download_weights.py" --hf-token <token>
+
+The rest of this step is the manual route, and the reference for
+what each file is and where it belongs.
+
 a) GroundingDINO weights
    Destination folder:
      autoannotate study/GroundingDINO/weights/
@@ -271,6 +290,15 @@ d) YOLOE weights (for YOLOE-vis and YOLOE-seg one-shot)
    Filenames: yoloe-11l-seg.pt and yoloe-11l-seg-pf.pt
    Source:    https://github.com/ultralytics/assets/releases
    Destination: GUI and Pipeline/
+
+   Filename:  mobileclip_blt.ts  (about 572 MB)
+   Source:    same releases page
+   Destination: GUI and Pipeline/
+   This is the text encoder YOLOE uses for TEXT prompts. Ultralytics
+   fetches it by itself the first time a YOLOE text prompt runs, so
+   a machine that skips it still works, but the download lands in the
+   middle of someone's first annotation and needs a connection right
+   then. download_weights.py fetches it up front for that reason.
 
 e) LLM weights (only needed for the Automated window)
    The splash screen loads HuggingFaceTB/SmolVLM-256M-Instruct from
@@ -574,6 +602,38 @@ STEP 6 - USING THE VISUALIZER (Manual Window)
       giving up. An image that fails anyway is reported with the two knobs
       to turn (AUTOANNOTATE_MODEL_BUDGET_GB, AUTOANNOTATE_BATCH_CHUNK)
       instead of a bare torch error.
+
+--------------------------------------------------------
+STEP 7 - EXPORTING TO COCO (optional)
+--------------------------------------------------------
+The app saves YOLO format, which is what YOLO training wants.
+Most other tooling (dataset viewers, detectron2, and anything that
+reads COCO) wants a single JSON instead. To convert a finished
+output folder, from the repo root with the venv active:
+
+    python -m autoannotate.coco <images_folder> <output_folder>
+
+<output_folder> is the annotation output folder itself, the one
+holding boxes/ and segments/, not its parent. The result is written
+to <output_folder>/annotations_coco.json unless you pass -o.
+
+By default each image contributes its polygons when it has any and
+its boxes otherwise, so a two-stage run exports masks and a
+detect-only run exports boxes, without mixing the two for one image.
+Force one or the other with --source segments or --source boxes.
+
+Points worth knowing about the output:
+  - COCO category ids start at 1 and YOLO class ids start at 0, so a
+    category id is always the YOLO id plus one. Each category also
+    carries its original "yolo_id" so the mapping stays checkable.
+  - Class names come from class_colors.txt in the output folder. If
+    that file is missing (older runs predate it), classes are named
+    class_0, class_1, and so on.
+  - Images with no labels are still listed, with no annotations.
+    They are part of the dataset and dropping them would quietly
+    change what you exported.
+  - Nothing is loaded but the images' dimensions, so this reads no
+    models, needs no GPU, and takes about a second on a folder.
 
 --------------------------------------------------------
 TUNING KNOBS (optional environment variables)

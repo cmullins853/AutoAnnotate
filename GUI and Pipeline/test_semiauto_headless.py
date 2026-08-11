@@ -5190,6 +5190,165 @@ t85_user_manual_and_dead_pipeline_guard()
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# T86: the COCO exporter. YOLO stores normalized centre-point boxes and
+# normalized polygons; COCO stores absolute top-left [x, y, w, h] pixels and
+# 1-based category ids. Every one of those conversions is a place where an
+# export can be silently, plausibly wrong, so they are pinned to arithmetic
+# worked out by hand rather than to whatever the code happened to produce.
+# ══════════════════════════════════════════════════════════════════════════
+def t86_coco_export():
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+
+    # Re-imported here rather than at module scope: T77 purges sys.modules, so a
+    # reference captured earlier in this file can point at a dead module object.
+    import autoannotate.coco as _coco
+
+    W, H = 200, 100
+    root = _tf.mkdtemp()
+    images = _os.path.join(root, "images")
+    out = _os.path.join(root, "out")
+    _os.makedirs(images)
+    _os.makedirs(_os.path.join(out, "boxes"))
+    _os.makedirs(_os.path.join(out, "segments"))
+
+    from PIL import Image as _Image
+    def _img(name):
+        _Image.new("RGB", (W, H), (10, 20, 30)).save(_os.path.join(images, name))
+
+    # a: boxes only. b: segments (and a box file that must be ignored under
+    # "auto"). c: an image with no labels at all. d: a non-ASCII filename.
+    for n in ("a.png", "b.png", "c.png"):
+        _img(n)
+    _img("bäi字.png")
+
+    def _write(sub, stem, text):
+        with open(_os.path.join(out, sub, stem + ".txt"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+
+    # cx=0.5 cy=0.5 w=0.25 h=0.5 on 200x100 -> x=75 y=25 w=50 h=50, class 2.
+    _write("boxes", "a", "2 0.5 0.5 0.25 0.5\n"
+                         "0 0.9\n"                     # malformed, skipped
+                         "0 1.2 0.5 0.1 0.1\n")        # fully outside, clamps away
+    # A right triangle: (0.1,0.2) (0.5,0.2) (0.1,0.6) -> (20,20) (100,20) (20,60).
+    # Absolute area = 0.5 * 80 * 40 = 1600.
+    _write("segments", "b", "1 0.1 0.2 0.5 0.2 0.1 0.6\n")
+    _write("boxes", "b", "1 0.5 0.5 0.9 0.9\n")        # must lose to the polygon
+    _write("segments", "bäi字", "0 0.1 0.2 0.5 0.2 0.1 0.6\n")
+
+    with open(_os.path.join(out, "class_colors.txt"), "w",
+              encoding="utf-8", newline="\n") as fh:
+        fh.write("# id  name  colour  hex  rgb\n")
+        fh.write("  0   berry       green  #00ff00  0,255,0\n")
+        fh.write("  1   green leaf  blue   #0000ff  0,0,255\n")
+        fh.write("  2   stem        red    #ff0000  255,0,0\n")
+
+    check("T86 class names split on column gaps, not any space",
+          _coco.load_class_names(out) == ["berry", "green leaf", "stem"],
+          _coco.load_class_names(out))
+    check("T86 no class table -> None", _coco.load_class_names(root) is None)
+
+    path, stats = _coco.export_coco(images, out)
+    check("T86 writes annotations_coco.json beside the labels",
+          path == _os.path.join(out, "annotations_coco.json") and _os.path.exists(path),
+          path)
+
+    # Read as bytes: on Windows a text-mode write would have turned every \n
+    # into \r\n, which is the whole reason the label writers pin newline="\n".
+    raw = open(path, "rb").read()
+    check("T86 json is utf-8 with unix newlines", b"\r\n" not in raw)
+    check("T86 non-ASCII filename survives unescaped",
+          "bäi字.png".encode("utf-8") in raw)
+
+    d = _json.loads(raw.decode("utf-8"))
+    imgs = {i["file_name"]: i for i in d["images"]}
+    check("T86 every image is listed, labelled or not", len(d["images"]) == 4,
+          sorted(imgs))
+    check("T86 image dimensions are read from the file",
+          all(i["width"] == W and i["height"] == H for i in d["images"]))
+    check("T86 an unlabelled image is kept with zero annotations",
+          stats["empty"] == 1 and not [a for a in d["annotations"]
+                                       if a["image_id"] == imgs["c.png"]["id"]],
+          stats)
+
+    def _anns(name):
+        return [a for a in d["annotations"] if a["image_id"] == imgs[name]["id"]]
+
+    box_anns = _anns("a.png")
+    check("T86 malformed and fully-outside box rows are dropped",
+          len(box_anns) == 1, len(box_anns))
+    check("T86 normalized centre box -> absolute xywh",
+          box_anns[0]["bbox"] == [75.0, 25.0, 50.0, 50.0], box_anns[0]["bbox"])
+    check("T86 box area is w*h", box_anns[0]["area"] == 2500.0, box_anns[0]["area"])
+    check("T86 category id is the YOLO id plus one",
+          box_anns[0]["category_id"] == 3, box_anns[0]["category_id"])
+    check("T86 a box annotation carries no segmentation",
+          box_anns[0]["segmentation"] == [], box_anns[0]["segmentation"])
+
+    seg_anns = _anns("b.png")
+    check("T86 auto source prefers the polygon over the box file",
+          len(seg_anns) == 1 and seg_anns[0]["segmentation"] == [[20.0, 20.0, 100.0, 20.0, 20.0, 60.0]],
+          seg_anns)
+    check("T86 bbox is derived from the polygon, not the box file",
+          seg_anns[0]["bbox"] == [20.0, 20.0, 80.0, 40.0], seg_anns[0]["bbox"])
+    check("T86 polygon area is the shoelace area",
+          seg_anns[0]["area"] == 1600.0, seg_anns[0]["area"])
+    check("T86 auto counts its sources per image",
+          stats["from_segments"] == 2 and stats["from_boxes"] == 1, stats)
+
+    # Categories must cover every id the annotations reference, in COCO's
+    # 1-based space, with the YOLO id kept for auditing.
+    cat_ids = {c["id"] for c in d["categories"]}
+    check("T86 every referenced category is defined",
+          all(a["category_id"] in cat_ids for a in d["annotations"]), cat_ids)
+    check("T86 categories carry the name table and the original YOLO id",
+          [(c["id"], c["name"], c["yolo_id"]) for c in d["categories"]]
+          == [(1, "berry", 0), (2, "green leaf", 1), (3, "stem", 2)],
+          d["categories"])
+
+    # --- explicit sources --------------------------------------------------
+    p_box, s_box = _coco.export_coco(images, out, json_path=_os.path.join(root, "b.json"),
+                                     source="boxes")
+    dbox = _json.loads(open(p_box, encoding="utf-8").read())
+    check("T86 source=boxes ignores polygons entirely",
+          s_box["from_segments"] == 0 and all(a["segmentation"] == []
+                                              for a in dbox["annotations"]),
+          s_box)
+    check("T86 source=boxes reads b.png's box file, which auto had skipped",
+          len([a for a in dbox["annotations"]
+               if a["image_id"] == {i["file_name"]: i for i in dbox["images"]}["b.png"]["id"]]) == 1,
+          s_box)
+
+    p_seg, s_seg = _coco.export_coco(images, out, json_path=_os.path.join(root, "s.json"),
+                                     source="segments")
+    check("T86 source=segments drops box-only images",
+          s_seg["from_boxes"] == 0 and s_seg["from_segments"] == 2, s_seg)
+
+    try:
+        _coco.build_coco(images, out, source="nonsense")
+        check("T86 an unknown source is refused", False, "no ValueError")
+    except ValueError:
+        check("T86 an unknown source is refused", True)
+
+    # --- class ids beyond the name table -----------------------------------
+    # A label referencing a class the table never named must still produce a
+    # category, or the file references an id it does not define and a strict
+    # reader rejects the whole dataset.
+    _write("boxes", "a", "7 0.5 0.5 0.25 0.5\n")
+    _os.remove(_os.path.join(out, "segments", "b.txt"))
+    d2, _ = _coco.build_coco(images, out)
+    ids2 = {c["id"] for c in d2["categories"]}
+    check("T86 an unnamed class id still gets a category",
+          all(a["category_id"] in ids2 for a in d2["annotations"])
+          and any(c["name"] == "class_7" for c in d2["categories"]),
+          [c["name"] for c in d2["categories"]])
+
+t86_coco_export()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # T87: optimizer.py scoring. This is the code behind the Automated window's
 # "best prompt" recommendation, and every one of its failures is silent: a
 # wrong number here does not crash anything, it just recommends the wrong

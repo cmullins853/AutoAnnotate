@@ -49,9 +49,15 @@ how to launch the app on macOS, Linux, and Windows. In short:
    **required** because its `setup.py` imports torch at build time, so torch from
    step 2 must already be installed):
    `pip install --no-build-isolation -e "autoannotate study/GroundingDINO"`
-4. Place the weight files (DINO `.pth`, `sam2_t.pt`, `sam3.pt`, `yoloe-*.pt`) as
-   described in HOW_TO_RUN.txt. `GROUNDING_DINO_DIR` is auto-derived, so a fresh
-   clone needs no `.env` path edit.
+4. Fetch the weight files with
+   `python "GUI and Pipeline/download_weights.py"`, which puts the DINO `.pth`,
+   `sam2_t.pt`, `yoloe-*.pt` and `mobileclip_blt.ts` where the app expects them
+   and verifies each download against its published size. `sam3.pt` is gated on
+   Hugging Face: accept the licence at <https://huggingface.co/facebook/sam3>,
+   then re-run with `--hf-token <token>` (or set `HF_TOKEN`). HOW_TO_RUN.txt
+   STEP 3 still documents every file for a manual download.
+   `GROUNDING_DINO_DIR` is auto-derived, so a fresh clone needs no `.env` path
+   edit.
 5. Launch the app from a terminal at the repo root with `python run_app.py`
    (or `python -m autoannotate`). No Jupyter or IDE is required.
 
@@ -182,6 +188,15 @@ files and dev tools live under `GUI and Pipeline/`.
     the compute device the app will use, and lists which weight files are
     present. Run it (inside the venv) on a new machine before launching:
     `python "GUI and Pipeline/check_environment.py"`.
+- **[GUI and Pipeline/download_weights.py](GUI%20and%20Pipeline/download_weights.py)**:
+  - Fetches the model weights into the folders the app reads, checking each
+    download against its published byte size and never installing a partial
+    file. `--list` reports what is already present without downloading.
+    Everything except the gated `sam3.pt` needs no token and no extra package.
+- **[autoannotate/coco.py](autoannotate/coco.py)**:
+  - Converts a saved output folder from YOLO `.txt` to a single COCO JSON:
+    `python -m autoannotate.coco <images_dir> <output_dir>`. Reads only what is
+    on disk, so it can run long after the annotation session.
 
 ### Instructions for Model Training and Testing:
 #### Grounding DINO:
